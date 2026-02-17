@@ -1,0 +1,43 @@
+# Engineering Hub Configuration
+# Copy this file to your workspace as config.yaml and fill in values
+
+django:
+  # Django consultingmanager API URL
+  api_url: "http://localhost:8000/api"
+
+  # API authentication token
+  # Get this from Django: python manage.py drf_create_token <username>
+  # Or set environment variable: ENGINEERING_HUB_DJANGO_API_TOKEN
+  api_token: ""
+
+  # Cache TTL for API responses (seconds)
+  cache_ttl: 300
+
+anthropic:
+  # Anthropic API key for Claude
+  # Get this from: https://console.anthropic.com/
+  # Or set environment variable: ENGINEERING_HUB_ANTHROPIC_API_KEY
+  api_key: ""
+
+  # Claude model to use
+  model: "claude-sonnet-4-5-20250929"
+
+  # Maximum tokens for responses
+  max_tokens: 4000
+
+workspace:
+  # Base workspace directory
+  # Default: ~/org-roam/engineering-hub
+  dir: "~/org-roam/engineering-hub"
+
+# Agent configurations (optional - defaults are provided)
+# agents:
+#   research:
+#     enabled: true
+#     max_tokens: 4000
+#   technical-writer:
+#     enabled: true
+#     max_tokens: 4000
+#   standards-checker:
+#     enabled: true
+#     max_tokens: 4000
