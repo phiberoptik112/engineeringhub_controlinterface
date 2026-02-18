@@ -20,6 +20,16 @@ class ParsedTask(BaseModel):
     start_line: int
     end_line: int
     raw_block: str
+    # Journal mode fields (for category-based extraction)
+    journal_date: str | None = None
+    category: str | None = None
+
+    @property
+    def task_id(self) -> str:
+        """Stable identifier for deduplication (journal or legacy)."""
+        if self.journal_date is not None:
+            return f"{self.journal_date}:{self.category}:{self.start_line}"
+        return str(self.start_line)
 
     @property
     def agent_type(self) -> AgentType:

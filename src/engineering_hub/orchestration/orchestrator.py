@@ -38,8 +38,12 @@ class Orchestrator:
 
     def _init_components(self) -> None:
         """Initialize all orchestrator components."""
-        # Notes manager
-        self.notes_manager = SharedNotesManager(self.settings.notes_file)
+        # Notes manager (journal or legacy mode)
+        self.notes_manager = SharedNotesManager(
+            self.settings.notes_file,
+            use_journal_mode=self.settings.use_journal_mode,
+            journal_categories=self.settings.journal_categories,
+        )
 
         # Django client
         self.django_client = DjangoClient(

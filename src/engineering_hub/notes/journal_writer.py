@@ -1,4 +1,4 @@
-"""Writer for updating shared notes file."""
+"""Writer for updating journal markdown file in-place."""
 
 import re
 from datetime import datetime
@@ -8,11 +8,14 @@ from engineering_hub.core.constants import TaskStatus
 from engineering_hub.core.models import AgentMessage, ParsedTask
 
 
-class NotesWriter:
-    """Writer for updating shared notes file in-place."""
+class JournalWriter:
+    """Writer for journal format - updates checkboxes and communication thread."""
+
+    IN_PROGRESS_SUFFIX = " (in progress)"
+    BLOCKED_SUFFIX_PREFIX = " (blocked: "
 
     def __init__(self, path: Path) -> None:
-        """Initialize writer with file path."""
+        """Initialize writer with journal file path."""
         self.path = path
 
     def _read_content(self) -> str:
@@ -29,28 +32,57 @@ class NotesWriter:
         new_status: TaskStatus,
         blocked_reason: str | None = None,
     ) -> None:
-        """Update the status of a task in the notes file."""
+        """Update the status of a task in the journal (checkbox line)."""
+        if task.start_line >= 0 and task.journal_date is None:
+            return  # Not a journal task, no-op
+
         content = self._read_content()
         lines = content.split("\n")
 
-        # Find and update the task header line
-        header_pattern = re.compile(
-            rf"^###\s+@{re.escape(task.agent)}:\s+{task.status.value}\s*$"
-        )
+        if task.start_line >= len(lines):
+            return
 
-        for i in range(task.start_line, min(task.end_line + 1, len(lines))):
-            if header_pattern.match(lines[i]):
-                lines[i] = f"### @{task.agent}: {new_status.value}"
-                break
+        line = lines[task.start_line]
+
+        if new_status == TaskStatus.COMPLETED:
+            # Change - [ ] to - [x], remove (in progress) or (blocked: ...) if present
+            lines[task.start_line] = self._mark_completed(line)
+        elif new_status == TaskStatus.IN_PROGRESS:
+            # Add (in progress) suffix if not already present
+            lines[task.start_line] = self._mark_in_progress(line)
+        elif new_status == TaskStatus.BLOCKED:
+            lines[task.start_line] = self._mark_blocked(line, blocked_reason)
+        # PENDING: no change to checkbox
 
         self._write_content("\n".join(lines))
+
+    def _mark_completed(self, line: str) -> str:
+        """Change unchecked to checked, remove status suffixes."""
+        # Remove (in progress) or (blocked: ...)
+        result = re.sub(r"\s*\(in progress\)\s*$", "", line)
+        result = re.sub(r"\s*\(blocked:[^)]*\)\s*$", "", result)
+        # Change [ ] to [x]
+        result = re.sub(r"\[\s\]", "[x]", result, count=1)
+        return result
+
+    def _mark_in_progress(self, line: str) -> str:
+        """Add (in progress) suffix if not present."""
+        if self.IN_PROGRESS_SUFFIX in line:
+            return line
+        return line.rstrip() + self.IN_PROGRESS_SUFFIX
+
+    def _mark_blocked(self, line: str, reason: str | None = None) -> str:
+        """Add (blocked: reason) suffix."""
+        # Remove existing blocked suffix if present
+        result = re.sub(r"\s*\(blocked:[^)]*\)\s*$", "", line)
+        suffix = self.BLOCKED_SUFFIX_PREFIX + (reason or "see thread") + ")"
+        return result.rstrip() + " " + suffix
 
     def append_to_communication_thread(self, message: AgentMessage) -> None:
         """Append a message to the Agent Communication Thread section."""
         content = self._read_content()
         lines = content.split("\n")
 
-        # Find the communication thread section
         thread_index = None
         for i, line in enumerate(lines):
             if line.strip() == "## Agent Communication Thread":
@@ -58,23 +90,18 @@ class NotesWriter:
                 break
 
         if thread_index is None:
-            # Create the section if it doesn't exist
             lines.append("")
             lines.append("## Agent Communication Thread")
             lines.append("")
             lines.append(message.format_for_notes())
         else:
-            # Find the next section to insert before it
             insert_index = thread_index + 1
-
-            # Skip any existing content until we find the next ## section or end
             for i in range(thread_index + 1, len(lines)):
                 if lines[i].startswith("## ") and i > thread_index:
                     insert_index = i
                     break
                 insert_index = i + 1
 
-            # Insert the message before the next section
             lines.insert(insert_index, "")
             lines.insert(insert_index + 1, message.format_for_notes())
 
@@ -91,7 +118,7 @@ class NotesWriter:
         timestamp = datetime.now()
 
         if success:
-            content = f"Task completed successfully.\n"
+            content = "Task completed successfully.\n"
             if output_path:
                 content += f"Output: [[{output_path}]]"
         else:

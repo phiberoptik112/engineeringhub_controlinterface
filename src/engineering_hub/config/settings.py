@@ -5,6 +5,13 @@ from pathlib import Path
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+# Default category-to-agent mapping for journal mode
+DEFAULT_JOURNAL_CATEGORIES: dict[str, str] = {
+    "Project Work to-do": "research",
+    "Technical Writing Work": "technical-writer",
+    "Thoughts to Expand or Clarify": "research",
+}
+
 
 class Settings(BaseSettings):
     """Application settings with environment variable support."""
@@ -50,9 +57,34 @@ class Settings(BaseSettings):
         description="Base workspace directory",
     )
 
+    # Journal mode (vs legacy shared-notes.md)
+    use_journal_mode: bool = Field(
+        default=True,
+        description="Use journal.md with category-based tasks (vs legacy shared-notes.md)",
+    )
+
+    # Journal filename (relative to workspace_dir)
+    journal_filename: str = Field(
+        default="journal.md",
+        description="Journal filename when in journal mode",
+    )
+
+    # Journal category-to-agent mapping (set via from_yaml, not env)
+    journal_categories: dict[str, str] = Field(
+        default_factory=lambda: dict(DEFAULT_JOURNAL_CATEGORIES),
+        description="Category header -> agent type mapping",
+    )
+
+    @property
+    def journal_file(self) -> Path:
+        """Path to the journal file (when in journal mode)."""
+        return self.workspace_dir / self.journal_filename
+
     @property
     def notes_file(self) -> Path:
-        """Path to the shared notes file."""
+        """Path to the notes file (journal or legacy shared-notes)."""
+        if self.use_journal_mode:
+            return self.journal_file
         return self.workspace_dir / "shared-notes.md"
 
     @property
@@ -101,6 +133,15 @@ class Settings(BaseSettings):
             workspace = config["workspace"].get("dir")
             if workspace:
                 flat_config["workspace_dir"] = Path(workspace).expanduser()
+
+        if "journal" in config:
+            journal = config["journal"]
+            if journal.get("use_journal_mode") is not None:
+                flat_config["use_journal_mode"] = journal["use_journal_mode"]
+            if journal.get("file"):
+                flat_config["journal_filename"] = journal["file"]
+            if journal.get("categories"):
+                flat_config["journal_categories"] = journal["categories"]
 
         # Remove None values
         flat_config = {k: v for k, v in flat_config.items() if v is not None}

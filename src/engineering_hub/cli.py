@@ -3,6 +3,7 @@
 import argparse
 import logging
 import sys
+from datetime import date
 from pathlib import Path
 
 from rich.console import Console
@@ -103,7 +104,11 @@ def cmd_status(args: argparse.Namespace) -> int:
     if settings.notes_file.exists():
         from engineering_hub.notes.manager import SharedNotesManager
 
-        manager = SharedNotesManager(settings.notes_file)
+        manager = SharedNotesManager(
+            settings.notes_file,
+            use_journal_mode=settings.use_journal_mode,
+            journal_categories=settings.journal_categories,
+        )
         pending = manager.get_pending_tasks()
 
         if pending:
@@ -198,11 +203,54 @@ anthropic:
 
 workspace:
   dir: "{workspace}"
+
+journal:
+  use_journal_mode: true
+  categories:
+    "Project Work to-do": "research"
+    "Technical Writing Work": "technical-writer"
+    "Thoughts to Expand or Clarify": "research"
 """
     (workspace / "config.yaml").write_text(config_content)
     console.print("  ✓ Created config.yaml")
 
-    # Create shared-notes.md
+    # Create journal.md (default) and shared-notes.md (legacy)
+    journal_content = """---
+workspace: engineering-hub
+sync_url: http://localhost:8000/api
+---
+
+# Engineering Hub Journal
+
+## {today}
+
+### Incoming Comms
+- 
+
+### Project Work to-do
+- [ ] 
+
+### Technical Writing Work
+- [ ] 
+
+### Thoughts to Expand or Clarify
+- [ ] 
+
+## Agent Communication Thread
+
+<!-- Agent messages will be appended here -->
+
+## Engineering Log
+
+<!-- Dated entries with decisions and findings -->
+"""
+    today = date.today().isoformat()
+    journal_content = journal_content.replace("{today}", today)
+
+    (workspace / "journal.md").write_text(journal_content)
+    console.print("  ✓ Created journal.md")
+
+    # Legacy shared-notes.md for users who set use_journal_mode: false
     notes_content = """---
 workspace: engineering-hub
 sync_url: http://localhost:8000/api
@@ -237,7 +285,12 @@ sync_url: http://localhost:8000/api
     console.print("\n[green]Workspace initialized![/green]")
     console.print("\nNext steps:")
     console.print("  1. Edit config.yaml and add your API tokens")
-    console.print("  2. Add tasks to shared-notes.md")
+    console.print("  2. Add tasks to journal.md (use - [ ] under category sections)")
+    console.print(
+        '     Example: - [ ] Draft report for [[django://project/25]] '
+        "→ [[/outputs/docs/report.md]]",
+        markup=False,
+    )
     console.print("  3. Run: engineering-hub start")
 
     return 0

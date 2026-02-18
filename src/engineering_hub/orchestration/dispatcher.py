@@ -48,12 +48,8 @@ class TaskDispatcher:
         return pending
 
     def _is_queued(self, task: ParsedTask) -> bool:
-        """Check if a task is already in the queue.
-
-        Simple check based on start line - could be improved.
-        """
-        # For now, we'll process duplicates - the status check will handle it
-        return False
+        """Check if a task is already in the queue by task_id."""
+        return any(t.task_id == task.task_id for t in list(self._queue.queue))
 
     def process_next_task(self) -> TaskResult | None:
         """Process the next task in the queue.
@@ -69,7 +65,7 @@ class TaskDispatcher:
         # Verify task is still pending (status might have changed)
         current_tasks = self.notes_manager.get_all_tasks()
         current_task = next(
-            (t for t in current_tasks if t.start_line == task.start_line),
+            (t for t in current_tasks if t.task_id == task.task_id),
             None,
         )
 
@@ -143,7 +139,7 @@ class TaskDispatcher:
             # Re-verify task is still pending
             current_tasks = self.notes_manager.get_all_tasks()
             current_task = next(
-                (t for t in current_tasks if t.start_line == task.start_line),
+                (t for t in current_tasks if t.task_id == task.task_id),
                 None,
             )
 

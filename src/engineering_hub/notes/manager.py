@@ -5,6 +5,8 @@ from pathlib import Path
 
 from engineering_hub.core.constants import TaskStatus
 from engineering_hub.core.models import AgentMessage, ParsedTask
+from engineering_hub.notes.journal_parser import JournalParser
+from engineering_hub.notes.journal_writer import JournalWriter
 from engineering_hub.notes.parser import NotesParser
 from engineering_hub.notes.writer import NotesWriter
 
@@ -12,13 +14,32 @@ from engineering_hub.notes.writer import NotesWriter
 class SharedNotesManager:
     """Facade for shared notes parsing and writing operations."""
 
-    def __init__(self, notes_path: Path) -> None:
-        """Initialize manager with path to shared notes file."""
-        self.path = notes_path
-        self._writer = NotesWriter(notes_path)
+    def __init__(
+        self,
+        notes_path: Path,
+        use_journal_mode: bool = False,
+        journal_categories: dict[str, str] | None = None,
+    ) -> None:
+        """Initialize manager with path and optional journal mode.
 
-    def _get_parser(self) -> NotesParser:
+        Args:
+            notes_path: Path to notes file (journal.md or shared-notes.md)
+            use_journal_mode: If True, use journal parser/writer
+            journal_categories: Category-to-agent mapping for journal mode
+        """
+        self.path = notes_path
+        self._use_journal = use_journal_mode
+        self._category_mapping = journal_categories or {}
+
+        if use_journal_mode:
+            self._writer = JournalWriter(notes_path)
+        else:
+            self._writer = NotesWriter(notes_path)
+
+    def _get_parser(self) -> NotesParser | JournalParser:
         """Get a fresh parser with current file content."""
+        if self._use_journal:
+            return JournalParser.from_file(self.path, self._category_mapping)
         return NotesParser.from_file(self.path)
 
     def get_frontmatter(self) -> dict:
@@ -37,9 +58,14 @@ class SharedNotesManager:
         """Get all tasks with the specified status."""
         return [t for t in self.get_all_tasks() if t.status == status]
 
-    def update_task_status(self, task: ParsedTask, new_status: TaskStatus) -> None:
+    def update_task_status(
+        self,
+        task: ParsedTask,
+        new_status: TaskStatus,
+        blocked_reason: str | None = None,
+    ) -> None:
         """Update the status of a task."""
-        self._writer.update_task_status(task, new_status)
+        self._writer.update_task_status(task, new_status, blocked_reason)
 
     def mark_task_in_progress(self, task: ParsedTask) -> None:
         """Mark a task as in progress."""
@@ -51,7 +77,7 @@ class SharedNotesManager:
 
     def mark_task_blocked(self, task: ParsedTask, reason: str | None = None) -> None:
         """Mark a task as blocked."""
-        self.update_task_status(task, TaskStatus.BLOCKED)
+        self.update_task_status(task, TaskStatus.BLOCKED, blocked_reason=reason)
         if reason:
             self.append_message(task.agent, f"Task blocked: {reason}")
 

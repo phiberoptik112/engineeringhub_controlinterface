@@ -30,6 +30,18 @@ workspace:
   # Default: ~/org-roam/engineering-hub
   dir: "~/org-roam/engineering-hub"
 
+# Journal mode: daily journal with category-based task delegation
+journal:
+  # Use journal.md (true) or legacy shared-notes.md (false)
+  use_journal_mode: true
+
+  # Category header -> agent mapping (items under these become tasks)
+  categories:
+    "Project Work to-do": "research"
+    "Technical Writing Work": "technical-writer"
+    "Thoughts to Expand or Clarify": "research"
+  # "Incoming Comms" has no mapping - notes only
+
 # Agent configurations (optional - defaults are provided)
 # agents:
 #   research:
