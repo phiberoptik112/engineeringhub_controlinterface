@@ -24,6 +24,7 @@ class ContextFormatter:
             AgentType.STANDARDS_CHECKER: cls._format_for_standards_checker,
             AgentType.REF_ENGINEER: cls._format_for_ref_engineer,
             AgentType.EVALUATOR: cls._format_for_evaluator,
+            AgentType.TECHNICAL_REVIEWER: cls._format_for_technical_reviewer,
         }
 
         formatter = formatter_map.get(agent_type, cls._format_default)
@@ -123,6 +124,9 @@ class ContextFormatter:
             for f in context.recent_files:
                 lines.append(f"- [[{f.url or f.title}]] - {f.title}")
 
+        # Staged source documents from ingest
+        lines.extend(cls._format_staged_files_section(context))
+
         # Writing guidance based on client level
         lines.extend(["", "### Writing Guidelines"])
         if tech_level == "low":
@@ -154,6 +158,20 @@ class ContextFormatter:
             )
 
         return "\n".join(lines)
+
+    @classmethod
+    def _format_staged_files_section(cls, context: ProjectContext) -> list[str]:
+        """Format staged source files section for formatters."""
+        staged = context.metadata.get("staged_source_files", [])
+        if not staged:
+            return []
+
+        lines = ["", "### Staged Source Documents"]
+        for f in staged:
+            name = f.get("original_name", "unknown")
+            path = f.get("staged_path", "")
+            lines.append(f"- {name} → {path}")
+        return lines
 
     @classmethod
     def _format_for_standards_checker(cls, context: ProjectContext) -> str:
@@ -294,6 +312,60 @@ class ContextFormatter:
                 "5. **Presentation** (10%): Professional formatting and structure",
                 "",
                 "Provide a structured comparison and clear selection rationale.",
+            ]
+        )
+
+        return "\n".join(lines)
+
+    @classmethod
+    def _format_for_technical_reviewer(cls, context: ProjectContext) -> str:
+        """Format context for technical reviewer agent."""
+        lines = [
+            f"## Project Context: {context.project.title}",
+            "",
+            "### Review Context",
+            f"- **Client**: {context.project.client_name}",
+            f"- **Status**: {context.project.status}",
+        ]
+
+        if context.standards:
+            lines.extend(["", "### Standards for Verification"])
+            for std in context.standards:
+                lines.append(f"- {std.id}")
+
+        if context.scope:
+            lines.extend(["", "### Scope"])
+            for item in context.scope:
+                lines.append(f"- {item}")
+
+        staged = context.metadata.get("staged_source_files", [])
+        if staged:
+            lines.extend(["", "### Staged Review Documents"])
+            for f in staged:
+                name = f.get("original_name", "unknown")
+                path = f.get("staged_path", "")
+                lines.append(f"- {name} -> {path}")
+                for section in f.get("sections", []):
+                    content = section.get("content", "")
+                    if content:
+                        lines.append("")
+                        lines.append(content[:2000] + ("..." if len(content) > 2000 else ""))
+
+        task_files = context.metadata.get("task_file_contents", [])
+        if task_files:
+            lines.extend(["", "### Document Source Files"])
+            for tf in task_files:
+                lines.append(f"\n#### {tf.get('name', 'file')}")
+                lines.append("```")
+                content = tf.get("content", "")
+                lines.append(content[:8000] + ("..." if len(content) > 8000 else ""))
+                lines.append("```")
+
+        lines.extend(
+            [
+                "",
+                "### Review Instructions",
+                "Follow the 5-phase workflow. For Phase 5 output, prepend a change log block and use % REVIEW_PENDING: for deferred items.",
             ]
         )
 

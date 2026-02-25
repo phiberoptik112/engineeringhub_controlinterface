@@ -177,6 +177,7 @@ class AgentWorker:
                 AgentType.STANDARDS_CHECKER: "analysis",
                 AgentType.REF_ENGINEER: "reviews",
                 AgentType.EVALUATOR: "analysis",
+                AgentType.TECHNICAL_REVIEWER: "reviews",
             }
             agent_dir = agent_dirs.get(task.agent_type, "outputs")
             project_id = task.project_id or "unknown"
@@ -193,7 +194,7 @@ class AgentWorker:
         # Ensure directory exists
         output_path.parent.mkdir(parents=True, exist_ok=True)
 
-        # Write response
+        # Write response (raw for .tex, no markdown wrapping)
         output_path.write_text(response, encoding="utf-8")
         logger.debug(f"Wrote output to {output_path}")
 

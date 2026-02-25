@@ -77,6 +77,26 @@ class TestJournalParser:
         assert protocol_task.category == "Project Work to-do"
         assert protocol_task.status == TaskStatus.PENDING
 
+    def test_parse_task_extracts_input_paths(self) -> None:
+        """Test that [[path]] wikilinks are extracted as input_paths, excluding deliverable."""
+        content = """---
+workspace: test
+---
+
+## 2025-02-17
+
+### Technical Review Work
+- [ ] Arbitrate draft [[/path/to/draft.tex]] for [[django://project/25]] → [[/outputs/reviews/decision-matrix-25.md]]
+"""
+        parser = JournalParser(content, {"Technical Review Work": "technical-reviewer"})
+        tasks = parser.parse_tasks()
+
+        assert len(tasks) == 1
+        task = tasks[0]
+        assert "/path/to/draft.tex" in task.input_paths
+        assert "/outputs/reviews/decision-matrix-25.md" not in task.input_paths
+        assert not any("django://" in p for p in task.input_paths)
+
     def test_parse_task_without_deliverable(self) -> None:
         """Test parsing task without explicit deliverable or project wikilink."""
         parser = JournalParser(SAMPLE_JOURNAL, CATEGORY_MAPPING)

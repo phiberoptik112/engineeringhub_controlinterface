@@ -1,5 +1,6 @@
 """Context manager for building agent context."""
 
+import json
 import logging
 from pathlib import Path
 
@@ -25,15 +26,21 @@ class ContextManager:
         self,
         django_client: DjangoClient,
         notes_manager: SharedNotesManager,
+        output_dir: Path | None = None,
+        workspace_dir: Path | None = None,
     ) -> None:
         """Initialize context manager.
 
         Args:
             django_client: Client for Django API
             notes_manager: Manager for shared notes
+            output_dir: Base output directory (for staging manifest lookup)
+            workspace_dir: Workspace directory (for resolving task file paths)
         """
         self.django_client = django_client
         self.notes_manager = notes_manager
+        self.output_dir = Path(output_dir) if output_dir else Path("outputs")
+        self.workspace_dir = Path(workspace_dir) if workspace_dir else Path.cwd()
 
     def build_context(self, task: ParsedTask) -> ProjectContext:
         """Build project context for a task.
@@ -46,7 +53,8 @@ class ContextManager:
         """
         if task.project_id is None:
             logger.warning(f"Task has no project ID, using minimal context")
-            return self._build_minimal_context()
+            context = self._build_minimal_context()
+            return self._enrich_with_task_file_refs(context, task)
 
         try:
             # Get context from Django API
@@ -84,6 +92,12 @@ class ContextManager:
 
             # Enrich with historical context from notes
             context = self._enrich_with_notes_context(context, task.project_id)
+
+            # Enrich with staged files from ingest
+            context = self._enrich_with_staged_files(context, task.project_id)
+
+            # Enrich with task file refs (.tex, etc.)
+            context = self._enrich_with_task_file_refs(context, task)
 
             return context
 
@@ -133,6 +147,65 @@ class ContextManager:
         except Exception as e:
             logger.warning(f"Failed to enrich context from notes: {e}")
 
+        return context
+
+    def _enrich_with_staged_files(
+        self,
+        context: ProjectContext,
+        project_id: int,
+    ) -> ProjectContext:
+        """Enrich context with staged markdown files from ingest."""
+        try:
+            staging_dir = self.output_dir / "staging" / f"project-{project_id}"
+            manifest_path = staging_dir / "manifest.json"
+            if not manifest_path.exists():
+                return context
+
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            files = manifest.get("files", [])
+            staged = [
+                {
+                    "original_name": f.get("original_name", ""),
+                    "staged_path": f.get("staged_path", ""),
+                    "sections": f.get("sections", []),
+                }
+                for f in files
+                if "error" not in f
+            ]
+            if staged:
+                context.metadata["staged_source_files"] = staged
+        except Exception as e:
+            logger.warning(f"Failed to enrich with staged files: {e}")
+        return context
+
+    def _enrich_with_task_file_refs(
+        self,
+        context: ProjectContext,
+        task: ParsedTask,
+    ) -> ProjectContext:
+        """Enrich context with contents of files referenced in task (e.g. .tex)."""
+        if not task.input_paths:
+            return context
+
+        contents: list[dict] = []
+        for path_str in task.input_paths:
+            try:
+                resolved = Path(path_str).expanduser()
+                if not resolved.is_absolute():
+                    resolved = self.workspace_dir / resolved
+                resolved = resolved.resolve()
+                if resolved.exists() and resolved.is_file():
+                    text = resolved.read_text(encoding="utf-8", errors="replace")
+                    contents.append({
+                        "path": str(resolved),
+                        "name": resolved.name,
+                        "content": text,
+                    })
+            except Exception as e:
+                logger.warning(f"Failed to read task file {path_str}: {e}")
+
+        if contents:
+            context.metadata["task_file_contents"] = contents
         return context
 
     def format_for_agent(self, task: ParsedTask) -> str:

@@ -39,8 +39,13 @@ journal:
   categories:
     "Project Work to-do": "research"
     "Technical Writing Work": "technical-writer"
+    "Technical Review Work": "technical-reviewer"
     "Thoughts to Expand or Clarify": "research"
   # "Incoming Comms" has no mapping - notes only
+
+# Staging directory for ingested files (PDF/DOCX -> markdown)
+staging:
+  manifest_name: "manifest.json"
 
 # Agent configurations (optional - defaults are provided)
 # agents:

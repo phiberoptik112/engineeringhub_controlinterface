@@ -20,6 +20,13 @@ class AgentType(str, Enum):
     STANDARDS_CHECKER = "standards-checker"
     REF_ENGINEER = "ref_engineer"
     EVALUATOR = "evaluator"
+    TECHNICAL_REVIEWER = "technical-reviewer"
+
+
+def is_ingest_task(description: str) -> bool:
+    """Check if task description indicates a file ingest action."""
+    desc_lower = description.lower()
+    return "ingest" in desc_lower and ("from" in desc_lower or "source" in desc_lower)
 
 
 # Default agent for unknown types
@@ -32,4 +39,5 @@ AGENT_PROMPT_FILES = {
     AgentType.STANDARDS_CHECKER: "standards-checker.txt",
     AgentType.REF_ENGINEER: "ref-engineer.txt",
     AgentType.EVALUATOR: "evaluator.txt",
+    AgentType.TECHNICAL_REVIEWER: "technical-reviewer.txt",
 }

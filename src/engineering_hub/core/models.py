@@ -17,6 +17,7 @@ class ParsedTask(BaseModel):
     description: str
     context: str | None = None
     deliverable: str | None = None
+    input_paths: list[str] = Field(default_factory=list)
     start_line: int
     end_line: int
     raw_block: str
@@ -109,3 +110,12 @@ class TaskResult(BaseModel):
     output_path: str | None = None
     error_message: str | None = None
     agent_response: str | None = None
+
+
+class IngestResult(BaseModel):
+    """Result of file ingest action."""
+
+    success: bool
+    files_converted: int = 0
+    manifest_path: str | None = None
+    error_message: str | None = None

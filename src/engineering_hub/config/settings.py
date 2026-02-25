@@ -9,6 +9,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 DEFAULT_JOURNAL_CATEGORIES: dict[str, str] = {
     "Project Work to-do": "research",
     "Technical Writing Work": "technical-writer",
+    "Technical Review Work": "technical-reviewer",
     "Thoughts to Expand or Clarify": "research",
 }
 
@@ -75,6 +76,11 @@ class Settings(BaseSettings):
         description="Category header -> agent type mapping",
     )
 
+    staging_manifest_name: str = Field(
+        default="manifest.json",
+        description="Manifest filename in staging directories",
+    )
+
     @property
     def journal_file(self) -> Path:
         """Path to the journal file (when in journal mode)."""
@@ -91,6 +97,11 @@ class Settings(BaseSettings):
     def output_dir(self) -> Path:
         """Path to the outputs directory."""
         return self.workspace_dir / "outputs"
+
+    @property
+    def staging_dir(self) -> Path:
+        """Path to the staging directory for ingested files."""
+        return self.output_dir / "staging"
 
     @property
     def prompts_dir(self) -> Path:
@@ -142,6 +153,11 @@ class Settings(BaseSettings):
                 flat_config["journal_filename"] = journal["file"]
             if journal.get("categories"):
                 flat_config["journal_categories"] = journal["categories"]
+
+        if "staging" in config:
+            staging = config["staging"]
+            if staging.get("manifest_name"):
+                flat_config["staging_manifest_name"] = staging["manifest_name"]
 
         # Remove None values
         flat_config = {k: v for k, v in flat_config.items() if v is not None}

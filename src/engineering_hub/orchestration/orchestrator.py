@@ -6,9 +6,11 @@ import sys
 import threading
 from pathlib import Path
 
+from engineering_hub.actions.file_ingest import FileIngestAction
 from engineering_hub.agents.worker import AgentWorker
 from engineering_hub.config.settings import Settings
 from engineering_hub.context.manager import ContextManager
+from engineering_hub.core.constants import is_ingest_task
 from engineering_hub.core.models import ParsedTask, TaskResult
 from engineering_hub.django.client import DjangoClient
 from engineering_hub.notes.manager import SharedNotesManager
@@ -56,6 +58,8 @@ class Orchestrator:
         self.context_manager = ContextManager(
             django_client=self.django_client,
             notes_manager=self.notes_manager,
+            output_dir=self.settings.output_dir,
+            workspace_dir=self.settings.workspace_dir,
         )
 
         # Agent worker
@@ -80,8 +84,14 @@ class Orchestrator:
             debounce_seconds=1.0,
         )
 
+        # File ingest action
+        self._ingest_action = FileIngestAction(
+            output_dir=self.settings.output_dir,
+            manifest_name=self.settings.staging_manifest_name,
+        )
+
     def _execute_task(self, task: ParsedTask) -> TaskResult:
-        """Execute a task using the agent worker.
+        """Execute a task using the agent worker or an action.
 
         Args:
             task: The task to execute
@@ -89,11 +99,28 @@ class Orchestrator:
         Returns:
             TaskResult with execution outcome
         """
+        # Route ingest tasks to FileIngestAction before agent
+        if is_ingest_task(task.description):
+            return self._execute_ingest(task)
+
         # Build context for the task
         context = self.context_manager.format_for_agent(task)
 
         # Execute with agent
         return self.agent_worker.execute(task, context)
+
+    def _execute_ingest(self, task: ParsedTask) -> TaskResult:
+        """Execute file ingest action for a task."""
+        result = self._ingest_action.execute_from_description(
+            description=task.description,
+            project_id=task.project_id,
+        )
+        return TaskResult(
+            task=task,
+            success=result.success,
+            output_path=result.manifest_path,
+            error_message=result.error_message,
+        )
 
     def _on_notes_changed(self) -> None:
         """Called when the shared notes file changes."""

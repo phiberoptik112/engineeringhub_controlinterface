@@ -27,7 +27,7 @@ DEFAULT_AGENT_CONFIGS = {
     AgentType.TECHNICAL_WRITER: AgentConfig(
         agent_type=AgentType.TECHNICAL_WRITER,
         prompt_file="technical-writer.txt",
-        tools=["create_file", "view", "django_api"],
+        tools=["create_file", "view", "ingest_files", "django_api"],
         max_tokens=4000,
     ),
     AgentType.STANDARDS_CHECKER: AgentConfig(
@@ -49,6 +49,12 @@ DEFAULT_AGENT_CONFIGS = {
         tools=["get_project_file", "view"],
         max_tokens=4000,
         enabled=False,  # Phase 5
+    ),
+    AgentType.TECHNICAL_REVIEWER: AgentConfig(
+        agent_type=AgentType.TECHNICAL_REVIEWER,
+        prompt_file="technical-reviewer.txt",
+        tools=["ingest_files", "get_project_file"],
+        max_tokens=4000,
     ),
 }
 

@@ -20,6 +20,9 @@ sync_url: http://localhost:8000/api
 - [ ] Expand section 3 on ASTM E336 in [[django://project/25]] report
 - [ ] Draft executive summary for [[django://project/25]] → [[/outputs/docs/exec-summary-25.md]]
 
+### Technical Review Work
+- [ ] Arbitrate draft [[/path/to/draft.tex]] for [[django://project/25]] → [[/outputs/reviews/decision-matrix-25.md]]
+
 ### Thoughts to Expand or Clarify
 - [ ] Research impact of humidity on STC ratings
 

@@ -30,6 +30,9 @@ DELIVERABLE_ARROW_PATTERN = re.compile(r"\s*→\s*\[\[(?P<path>[^\]]+)\]\]\s*$")
 # Match any output path: [[/outputs/...]]
 OUTPUT_PATH_PATTERN = re.compile(r"\[\[(/outputs/[^\]]+)\]\]")
 
+# Match any wikilink: [[path]]
+WIKILINK_PATTERN = re.compile(r"\[\[([^\]]+)\]\]")
+
 
 class JournalParser:
     """Parser for journal format with dated sections and category-based task extraction."""
@@ -142,6 +145,13 @@ class JournalParser:
         project_match = PROJECT_REF_PATTERN.search(text)
         project_id = int(project_match.group("project_id")) if project_match else None
 
+        # Extract input paths: all [[path]] except deliverable and django:// refs
+        all_links = WIKILINK_PATTERN.findall(raw_text)
+        input_paths = [
+            p for p in all_links
+            if not p.startswith("django://") and p != deliverable
+        ]
+
         # Description is the remaining text (strip wikilinks for cleaner description)
         description = text.strip()
         if not description:
@@ -154,6 +164,7 @@ class JournalParser:
             description=description,
             context=None,
             deliverable=deliverable,
+            input_paths=input_paths,
             start_line=start_line,
             end_line=end_line,
             raw_block=original_line,
