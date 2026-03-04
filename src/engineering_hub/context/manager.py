@@ -1,8 +1,11 @@
 """Context manager for building agent context."""
 
+from __future__ import annotations
+
 import json
 import logging
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from engineering_hub.core.constants import AgentType
 from engineering_hub.core.models import (
@@ -16,6 +19,9 @@ from engineering_hub.context.formatters import ContextFormatter
 from engineering_hub.django.client import DjangoClient
 from engineering_hub.notes.manager import SharedNotesManager
 
+if TYPE_CHECKING:
+    from engineering_hub.memory.service import MemoryService
+
 logger = logging.getLogger(__name__)
 
 
@@ -28,6 +34,7 @@ class ContextManager:
         notes_manager: SharedNotesManager,
         output_dir: Path | None = None,
         workspace_dir: Path | None = None,
+        memory_service: MemoryService | None = None,
     ) -> None:
         """Initialize context manager.
 
@@ -36,11 +43,13 @@ class ContextManager:
             notes_manager: Manager for shared notes
             output_dir: Base output directory (for staging manifest lookup)
             workspace_dir: Workspace directory (for resolving task file paths)
+            memory_service: Optional memory service for semantic context enrichment
         """
         self.django_client = django_client
         self.notes_manager = notes_manager
         self.output_dir = Path(output_dir) if output_dir else Path("outputs")
         self.workspace_dir = Path(workspace_dir) if workspace_dir else Path.cwd()
+        self.memory_service = memory_service
 
     def build_context(self, task: ParsedTask) -> ProjectContext:
         """Build project context for a task.
@@ -54,7 +63,9 @@ class ContextManager:
         if task.project_id is None:
             logger.warning(f"Task has no project ID, using minimal context")
             context = self._build_minimal_context()
-            return self._enrich_with_task_file_refs(context, task)
+            context = self._enrich_with_task_file_refs(context, task)
+            context = self._enrich_with_memory(context, task)
+            return context
 
         try:
             # Get context from Django API
@@ -98,6 +109,9 @@ class ContextManager:
 
             # Enrich with task file refs (.tex, etc.)
             context = self._enrich_with_task_file_refs(context, task)
+
+            # Enrich with semantic memory from past tasks
+            context = self._enrich_with_memory(context, task)
 
             return context
 
@@ -206,6 +220,57 @@ class ContextManager:
 
         if contents:
             context.metadata["task_file_contents"] = contents
+        return context
+
+    def _enrich_with_memory(
+        self,
+        context: ProjectContext,
+        task: ParsedTask,
+    ) -> ProjectContext:
+        """
+        Run a semantic search using the task description as the query and inject
+        the top results into context.metadata for formatters to include.
+        """
+        if self.memory_service is None:
+            return context
+
+        query = task.description
+        if task.context:
+            query = f"{task.description}. {task.context}"
+
+        results = self.memory_service.search(
+            query=query,
+            project_id=task.project_id,
+        )
+
+        # Broaden search across projects if we got fewer than 2 results
+        if len(results) < 2 and task.project_id is not None:
+            broader = self.memory_service.search(query=query, threshold=0.40)
+            seen_ids = {r.id for r in results}
+            for r in broader:
+                if r.id not in seen_ids:
+                    results.append(r)
+            results = results[: self.memory_service.search_k]
+
+        if results:
+            context.metadata["memory_results"] = [
+                {
+                    "content": r.content,
+                    "source": r.source,
+                    "similarity": r.similarity,
+                    "agent": r.agent,
+                    "created_at": r.created_at,
+                }
+                for r in results
+            ]
+            context.metadata["memory_context_block"] = (
+                self.memory_service.format_for_context(results)
+            )
+            logger.debug(
+                f"Injected {len(results)} memory results "
+                f"for: {task.description[:50]}"
+            )
+
         return context
 
     def format_for_agent(self, task: ParsedTask) -> str:

@@ -28,7 +28,13 @@ class ContextFormatter:
         }
 
         formatter = formatter_map.get(agent_type, cls._format_default)
-        return formatter(context)
+        base = formatter(context)
+
+        memory_block = context.metadata.get("memory_context_block", "")
+        if memory_block:
+            base += "\n\n---\n\n" + memory_block
+
+        return base
 
     @classmethod
     def _format_default(cls, context: ProjectContext) -> str:

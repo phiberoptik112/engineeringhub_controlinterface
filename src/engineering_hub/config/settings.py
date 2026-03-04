@@ -81,6 +81,30 @@ class Settings(BaseSettings):
         description="Manifest filename in staging directories",
     )
 
+    # Ollama settings (local embeddings)
+    ollama_host: str = Field(
+        default="http://localhost:11434",
+        description="Ollama server URL for local embeddings",
+    )
+    ollama_embed_model: str = Field(
+        default="nomic-embed-text",
+        description="Model to use for embeddings. Pull with: ollama pull nomic-embed-text",
+    )
+
+    # Memory settings
+    memory_enabled: bool = Field(
+        default=True,
+        description="Enable local vector memory capture and retrieval",
+    )
+    memory_search_k: int = Field(
+        default=5,
+        description="Max memory results injected into agent context per task",
+    )
+    memory_search_threshold: float = Field(
+        default=0.35,
+        description="Minimum cosine similarity for memory results (0.0-1.0)",
+    )
+
     @property
     def journal_file(self) -> Path:
         """Path to the journal file (when in journal mode)."""
@@ -159,7 +183,23 @@ class Settings(BaseSettings):
             if staging.get("manifest_name"):
                 flat_config["staging_manifest_name"] = staging["manifest_name"]
 
-        # Remove None values
-        flat_config = {k: v for k, v in flat_config.items() if v is not None}
+        if "ollama" in config:
+            ollama = config["ollama"]
+            if ollama.get("host"):
+                flat_config["ollama_host"] = ollama["host"]
+            if ollama.get("embed_model"):
+                flat_config["ollama_embed_model"] = ollama["embed_model"]
+
+        if "memory" in config:
+            mem = config["memory"]
+            if mem.get("enabled") is not None:
+                flat_config["memory_enabled"] = mem["enabled"]
+            if mem.get("search_k") is not None:
+                flat_config["memory_search_k"] = mem["search_k"]
+            if mem.get("threshold") is not None:
+                flat_config["memory_search_threshold"] = mem["threshold"]
+
+        # Remove None values and empty strings so env vars are not shadowed by blank YAML fields
+        flat_config = {k: v for k, v in flat_config.items() if v is not None and v != ""}
 
         return cls(**flat_config)

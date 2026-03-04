@@ -47,6 +47,20 @@ journal:
 staging:
   manifest_name: "manifest.json"
 
+# ── Local embeddings ──────────────────────────────────────────────
+ollama:
+  host: "http://localhost:11434"
+  # Pull the model once before first use:
+  #   ollama pull nomic-embed-text     (274MB, 768-dim, fast)
+  #   ollama pull mxbai-embed-large    (670MB, 1024-dim, higher quality)
+  embed_model: "nomic-embed-text"
+
+# ── Memory settings ───────────────────────────────────────────────
+memory:
+  enabled: true
+  search_k: 5         # memories injected per agent task
+  threshold: 0.35     # cosine similarity floor (0.0-1.0)
+
 # Agent configurations (optional - defaults are provided)
 # agents:
 #   research:

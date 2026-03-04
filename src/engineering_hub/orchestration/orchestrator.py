@@ -5,14 +5,16 @@ import signal
 import sys
 import threading
 from pathlib import Path
+from typing import Optional
 
 from engineering_hub.actions.file_ingest import FileIngestAction
 from engineering_hub.agents.worker import AgentWorker
 from engineering_hub.config.settings import Settings
 from engineering_hub.context.manager import ContextManager
-from engineering_hub.core.constants import is_ingest_task
+from engineering_hub.core.constants import TaskStatus, is_ingest_task
 from engineering_hub.core.models import ParsedTask, TaskResult
 from engineering_hub.django.client import DjangoClient
+from engineering_hub.memory.service import MemoryService
 from engineering_hub.notes.manager import SharedNotesManager
 from engineering_hub.orchestration.dispatcher import TaskDispatcher
 from engineering_hub.orchestration.watcher import FileWatcher
@@ -54,12 +56,16 @@ class Orchestrator:
             cache_ttl=self.settings.django_cache_ttl,
         )
 
+        # Memory service (standalone, no Django dependency)
+        self.memory_service: Optional[MemoryService] = self._init_memory_service()
+
         # Context manager
         self.context_manager = ContextManager(
             django_client=self.django_client,
             notes_manager=self.notes_manager,
             output_dir=self.settings.output_dir,
             workspace_dir=self.settings.workspace_dir,
+            memory_service=self.memory_service,
         )
 
         # Agent worker
@@ -107,7 +113,12 @@ class Orchestrator:
         context = self.context_manager.format_for_agent(task)
 
         # Execute with agent
-        return self.agent_worker.execute(task, context)
+        result = self.agent_worker.execute(task, context)
+
+        if result.success:
+            self._capture_task_result(task, result)
+
+        return result
 
     def _execute_ingest(self, task: ParsedTask) -> TaskResult:
         """Execute file ingest action for a task."""
@@ -120,6 +131,62 @@ class Orchestrator:
             success=result.success,
             output_path=result.manifest_path,
             error_message=result.error_message,
+        )
+
+    def _init_memory_service(self) -> Optional[MemoryService]:
+        """Initialise memory service. Returns None if disabled or on error."""
+        if not self.settings.memory_enabled:
+            logger.info("Memory service disabled in config")
+            return None
+
+        try:
+            return MemoryService.from_workspace(
+                workspace_dir=self.settings.workspace_dir,
+                ollama_host=self.settings.ollama_host,
+                ollama_model=self.settings.ollama_embed_model,
+                enabled=True,
+                search_k=self.settings.memory_search_k,
+                search_threshold=self.settings.memory_search_threshold,
+            )
+        except Exception as e:
+            logger.warning(f"Memory service init failed (non-fatal): {e}")
+            return None
+
+    def _capture_task_result(self, task: ParsedTask, result: TaskResult) -> None:
+        """
+        Store agent output as a memory after successful task completion.
+
+        Two entries are written:
+        1. The full agent response (for semantic retrieval of detailed findings).
+        2. A short task summary (for 'what did I work on' style queries).
+        """
+        if self.memory_service is None or not result.success:
+            return
+
+        proj_tag = f"project_{task.project_id}" if task.project_id else "no_project"
+        base_tags = [task.agent, proj_tag]
+
+        if result.agent_response:
+            self.memory_service.capture(
+                content=result.agent_response,
+                source="task_output",
+                project_id=task.project_id,
+                agent=task.agent,
+                tags=base_tags,
+            )
+
+        summary = f"@{task.agent} completed: {task.description}"
+        if result.output_path:
+            summary += f"\nOutput: {result.output_path}"
+        if task.project_id:
+            summary += f"\nProject: {task.project_id}"
+
+        self.memory_service.capture(
+            content=summary,
+            source="task_output",
+            project_id=task.project_id,
+            agent=task.agent,
+            tags=base_tags + ["summary"],
         )
 
     def _on_notes_changed(self) -> None:
@@ -233,11 +300,9 @@ class Orchestrator:
             Status dictionary
         """
         pending = self.notes_manager.get_pending_tasks()
-        in_progress = self.notes_manager.get_tasks_by_status(
-            __import__("engineering_hub.core.constants", fromlist=["TaskStatus"]).TaskStatus.IN_PROGRESS
-        )
+        in_progress = self.notes_manager.get_tasks_by_status(TaskStatus.IN_PROGRESS)
 
-        return {
+        status = {
             "watcher_running": self.watcher.is_running,
             "dispatcher_running": self.dispatcher.is_running,
             "queue_size": self.dispatcher.queue_size,
@@ -245,4 +310,10 @@ class Orchestrator:
             "in_progress_tasks": len(in_progress),
             "notes_file": str(self.settings.notes_file),
             "output_dir": str(self.settings.output_dir),
+            "memory_enabled": self.memory_service is not None,
         }
+
+        if self.memory_service is not None:
+            status["memory_stats"] = self.memory_service.get_stats()
+
+        return status

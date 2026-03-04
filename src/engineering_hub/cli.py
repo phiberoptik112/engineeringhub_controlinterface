@@ -2,6 +2,7 @@
 
 import argparse
 import logging
+import os
 import sys
 from datetime import date
 from pathlib import Path
@@ -296,6 +297,62 @@ sync_url: http://localhost:8000/api
     return 0
 
 
+def cmd_mcp_server(args: argparse.Namespace) -> int:
+    """Start the local MCP server."""
+    from engineering_hub.mcp.server import run_server
+
+    setup_logging(args.verbose)
+    host = args.host
+    port = args.port
+    console.print(f"[bold green]Starting MCP server on {host}:{port}[/bold green]")
+    console.print(
+        f"[dim]Auth key: {os.environ.get('ENGINEERING_HUB_MCP_KEY', 'local-dev-key')}[/dim]"
+    )
+    run_server(host=host, port=port)
+    return 0
+
+
+def cmd_memory(args: argparse.Namespace) -> int:
+    """Query or inspect the local memory database."""
+    setup_logging(args.verbose)
+    settings = load_settings(args.config)
+
+    from engineering_hub.memory import MemoryService
+
+    svc = MemoryService.from_workspace(
+        workspace_dir=settings.workspace_dir,
+        ollama_host=settings.ollama_host,
+        ollama_model=settings.ollama_embed_model,
+        enabled=settings.memory_enabled,
+    )
+
+    if args.memory_command == "stats":
+        stats = svc.get_stats()
+        console.print_json(data=stats)
+
+    elif args.memory_command == "search":
+        results = svc.search(query=args.query, k=args.k)
+        if not results:
+            console.print("[dim]No results.[/dim]")
+        for r in results:
+            console.print(r.as_context_snippet())
+            console.print()
+
+    elif args.memory_command == "recent":
+        rows = svc.browse_recent(limit=args.limit)
+        if not rows:
+            console.print("[dim]No memories stored yet.[/dim]")
+        for r in rows:
+            date_str = (r.get("created_at") or "")[:10]
+            console.print(f"[cyan]{date_str}[/cyan] [{r['source']}] {r['content'][:120]}")
+
+    else:
+        console.print("[yellow]Usage: engineering-hub memory {stats|search|recent}[/yellow]")
+
+    svc.db.close()
+    return 0
+
+
 def main() -> int:
     """Main entry point."""
     parser = argparse.ArgumentParser(
@@ -341,6 +398,24 @@ def main() -> int:
         help="Overwrite existing files",
     )
 
+    # mcp-server command
+    mcp_parser = subparsers.add_parser("mcp-server", help="Start local MCP memory server")
+    mcp_parser.add_argument("--host", default="127.0.0.1", help="Bind address")
+    mcp_parser.add_argument("--port", type=int, default=3456, help="Port number")
+
+    # memory command
+    memory_parser = subparsers.add_parser("memory", help="Inspect the local memory database")
+    memory_sub = memory_parser.add_subparsers(dest="memory_command")
+
+    memory_sub.add_parser("stats", help="Show memory statistics")
+
+    recent_p = memory_sub.add_parser("recent", help="Browse recent memories")
+    recent_p.add_argument("--limit", type=int, default=20, help="Number of entries")
+
+    search_p = memory_sub.add_parser("search", help="Semantic search")
+    search_p.add_argument("query", help="Search query")
+    search_p.add_argument("--k", type=int, default=5, help="Max results")
+
     args = parser.parse_args()
     setup_logging(args.verbose)
 
@@ -353,6 +428,8 @@ def main() -> int:
         "status": cmd_status,
         "run-once": cmd_run_once,
         "init": cmd_init,
+        "mcp-server": cmd_mcp_server,
+        "memory": cmd_memory,
     }
 
     return commands[args.command](args)
