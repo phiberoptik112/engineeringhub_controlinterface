@@ -81,6 +81,12 @@ class Settings(BaseSettings):
         description="Manifest filename in staging directories",
     )
 
+    # Org-roam journal directory (for weekly review)
+    org_journal_dir: Path = Field(
+        default=Path.home() / "org-roam" / "journal",
+        description="Path to org-roam daily journal directory (YYYY-MM-DD.org files)",
+    )
+
     # Ollama settings (local embeddings)
     ollama_host: str = Field(
         default="http://localhost:11434",
@@ -177,6 +183,8 @@ class Settings(BaseSettings):
                 flat_config["journal_filename"] = journal["file"]
             if journal.get("categories"):
                 flat_config["journal_categories"] = journal["categories"]
+            if journal.get("org_journal_dir"):
+                flat_config["org_journal_dir"] = Path(journal["org_journal_dir"]).expanduser()
 
         if "staging" in config:
             staging = config["staging"]

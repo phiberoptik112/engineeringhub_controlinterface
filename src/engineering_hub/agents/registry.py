@@ -56,6 +56,12 @@ DEFAULT_AGENT_CONFIGS = {
         tools=["ingest_files", "get_project_file"],
         max_tokens=4000,
     ),
+    AgentType.WEEKLY_REVIEWER: AgentConfig(
+        agent_type=AgentType.WEEKLY_REVIEWER,
+        prompt_file="weekly-reviewer.txt",
+        tools=[],
+        max_tokens=6000,
+    ),
 }
 
 

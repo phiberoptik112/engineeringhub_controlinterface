@@ -200,6 +200,48 @@ class AgentWorker:
 
         return output_path
 
+    def run_weekly_review(self, context: str, output_path: Path) -> str:
+        """Run the weekly reviewer agent with pre-built context.
+
+        Unlike execute(), this method takes the full context string directly
+        (no ParsedTask). The weekly reviewer prompt is loaded from
+        prompts/weekly-reviewer.txt.
+
+        Args:
+            context: Pre-built context string (journal entries + agent work)
+            output_path: Where to write the review report
+
+        Returns:
+            The agent response text
+
+        Raises:
+            AgentExecutionError: If the Claude API call or file write fails
+        """
+        config = self._registry.get_config(AgentType.WEEKLY_REVIEWER)
+        max_tokens = config.max_tokens if config else 6000
+
+        system_prompt = self._prompt_loader.get_prompt(AgentType.WEEKLY_REVIEWER)
+
+        logger.info("Running weekly reviewer agent...")
+        try:
+            message = self._client.messages.create(
+                model=self.model,
+                max_tokens=max_tokens,
+                system=system_prompt,
+                messages=[{"role": "user", "content": context}],
+            )
+        except anthropic.APIError as e:
+            raise AgentExecutionError(f"Claude API error during weekly review: {e}") from e
+
+        text_parts = [block.text for block in message.content if hasattr(block, "text")]
+        response = "\n".join(text_parts)
+
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(response, encoding="utf-8")
+        logger.info(f"Weekly review written to {output_path}")
+
+        return response
+
     def test_connection(self) -> bool:
         """Test the Claude API connection.
 

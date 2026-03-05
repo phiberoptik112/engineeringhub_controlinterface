@@ -34,6 +34,15 @@ if [ -z "${ENGINEERING_HUB_DJANGO_API_TOKEN:-}" ]; then
     echo "⚠ Warning: No Django API token set (ENGINEERING_HUB_DJANGO_API_TOKEN)"
 fi
 
+# Check Ollama availability (used for memory embeddings and weekly-review agent work context)
+if curl -sf http://localhost:11434/api/tags >/dev/null 2>&1; then
+    echo "✓ Ollama running (memory embeddings available)"
+else
+    echo "⚠ Ollama not running — memory embeddings disabled"
+    echo "  Start with: ollama serve"
+    echo "  Pull model: ollama pull nomic-embed-text"
+fi
+
 # Display Python version
 echo "✓ Python: $(python --version)"
 echo "✓ Working directory: $SCRIPT_DIR"
