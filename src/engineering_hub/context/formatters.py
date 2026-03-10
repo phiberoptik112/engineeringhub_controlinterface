@@ -79,6 +79,9 @@ class ContextFormatter:
             for f in context.recent_files:
                 lines.append(f"- {f.title} ({f.file_type})")
 
+        # Task-referenced documents
+        lines.extend(cls._format_task_file_contents(context))
+
         # Research guidance
         lines.extend(
             [
@@ -133,6 +136,9 @@ class ContextFormatter:
         # Staged source documents from ingest
         lines.extend(cls._format_staged_files_section(context))
 
+        # Task-referenced documents
+        lines.extend(cls._format_task_file_contents(context))
+
         # Writing guidance based on client level
         lines.extend(["", "### Writing Guidelines"])
         if tech_level == "low":
@@ -180,6 +186,50 @@ class ContextFormatter:
         return lines
 
     @classmethod
+    def _format_task_file_contents(
+        cls,
+        context: ProjectContext,
+        max_chars_per_file: int = 40000,
+        label_roles: bool = False,
+    ) -> list[str]:
+        """Format task-referenced file contents into a context section.
+
+        Used by all agent formatters. When ``label_roles`` is True (used by the
+        technical-reviewer formatter), .tex files are labeled as the Draft Document
+        and .md/.pdf files are labeled as Review Comments, so the agent knows which
+        role each file plays without having to infer it from the filename.
+        """
+        task_files = context.metadata.get("task_file_contents", [])
+        if not task_files:
+            return []
+
+        lines = ["", "### Referenced Documents"]
+        for tf in task_files:
+            name = tf.get("name", "file")
+            file_type = tf.get("file_type", "")
+
+            if label_roles:
+                if file_type == "tex":
+                    role = "Draft Document"
+                elif file_type in ("md", "pdf", "docx"):
+                    role = "Review Comments"
+                else:
+                    role = file_type.upper() if file_type else "Document"
+                label = f"{name} — {role}"
+            else:
+                label = f"{name} ({file_type})" if file_type else name
+
+            lines.append(f"\n#### {label}")
+            lines.append("```")
+            content = tf.get("content", "")
+            lines.append(
+                content[:max_chars_per_file]
+                + ("..." if len(content) > max_chars_per_file else "")
+            )
+            lines.append("```")
+        return lines
+
+    @classmethod
     def _format_for_standards_checker(cls, context: ProjectContext) -> str:
         """Format context for standards checker agent.
 
@@ -211,6 +261,9 @@ class ContextFormatter:
             lines.extend(["", "### Documents Available for Review"])
             for f in context.recent_files:
                 lines.append(f"- {f.title} ({f.file_type})")
+
+        # Task-referenced documents
+        lines.extend(cls._format_task_file_contents(context))
 
         # Compliance guidance
         lines.extend(
@@ -357,15 +410,7 @@ class ContextFormatter:
                         lines.append("")
                         lines.append(content[:2000] + ("..." if len(content) > 2000 else ""))
 
-        task_files = context.metadata.get("task_file_contents", [])
-        if task_files:
-            lines.extend(["", "### Document Source Files"])
-            for tf in task_files:
-                lines.append(f"\n#### {tf.get('name', 'file')}")
-                lines.append("```")
-                content = tf.get("content", "")
-                lines.append(content[:8000] + ("..." if len(content) > 8000 else ""))
-                lines.append("```")
+        lines.extend(cls._format_task_file_contents(context, label_roles=True))
 
         lines.extend(
             [

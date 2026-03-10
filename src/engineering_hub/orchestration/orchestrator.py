@@ -42,11 +42,30 @@ class Orchestrator:
 
     def _init_components(self) -> None:
         """Initialize all orchestrator components."""
-        # Notes manager (journal or legacy mode)
+        # Org mode: watch the daily journal directory; otherwise watch the notes file.
+        if self.settings.use_org_mode:
+            notes_path = self.settings.org_journal_dir
+        else:
+            notes_path = self.settings.notes_file
+
+        # Notes manager (org, journal, or legacy mode) — task dispatch window
         self.notes_manager = SharedNotesManager(
-            self.settings.notes_file,
+            notes_path,
             use_journal_mode=self.settings.use_journal_mode,
             journal_categories=self.settings.journal_categories,
+            use_org_mode=self.settings.use_org_mode,
+            org_task_sections=self.settings.org_task_sections,
+            org_lookback_days=self.settings.org_lookback_days,
+        )
+
+        # Separate notes manager with a wider lookback for context enrichment
+        self._history_notes_manager = SharedNotesManager(
+            notes_path,
+            use_journal_mode=self.settings.use_journal_mode,
+            journal_categories=self.settings.journal_categories,
+            use_org_mode=self.settings.use_org_mode,
+            org_task_sections=self.settings.org_task_sections,
+            org_lookback_days=self.settings.org_context_lookback_days,
         )
 
         # Django client
@@ -65,7 +84,9 @@ class Orchestrator:
             notes_manager=self.notes_manager,
             output_dir=self.settings.output_dir,
             workspace_dir=self.settings.workspace_dir,
+            inputs_dir=self.settings.resolved_inputs_dir,
             memory_service=self.memory_service,
+            history_notes_manager=self._history_notes_manager,
         )
 
         # Agent worker
@@ -85,9 +106,10 @@ class Orchestrator:
 
         # File watcher (created but not started)
         self.watcher = FileWatcher(
-            notes_path=self.settings.notes_file,
+            notes_path=notes_path,
             callback=self._on_notes_changed,
             debounce_seconds=1.0,
+            watch_dir=self.settings.use_org_mode,
         )
 
         # File ingest action
@@ -108,6 +130,27 @@ class Orchestrator:
         # Route ingest tasks to FileIngestAction before agent
         if is_ingest_task(task.description):
             return self._execute_ingest(task)
+
+        # Pre-flight: verify all input files exist before calling the agent
+        if task.input_paths:
+            missing = []
+            for path_str in task.input_paths:
+                resolved = self.context_manager._resolve_input_path(path_str)
+                if resolved is None or not resolved.is_file():
+                    missing.append(path_str)
+            if missing:
+                missing_list = ", ".join(missing)
+                error_msg = (
+                    f"Input file(s) not found: {missing_list}. "
+                    f"Place them under {self.context_manager.inputs_dir} "
+                    f"or use an absolute path."
+                )
+                logger.error(error_msg)
+                return TaskResult(
+                    task=task,
+                    success=False,
+                    error_message=error_msg,
+                )
 
         # Build context for the task
         context = self.context_manager.format_for_agent(task)
@@ -198,11 +241,16 @@ class Orchestrator:
         """Start the orchestrator."""
         logger.info("Starting Engineering Hub orchestrator...")
 
-        # Validate notes file exists
+        # Validate notes file / journal dir exists
         if not self.notes_manager.file_exists():
+            notes_display = (
+                self.settings.org_journal_dir
+                if self.settings.use_org_mode
+                else self.settings.notes_file
+            )
             raise FileNotFoundError(
-                f"Notes file not found: {self.settings.notes_file}\n"
-                "Create the file or check your configuration."
+                f"Notes path not found: {notes_display}\n"
+                "Create the file/directory or check your configuration."
             )
 
         # Test Claude API connection
@@ -218,8 +266,13 @@ class Orchestrator:
         # Start file watcher
         self.watcher.start()
 
+        watch_path = (
+            self.settings.org_journal_dir
+            if self.settings.use_org_mode
+            else self.settings.notes_file
+        )
         logger.info("Orchestrator started successfully")
-        logger.info(f"Watching: {self.settings.notes_file}")
+        logger.info(f"Watching: {watch_path}")
         logger.info(f"Outputs: {self.settings.output_dir}")
 
     def stop(self) -> None:

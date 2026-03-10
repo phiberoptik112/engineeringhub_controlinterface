@@ -57,6 +57,10 @@ class Settings(BaseSettings):
         default=Path.home() / "org-roam" / "engineering-hub",
         description="Base workspace directory",
     )
+    inputs_dir: Path | None = Field(
+        default=None,
+        description="Working directory for input files (PDFs, DOCX, .md). Defaults to workspace_dir/inputs",
+    )
 
     # Journal mode (vs legacy shared-notes.md)
     use_journal_mode: bool = Field(
@@ -81,10 +85,34 @@ class Settings(BaseSettings):
         description="Manifest filename in staging directories",
     )
 
-    # Org-roam journal directory (for weekly review)
+    # Org-roam journal directory (for weekly review and org task dispatch)
     org_journal_dir: Path = Field(
         default=Path.home() / "org-roam" / "journal",
         description="Path to org-roam daily journal directory (YYYY-MM-DD.org files)",
+    )
+
+    # Org mode: use org-roam daily journals as the task source instead of journal.md
+    use_org_mode: bool = Field(
+        default=False,
+        description="Use org-roam daily .org files for task dispatch instead of journal.md",
+    )
+
+    # Org headings to scan for agent tasks
+    org_task_sections: list[str] = Field(
+        default_factory=lambda: ["Overnight Agent Tasks"],
+        description="Org heading names whose list items are parsed as agent tasks",
+    )
+
+    # How many recent days to scan for pending tasks in org mode
+    org_lookback_days: int = Field(
+        default=2,
+        description="Number of recent daily journal files to scan for pending tasks",
+    )
+
+    # How many recent days to scan when enriching agent context with historical tasks
+    org_context_lookback_days: int = Field(
+        default=7,
+        description="Number of recent daily journal files to include when building historical task context for agents",
     )
 
     # Ollama settings (local embeddings)
@@ -110,6 +138,13 @@ class Settings(BaseSettings):
         default=0.35,
         description="Minimum cosine similarity for memory results (0.0-1.0)",
     )
+
+    @property
+    def resolved_inputs_dir(self) -> Path:
+        """Effective inputs directory — custom path if set, else workspace_dir/inputs."""
+        if self.inputs_dir is not None:
+            return self.inputs_dir
+        return self.workspace_dir / "inputs"
 
     @property
     def journal_file(self) -> Path:
@@ -174,6 +209,9 @@ class Settings(BaseSettings):
             workspace = config["workspace"].get("dir")
             if workspace:
                 flat_config["workspace_dir"] = Path(workspace).expanduser()
+            inputs = config["workspace"].get("inputs_dir")
+            if inputs:
+                flat_config["inputs_dir"] = Path(inputs).expanduser()
 
         if "journal" in config:
             journal = config["journal"]
@@ -185,6 +223,14 @@ class Settings(BaseSettings):
                 flat_config["journal_categories"] = journal["categories"]
             if journal.get("org_journal_dir"):
                 flat_config["org_journal_dir"] = Path(journal["org_journal_dir"]).expanduser()
+            if journal.get("use_org_mode") is not None:
+                flat_config["use_org_mode"] = journal["use_org_mode"]
+            if journal.get("org_task_sections"):
+                flat_config["org_task_sections"] = journal["org_task_sections"]
+            if journal.get("org_lookback_days") is not None:
+                flat_config["org_lookback_days"] = journal["org_lookback_days"]
+            if journal.get("org_context_lookback_days") is not None:
+                flat_config["org_context_lookback_days"] = journal["org_context_lookback_days"]
 
         if "staging" in config:
             staging = config["staging"]

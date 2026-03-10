@@ -30,10 +30,46 @@ workspace:
   # Default: ~/org-roam/engineering-hub
   dir: "~/org-roam/engineering-hub"
 
-# Journal mode: daily journal with category-based task delegation
+  # Working directory for input files (PDFs, DOCX, .md).
+  # Drop files here and reference them with short relative paths in task wikilinks:
+  #   [[inputs/project-25/client-brief.pdf]]
+  # Defaults to workspace_dir/inputs if not set.
+  # inputs_dir: "~/org-roam/engineering-hub/inputs"
+
+# Journal / task dispatch mode
+#
+# Three mutually exclusive modes (use_org_mode takes priority):
+#
+#   use_org_mode: true   — read tasks from org-roam daily journal .org files
+#                          (recommended — integrates with your existing workflow)
+#   use_journal_mode: true — read tasks from workspace_dir/journal.md
+#   (neither)            — legacy shared-notes.md with @agent: STATUS blocks
+#
 journal:
-  # Use journal.md (true) or legacy shared-notes.md (false)
-  use_journal_mode: true
+  # ── Org mode (org-roam daily journal) ─────────────────────────────
+  # Watches org_journal_dir for *.org changes.
+  # Tasks are written as:  - [ ] @research: description [[django://project/25]]
+  # Load config/engineering-hub-capture.el in Emacs to get capture templates.
+  use_org_mode: true
+
+  # Path to daily .org files (YYYY-MM-DD.org)
+  # Default: ~/org-roam/journal
+  # org_journal_dir: "~/org-roam/journal"
+
+  # Org headings whose list items are treated as agent tasks
+  org_task_sections:
+    - "Overnight Agent Tasks"
+
+  # How many recent daily files to scan for pending tasks (2 = today + yesterday)
+  org_lookback_days: 2
+
+  # How many recent daily files to include when building historical task context
+  # for agents (used by context enrichment, not task dispatch)
+  org_context_lookback_days: 7
+
+  # ── Markdown journal mode (fallback) ──────────────────────────────
+  # Only active when use_org_mode is false.
+  use_journal_mode: false
 
   # Category header -> agent mapping (items under these become tasks)
   categories:

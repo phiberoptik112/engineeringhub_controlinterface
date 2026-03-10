@@ -7,6 +7,7 @@ import logging
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from engineering_hub.actions.file_ingest import FileIngestAction
 from engineering_hub.core.constants import AgentType
 from engineering_hub.core.models import (
     FileInfo,
@@ -34,22 +35,34 @@ class ContextManager:
         notes_manager: SharedNotesManager,
         output_dir: Path | None = None,
         workspace_dir: Path | None = None,
+        inputs_dir: Path | None = None,
         memory_service: MemoryService | None = None,
+        history_notes_manager: SharedNotesManager | None = None,
     ) -> None:
         """Initialize context manager.
 
         Args:
             django_client: Client for Django API
-            notes_manager: Manager for shared notes
+            notes_manager: Manager for shared notes (task dispatch window)
             output_dir: Base output directory (for staging manifest lookup)
             workspace_dir: Workspace directory (for resolving task file paths)
+            inputs_dir: Working directory for input files (PDFs, DOCX, .md).
+                Defaults to workspace_dir/inputs.
             memory_service: Optional memory service for semantic context enrichment
+            history_notes_manager: Optional separate manager with a longer lookback
+                for enriching agent context with historical completed tasks. Falls
+                back to notes_manager if not provided.
         """
         self.django_client = django_client
         self.notes_manager = notes_manager
+        self._history_notes_manager = history_notes_manager or notes_manager
         self.output_dir = Path(output_dir) if output_dir else Path("outputs")
         self.workspace_dir = Path(workspace_dir) if workspace_dir else Path.cwd()
+        self.inputs_dir = (
+            Path(inputs_dir) if inputs_dir else self.workspace_dir / "inputs"
+        )
         self.memory_service = memory_service
+        self._file_ingest = FileIngestAction(output_dir=self.output_dir)
 
     def build_context(self, task: ParsedTask) -> ProjectContext:
         """Build project context for a task.
@@ -137,12 +150,12 @@ class ContextManager:
     ) -> ProjectContext:
         """Enrich context with historical data from shared notes.
 
-        This adds information about previous tasks, decisions, and
-        research findings for the same project.
+        Uses the history notes manager (wider lookback) so agents can see
+        completed tasks from earlier in the week, not just today's file.
         """
         try:
-            # Get all tasks for this project
-            all_tasks = self.notes_manager.get_all_tasks()
+            # Get all tasks for this project using the extended lookback manager
+            all_tasks = self._history_notes_manager.get_all_tasks()
             project_tasks = [t for t in all_tasks if t.project_id == project_id]
 
             # Add task history to metadata
@@ -192,29 +205,58 @@ class ContextManager:
             logger.warning(f"Failed to enrich with staged files: {e}")
         return context
 
+    def _resolve_input_path(self, path_str: str) -> Path | None:
+        """Resolve a task input path, checking workspace_dir then inputs_dir.
+
+        Returns the resolved Path if the file exists, else None.
+        """
+        candidate = Path(path_str).expanduser()
+        if candidate.is_absolute():
+            return candidate.resolve() if candidate.exists() else None
+
+        # Try relative to workspace_dir first
+        from_workspace = (self.workspace_dir / candidate).resolve()
+        if from_workspace.exists():
+            return from_workspace
+
+        # Fallback: relative to inputs_dir
+        from_inputs = (self.inputs_dir / candidate).resolve()
+        if from_inputs.exists():
+            return from_inputs
+
+        return None
+
+    def _read_input_file(self, path: Path) -> str:
+        """Read a file's content, routing binary formats through the converter."""
+        suffix = path.suffix.lower()
+        if suffix in (".pdf", ".docx"):
+            result = self._file_ingest._convert_to_markdown(path)
+            return result if result is not None else f"(Could not convert {path.name})"
+        return path.read_text(encoding="utf-8", errors="replace")
+
     def _enrich_with_task_file_refs(
         self,
         context: ProjectContext,
         task: ParsedTask,
     ) -> ProjectContext:
-        """Enrich context with contents of files referenced in task (e.g. .tex)."""
+        """Enrich context with contents of files referenced in the task wikilinks."""
         if not task.input_paths:
             return context
 
         contents: list[dict] = []
         for path_str in task.input_paths:
             try:
-                resolved = Path(path_str).expanduser()
-                if not resolved.is_absolute():
-                    resolved = self.workspace_dir / resolved
-                resolved = resolved.resolve()
-                if resolved.exists() and resolved.is_file():
-                    text = resolved.read_text(encoding="utf-8", errors="replace")
-                    contents.append({
-                        "path": str(resolved),
-                        "name": resolved.name,
-                        "content": text,
-                    })
+                resolved = self._resolve_input_path(path_str)
+                if resolved is None or not resolved.is_file():
+                    logger.warning(f"Task file not found: {path_str}")
+                    continue
+                text = self._read_input_file(resolved)
+                contents.append({
+                    "path": str(resolved),
+                    "name": resolved.name,
+                    "file_type": resolved.suffix.lower().lstrip("."),
+                    "content": text,
+                })
             except Exception as e:
                 logger.warning(f"Failed to read task file {path_str}: {e}")
 

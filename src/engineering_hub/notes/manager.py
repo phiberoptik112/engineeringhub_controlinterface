@@ -7,37 +7,64 @@ from engineering_hub.core.constants import TaskStatus
 from engineering_hub.core.models import AgentMessage, ParsedTask
 from engineering_hub.notes.journal_parser import JournalParser
 from engineering_hub.notes.journal_writer import JournalWriter
+from engineering_hub.notes.org_task_parser import OrgTaskParser
+from engineering_hub.notes.org_task_writer import OrgTaskWriter
 from engineering_hub.notes.parser import NotesParser
 from engineering_hub.notes.writer import NotesWriter
 
 
 class SharedNotesManager:
-    """Facade for shared notes parsing and writing operations."""
+    """Facade for shared notes parsing and writing operations.
+
+    Supports three modes selected by constructor flags (mutually exclusive,
+    evaluated in priority order):
+
+    1. **org mode** (``use_org_mode=True``) — reads tasks from ``* Overnight
+       Agent Tasks`` sections of org-roam daily ``.org`` files.
+    2. **journal mode** (``use_journal_mode=True``) — reads tasks from a
+       ``journal.md`` file with dated sections and category headers.
+    3. **legacy mode** (default) — reads tasks from a ``shared-notes.md`` file
+       with ``### @agent: STATUS`` blocks.
+    """
 
     def __init__(
         self,
         notes_path: Path,
         use_journal_mode: bool = False,
         journal_categories: dict[str, str] | None = None,
+        use_org_mode: bool = False,
+        org_task_sections: list[str] | None = None,
+        org_lookback_days: int = 1,
     ) -> None:
-        """Initialize manager with path and optional journal mode.
+        """Initialize manager.
 
         Args:
-            notes_path: Path to notes file (journal.md or shared-notes.md)
-            use_journal_mode: If True, use journal parser/writer
-            journal_categories: Category-to-agent mapping for journal mode
+            notes_path: Path to notes file *or* org journal directory (org mode).
+            use_journal_mode: Use journal.md category-based parser.
+            journal_categories: Category-to-agent mapping for journal mode.
+            use_org_mode: Use org-roam daily journal parser (takes priority).
+            org_task_sections: Org heading names to scan for tasks.
+            org_lookback_days: How many recent daily files to scan.
         """
         self.path = notes_path
-        self._use_journal = use_journal_mode
+        self._use_org = use_org_mode
+        self._use_journal = use_journal_mode and not use_org_mode
         self._category_mapping = journal_categories or {}
 
-        if use_journal_mode:
+        if use_org_mode:
+            self._org_parser = OrgTaskParser(
+                journal_dir=notes_path,
+                task_sections=org_task_sections,
+                lookback_days=org_lookback_days,
+            )
+            self._writer = OrgTaskWriter(journal_dir=notes_path)
+        elif use_journal_mode:
             self._writer = JournalWriter(notes_path)
         else:
             self._writer = NotesWriter(notes_path)
 
     def _get_parser(self) -> NotesParser | JournalParser:
-        """Get a fresh parser with current file content."""
+        """Get a fresh parser for legacy/journal modes."""
         if self._use_journal:
             return JournalParser.from_file(self.path, self._category_mapping)
         return NotesParser.from_file(self.path)
@@ -48,10 +75,14 @@ class SharedNotesManager:
 
     def get_all_tasks(self) -> list[ParsedTask]:
         """Get all tasks from the notes file."""
+        if self._use_org:
+            return self._org_parser.parse_tasks()
         return self._get_parser().parse_tasks()
 
     def get_pending_tasks(self) -> list[ParsedTask]:
         """Get all tasks with PENDING status."""
+        if self._use_org:
+            return self._org_parser.get_pending_tasks()
         return self._get_parser().get_pending_tasks()
 
     def get_tasks_by_status(self, status: TaskStatus) -> list[ParsedTask]:
@@ -106,5 +137,5 @@ class SharedNotesManager:
         )
 
     def file_exists(self) -> bool:
-        """Check if the notes file exists."""
+        """Check if the notes file (or journal directory for org mode) exists."""
         return self.path.exists()

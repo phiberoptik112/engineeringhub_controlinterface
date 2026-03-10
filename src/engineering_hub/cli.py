@@ -91,8 +91,16 @@ def cmd_status(args: argparse.Namespace) -> int:
     table.add_column("Value", style="green")
 
     table.add_row("Workspace", str(settings.workspace_dir))
-    table.add_row("Notes File", str(settings.notes_file))
-    table.add_row("Notes Exists", "✓" if settings.notes_file.exists() else "✗")
+
+    if settings.use_org_mode:
+        notes_display = str(settings.org_journal_dir)
+        notes_exists = settings.org_journal_dir.exists()
+        table.add_row("Task Source (org)", notes_display)
+        table.add_row("Org Journal Exists", "✓" if notes_exists else "✗")
+    else:
+        table.add_row("Notes File", str(settings.notes_file))
+        table.add_row("Notes Exists", "✓" if settings.notes_file.exists() else "✗")
+
     table.add_row("Output Dir", str(settings.output_dir))
     table.add_row("Django API", settings.django_api_url)
     table.add_row("Django Token", "✓ Set" if settings.django_api_token else "✗ Not set")
@@ -101,14 +109,24 @@ def cmd_status(args: argparse.Namespace) -> int:
 
     console.print(table)
 
-    # Show pending tasks if notes file exists
-    if settings.notes_file.exists():
-        from engineering_hub.notes.manager import SharedNotesManager
+    # Show pending tasks
+    from engineering_hub.notes.manager import SharedNotesManager
 
+    if settings.use_org_mode:
+        notes_path = settings.org_journal_dir
+        path_exists = settings.org_journal_dir.exists()
+    else:
+        notes_path = settings.notes_file
+        path_exists = settings.notes_file.exists()
+
+    if path_exists:
         manager = SharedNotesManager(
-            settings.notes_file,
+            notes_path,
             use_journal_mode=settings.use_journal_mode,
             journal_categories=settings.journal_categories,
+            use_org_mode=settings.use_org_mode,
+            org_task_sections=settings.org_task_sections,
+            org_lookback_days=settings.org_lookback_days,
         )
         pending = manager.get_pending_tasks()
 
