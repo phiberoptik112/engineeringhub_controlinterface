@@ -2,9 +2,8 @@
 
 import argparse
 import logging
-import os
 import sys
-from datetime import date, datetime, timedelta
+from datetime import date
 from pathlib import Path
 
 from rich.console import Console
@@ -323,137 +322,16 @@ def cmd_weekly_review(args: argparse.Namespace) -> int:
         console.print("[red]Error:[/red] Anthropic API key not set.")
         return 1
 
-    days: int = args.days
-    focus: str | None = args.focus
-
-    # ------------------------------------------------------------------
-    # 1. Read org-roam journal entries
-    # ------------------------------------------------------------------
-    from engineering_hub.notes.weekly_reader import OrgJournalReader
-
-    journal_dir = settings.org_journal_dir
-    if not journal_dir.exists():
-        console.print(
-            f"[yellow]Warning:[/yellow] Org journal directory not found: {journal_dir}\n"
-            "Set journal.org_journal_dir in config.yaml or create the directory."
-        )
-        entries = []
-    else:
-        reader = OrgJournalReader(journal_dir)
-        entries = reader.collect_week(days=days)
-        console.print(
-            f"[dim]Found {len(entries)} journal entries "
-            f"in the last {days} days ({journal_dir})[/dim]"
-        )
-
-    journal_block = OrgJournalReader(journal_dir).format_context(entries) if entries else (
-        "(No journal entries found for this period.)"
-    )
-
-    # ------------------------------------------------------------------
-    # 2. Collect agent work from memory
-    # ------------------------------------------------------------------
-    from engineering_hub.memory import MemoryService
-
-    memory_block = "(Memory service not available or no entries found.)"
-    try:
-        svc = MemoryService.from_workspace(
-            workspace_dir=settings.workspace_dir,
-            ollama_host=settings.ollama_host,
-            ollama_model=settings.ollama_embed_model,
-            enabled=settings.memory_enabled,
-        )
-        cutoff = (date.today() - timedelta(days=days)).isoformat()
-        recent_rows = svc.browse_recent(limit=100)
-        week_rows = [
-            r for r in recent_rows
-            if (r.get("created_at") or "") >= cutoff
-            and r.get("source") in ("task_output", "agent_message")
-        ]
-
-        if week_rows:
-            mem_lines: list[str] = []
-            for r in week_rows:
-                day = (r.get("created_at") or "")[:10]
-                agent = f"@{r['agent']}" if r.get("agent") else "agent"
-                source_label = "Output" if r["source"] == "task_output" else "Message"
-                proj = f" · project {r['project_id']}" if r.get("project_id") else ""
-                mem_lines.append(f"**{source_label} · {agent}{proj} · {day}**")
-                mem_lines.append(r["content"][:600].strip())
-                mem_lines.append("")
-            memory_block = "\n".join(mem_lines).rstrip()
-            console.print(f"[dim]Found {len(week_rows)} agent work entries in memory[/dim]")
-        else:
-            memory_block = "(No agent work entries found in memory for this period.)"
-            console.print("[dim]No agent work entries found in memory this week[/dim]")
-
-        svc.db.close()
-    except Exception as exc:
-        console.print(f"[yellow]Warning:[/yellow] Could not read memory: {exc}")
-
-    # ------------------------------------------------------------------
-    # 3. Scan outputs/ directory for files modified this week
-    # ------------------------------------------------------------------
-    output_files_block = "(outputs/ directory not found or empty.)"
-    try:
-        cutoff_ts = datetime.combine(
-            date.today() - timedelta(days=days), datetime.min.time()
-        ).timestamp()
-        output_dir = settings.output_dir
-        if output_dir.exists():
-            recent_outputs: list[str] = []
-            for f in sorted(output_dir.rglob("*.md"), key=lambda p: p.stat().st_mtime, reverse=True):
-                if f.stat().st_mtime >= cutoff_ts:
-                    rel = f.relative_to(output_dir)
-                    mtime = datetime.fromtimestamp(f.stat().st_mtime).strftime("%Y-%m-%d %H:%M")
-                    recent_outputs.append(f"- `outputs/{rel}` (modified {mtime})")
-            if recent_outputs:
-                output_files_block = "\n".join(recent_outputs)
-                console.print(f"[dim]Found {len(recent_outputs)} output files modified this week[/dim]")
-            else:
-                output_files_block = "(No output files modified during this period.)"
-    except Exception as exc:
-        console.print(f"[yellow]Warning:[/yellow] Could not scan outputs: {exc}")
-
-    # ------------------------------------------------------------------
-    # 4. Build full context message
-    # ------------------------------------------------------------------
-    period_start = (date.today() - timedelta(days=days - 1)).isoformat()
-    period_end = date.today().isoformat()
-
-    context_parts = [
-        f"Review period: {period_start} through {period_end} ({days} days)",
-        "",
-        "<journal_content>",
-        journal_block,
-        "</journal_content>",
-        "",
-        "<agent_work>",
-        memory_block,
-        "</agent_work>",
-        "",
-        "<output_files>",
-        output_files_block,
-        "</output_files>",
-    ]
-    if focus:
-        context_parts += ["", f"USER FOCUS: {focus}"]
-
-    context = "\n".join(context_parts)
-
-    # ------------------------------------------------------------------
-    # 5. Determine output path
-    # ------------------------------------------------------------------
-    if args.output:
-        output_path = Path(args.output).expanduser()
-    else:
-        iso_year, iso_week, _ = date.today().isocalendar()
-        output_path = settings.output_dir / "reviews" / f"weekly-{iso_year}-W{iso_week:02d}.md"
-
-    # ------------------------------------------------------------------
-    # 6. Call the weekly reviewer agent
-    # ------------------------------------------------------------------
     from engineering_hub.agents.worker import AgentWorker
+    from engineering_hub.orchestration.weekly_review_builder import WeeklyReviewBuilder
+
+    builder = WeeklyReviewBuilder(settings)
+    context = builder.build_context(days=args.days, focus=args.focus)
+    output_path = (
+        Path(args.output).expanduser()
+        if args.output
+        else builder.default_output_path()
+    )
 
     worker = AgentWorker(
         api_key=settings.anthropic_api_key,
@@ -469,7 +347,7 @@ def cmd_weekly_review(args: argparse.Namespace) -> int:
         console.print(f"[red]Error:[/red] Weekly review failed: {exc}")
         return 1
 
-    console.print(f"\n[bold green]Weekly review complete![/bold green]")
+    console.print(f"[bold green]Weekly review complete![/bold green]")
     console.print(f"  Report: {output_path}")
     return 0
 
@@ -478,14 +356,18 @@ def cmd_mcp_server(args: argparse.Namespace) -> int:
     """Start the local MCP server."""
     from engineering_hub.mcp.server import run_server
 
-    setup_logging(args.verbose)
-    host = args.host
-    port = args.port
-    console.print(f"[bold green]Starting MCP server on {host}:{port}[/bold green]")
-    console.print(
-        f"[dim]Auth key: {os.environ.get('ENGINEERING_HUB_MCP_KEY', 'local-dev-key')}[/dim]"
-    )
-    run_server(host=host, port=port)
+    transport = args.transport
+
+    if transport == "stdio":
+        logging.basicConfig(level=logging.WARNING, stream=sys.stderr)
+    else:
+        setup_logging(args.verbose)
+        console.print(
+            f"[bold green]Starting MCP server ({transport}) "
+            f"on {args.host}:{args.port}[/bold green]"
+        )
+
+    run_server(transport=transport, host=args.host, port=args.port)
     return 0
 
 
@@ -577,8 +459,14 @@ def main() -> int:
 
     # mcp-server command
     mcp_parser = subparsers.add_parser("mcp-server", help="Start local MCP memory server")
-    mcp_parser.add_argument("--host", default="127.0.0.1", help="Bind address")
-    mcp_parser.add_argument("--port", type=int, default=3456, help="Port number")
+    mcp_parser.add_argument(
+        "--transport", "-t",
+        choices=["stdio", "http"],
+        default="stdio",
+        help="MCP transport: stdio (default, for Claude Desktop/Cursor) or http (network)",
+    )
+    mcp_parser.add_argument("--host", default="127.0.0.1", help="Bind address (http only)")
+    mcp_parser.add_argument("--port", type=int, default=8000, help="Port number (http only)")
 
     # weekly-review command
     weekly_parser = subparsers.add_parser(

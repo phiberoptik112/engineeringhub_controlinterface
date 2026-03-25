@@ -118,6 +118,8 @@ class Orchestrator:
             manifest_name=self.settings.staging_manifest_name,
         )
 
+        self._capture_journal_entries()
+
     def _execute_task(self, task: ParsedTask) -> TaskResult:
         """Execute a task using the agent worker or an action.
 
@@ -160,6 +162,7 @@ class Orchestrator:
 
         if result.success:
             self._capture_task_result(task, result)
+            self._create_roam_wrapper(task, result)
 
         return result
 
@@ -231,6 +234,114 @@ class Orchestrator:
             agent=task.agent,
             tags=base_tags + ["summary"],
         )
+
+    def _create_roam_wrapper(self, task: ParsedTask, result: TaskResult) -> None:
+        """Create a lightweight .org file in the roam directory that links to
+        the agent output, giving it a presence in the org-roam graph."""
+        if not self.settings.roam_wrappers_enabled:
+            return
+        if not result.output_path:
+            return
+
+        import uuid
+        from datetime import datetime
+
+        output_path = Path(result.output_path)
+        node_id = str(uuid.uuid4())
+        timestamp = datetime.now().strftime("%Y-%m-%d %a %H:%M")
+        date_prefix = datetime.now().strftime("%Y%m%d%H%M%S")
+
+        slug = "".join(
+            c if c.isalnum() or c == "-" else "-"
+            for c in task.description[:40].lower()
+        ).strip("-")
+        slug = "-".join(filter(None, slug.split("-")))
+
+        wrapper_dir = self.settings.workspace_dir
+        wrapper_path = wrapper_dir / f"{date_prefix}-{slug}.org"
+
+        proj_tag = f":project-{task.project_id}:" if task.project_id else ""
+        tags = f":engineering:{task.agent}:{proj_tag}"
+
+        journal_ref = (
+            f"[[file:{task.journal_date}.org][{task.journal_date}]]"
+            if task.journal_date
+            else "n/a"
+        )
+
+        content = (
+            f":PROPERTIES:\n"
+            f":ID: {node_id}\n"
+            f":END:\n"
+            f"#+title: {task.agent}: {task.description[:60]}\n"
+            f"#+filetags: {tags}\n"
+            f"#+created: [{timestamp}]\n"
+            f"\n"
+            f"* Output\n"
+            f"\n"
+            f"Agent output: [[file:{output_path}]]\n"
+            f"\n"
+            f"* Task context\n"
+            f"\n"
+            f"- Agent: ={task.agent}=\n"
+            f"- Project: {task.project_id or 'none'}\n"
+            f"- Journal: {journal_ref}\n"
+            f"- Description: {task.description}\n"
+        )
+
+        try:
+            wrapper_path.write_text(content, encoding="utf-8")
+            logger.info(f"Roam wrapper: {wrapper_path.name}")
+        except OSError as e:
+            logger.warning(f"Failed to write roam wrapper: {e}")
+
+    def _capture_journal_entries(self) -> None:
+        """Backfill recent journal entries into memory.
+
+        Reads daily .org files from the context lookback window and captures
+        any section content that hasn't been stored yet (based on the
+        latest journal_entry timestamp in memory).
+        """
+        if self.memory_service is None:
+            return
+        if not self.settings.use_org_mode:
+            return
+
+        from engineering_hub.notes.weekly_reader import OrgJournalReader
+
+        reader = OrgJournalReader(self.settings.org_journal_dir)
+        entries = reader.collect_week(days=self.settings.org_context_lookback_days)
+
+        if not entries:
+            return
+
+        latest = self.memory_service.db.get_latest_created_at("journal_entry")
+
+        captured = 0
+        for entry in entries:
+            entry_date = entry.date.isoformat()
+
+            if latest and entry_date < latest[:10]:
+                continue
+
+            for heading, body in entry.sections.items():
+                body_stripped = body.strip()
+                if not body_stripped or len(body_stripped) < 20:
+                    continue
+
+                if heading in self.settings.org_task_sections:
+                    continue
+
+                content = f"[{entry_date}] {heading}\n{body_stripped}"
+                self.memory_service.capture(
+                    content=content,
+                    source="journal_entry",
+                    tags=[f"journal_{entry_date}", heading.lower().replace(" ", "_")],
+                )
+                captured += 1
+
+        if captured:
+            logger.info(f"Captured {captured} journal entries into memory")
 
     def _on_notes_changed(self) -> None:
         """Called when the shared notes file changes."""
@@ -344,6 +455,7 @@ class Orchestrator:
                     error_message=result.error_message,
                 )
 
+        self._capture_journal_entries()
         return results
 
     def status(self) -> dict:

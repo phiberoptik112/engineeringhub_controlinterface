@@ -276,6 +276,15 @@ class LocalMemDB:
             "oldest_entry": oldest[0] if oldest else None,
         }
 
+    def get_latest_created_at(self, source: str) -> str | None:
+        """Return the most recent created_at for a given source type."""
+        row = self._conn.execute(
+            "SELECT created_at FROM thoughts WHERE source = ? "
+            "ORDER BY created_at DESC LIMIT 1",
+            (source,),
+        ).fetchone()
+        return row[0] if row else None
+
     def get_by_id(self, thought_id: int) -> Optional[dict]:
         """Retrieve a single thought by ID."""
         row = self._conn.execute(

@@ -105,14 +105,21 @@ class Settings(BaseSettings):
 
     # How many recent days to scan for pending tasks in org mode
     org_lookback_days: int = Field(
-        default=2,
-        description="Number of recent daily journal files to scan for pending tasks",
+        default=3,
+        description="Number of recent daily journal files to scan for pending tasks. "
+        "3 covers a weekend gap (Friday evening → Monday morning).",
     )
 
     # How many recent days to scan when enriching agent context with historical tasks
     org_context_lookback_days: int = Field(
         default=7,
         description="Number of recent daily journal files to include when building historical task context for agents",
+    )
+
+    # Roam graph integration
+    roam_wrappers_enabled: bool = Field(
+        default=True,
+        description="Create .org wrapper nodes in the roam directory for agent outputs",
     )
 
     # Ollama settings (local embeddings)
@@ -231,6 +238,11 @@ class Settings(BaseSettings):
                 flat_config["org_lookback_days"] = journal["org_lookback_days"]
             if journal.get("org_context_lookback_days") is not None:
                 flat_config["org_context_lookback_days"] = journal["org_context_lookback_days"]
+
+        if "roam" in config:
+            roam = config["roam"]
+            if roam.get("wrappers_enabled") is not None:
+                flat_config["roam_wrappers_enabled"] = roam["wrappers_enabled"]
 
         if "staging" in config:
             staging = config["staging"]

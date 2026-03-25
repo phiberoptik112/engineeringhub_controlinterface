@@ -49,7 +49,7 @@ journal:
   # ── Org mode (org-roam daily journal) ─────────────────────────────
   # Watches org_journal_dir for *.org changes.
   # Tasks are written as:  - [ ] @research: description [[django://project/25]]
-  # Load config/engineering-hub-capture.el in Emacs to get capture templates.
+  # Capture templates are defined in $DOOMDIR/config.el (see docs/workflow.md).
   use_org_mode: true
 
   # Path to daily .org files (YYYY-MM-DD.org)
@@ -60,8 +60,9 @@ journal:
   org_task_sections:
     - "Overnight Agent Tasks"
 
-  # How many recent daily files to scan for pending tasks (2 = today + yesterday)
-  org_lookback_days: 2
+  # How many recent daily files to scan for pending tasks
+  # 3 = covers a weekend gap (Friday → Monday)
+  org_lookback_days: 3
 
   # How many recent daily files to include when building historical task context
   # for agents (used by context enrichment, not task dispatch)
@@ -78,6 +79,12 @@ journal:
     "Technical Review Work": "technical-reviewer"
     "Thoughts to Expand or Clarify": "research"
   # "Incoming Comms" has no mapping - notes only
+
+# ── Roam graph integration ─────────────────────────────────────────
+roam:
+  # Create .org wrapper nodes in the roam directory for agent outputs,
+  # giving them a presence in the org-roam knowledge graph
+  wrappers_enabled: true
 
 # Staging directory for ingested files (PDF/DOCX -> markdown)
 staging:

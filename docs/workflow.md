@@ -69,16 +69,16 @@ Tasks go under the `* Overnight Agent Tasks` heading in today's journal file. Th
 
 ## Emacs Capture Templates
 
-Load `config/engineering-hub-capture.el` in your Doom config to get these capture keys:
+The capture templates are defined inline in `$DOOMDIR/config.el`. The file `config/engineering-hub-capture.el` in this repo is kept as a reference only — do not load it, or you will get duplicate entries.
 
 | Key | Agent dispatched |
 |-----|-----------------|
-| `C-c c A` | Prompt to choose agent type |
-| `C-c c Ar` | `@research` |
-| `C-c c Aw` | `@technical-writer` |
-| `C-c c Av` | `@technical-reviewer` |
-| `C-c c As` | `@standards-checker` |
-| `C-c h e` | Jump to today's *Overnight Agent Tasks* heading |
+| `SPC X A` | Prompt to choose agent type |
+| `SPC X Ar` | `@research` |
+| `SPC X Aw` | `@technical-writer` |
+| `SPC X Av` | `@technical-reviewer` |
+| `SPC X As` | `@standards-checker` |
+| `SPC h e` | Jump to today's *Overnight Agent Tasks* heading |
 
 ---
 
@@ -191,7 +191,7 @@ source .venv/bin/activate
 engineering-hub run-once
 ```
 
-Picks up all `- [ ]` tasks from today's and yesterday's journal files (2-day lookback), runs them, marks each checkbox `[x]` on completion, and appends a result message under `* Engineering Hub Messages` in the same journal file.
+Picks up all `- [ ]` tasks from the last 3 days of journal files (3-day lookback covers weekends), runs them, marks each checkbox `[x]` on completion, and appends a result message under `* Engineering Hub Messages` in the same journal file.
 
 ### Check what tasks are pending (no API calls)
 
@@ -242,10 +242,10 @@ A task that fails (e.g. missing input file) is marked `(blocked: ...)` rather th
 
 | Purpose | Setting | Default |
 |---------|---------|---------|
-| Task pickup | `org_lookback_days` | 2 days (today + yesterday) |
+| Task pickup | `org_lookback_days` | 3 days (covers weekend gap) |
 | Agent history context | `org_context_lookback_days` | 7 days |
 
-If a task is not picked up, check that it was written within the last 2 days and uses correct `- [ ] @agent:` syntax. Tasks marked `[x]`, `(in progress)`, or `(blocked:...)` are skipped.
+If a task is not picked up, check that it was written within the last 3 days and uses correct `- [ ] @agent:` syntax. Tasks marked `[x]`, `(in progress)`, or `(blocked:...)` are skipped.
 
 ---
 
