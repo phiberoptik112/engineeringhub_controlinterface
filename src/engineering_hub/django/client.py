@@ -3,6 +3,7 @@
 import logging
 import time
 from pathlib import Path
+from urllib.parse import urlparse
 
 import requests
 from requests.adapters import HTTPAdapter
@@ -46,6 +47,14 @@ class DjangoClient:
         self.api_token = api_token
         self.timeout = timeout
         self._cache = TTLCache(ttl_seconds=cache_ttl)
+
+        parsed = urlparse(self.api_url)
+        if parsed.scheme == "http" and parsed.hostname not in ("localhost", "127.0.0.1", "::1"):
+            logger.warning(
+                "Django API URL uses plain HTTP with a remote host (%s). "
+                "API tokens will be sent in cleartext. Consider using HTTPS.",
+                parsed.hostname,
+            )
 
         # Set up session with retry logic
         self._session = requests.Session()

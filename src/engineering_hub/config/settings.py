@@ -2,7 +2,7 @@
 
 from pathlib import Path
 
-from pydantic import Field
+from pydantic import Field, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # Default category-to-agent mapping for journal mode
@@ -29,8 +29,8 @@ class Settings(BaseSettings):
         default="http://localhost:8000/api",
         description="Base URL for Django API",
     )
-    django_api_token: str = Field(
-        default="",
+    django_api_token: SecretStr = Field(
+        default=SecretStr(""),
         description="Django API authentication token",
     )
     django_cache_ttl: int = Field(
@@ -39,8 +39,8 @@ class Settings(BaseSettings):
     )
 
     # Anthropic API settings
-    anthropic_api_key: str = Field(
-        default="",
+    anthropic_api_key: SecretStr = Field(
+        default=SecretStr(""),
         description="Anthropic API key for Claude",
     )
     anthropic_model: str = Field(
@@ -122,6 +122,38 @@ class Settings(BaseSettings):
         description="Create .org wrapper nodes in the roam directory for agent outputs",
     )
 
+    # LLM provider selection
+    llm_provider: str = Field(
+        default="anthropic",
+        description="LLM backend: 'anthropic' (cloud API) or 'mlx' (local Apple Silicon)",
+    )
+
+    # MLX local model settings (used when llm_provider == "mlx")
+    mlx_model_path: str = Field(
+        default="",
+        description="HuggingFace model ID or local path to MLX snapshot directory",
+    )
+    mlx_temp: float = Field(
+        default=0.7,
+        description="Sampling temperature for MLX generation",
+    )
+    mlx_top_p: float = Field(
+        default=0.9,
+        description="Top-p (nucleus) sampling for MLX generation",
+    )
+    mlx_min_p: float = Field(
+        default=0.05,
+        description="Min-p sampling floor for MLX generation",
+    )
+    mlx_repetition_penalty: float = Field(
+        default=1.1,
+        description="Repetition penalty for MLX generation",
+    )
+    mlx_max_tokens: int = Field(
+        default=4000,
+        description="Default max tokens for MLX generation",
+    )
+
     # Ollama settings (local embeddings)
     ollama_host: str = Field(
         default="http://localhost:11434",
@@ -144,6 +176,100 @@ class Settings(BaseSettings):
     memory_search_threshold: float = Field(
         default=0.35,
         description="Minimum cosine similarity for memory results (0.0-1.0)",
+    )
+
+    # Document ingest chunking settings
+    chunk_enabled: bool = Field(
+        default=True,
+        description="Embed document chunks into memory on ingest",
+    )
+    chunk_max_tokens: int = Field(
+        default=512,
+        description="Max tokens per chunk for document ingest (aligned with nomic-embed-text context)",
+    )
+
+    # ── Journaler daemon settings ──────────────────────────────────
+    journaler_enabled: bool = Field(
+        default=False,
+        description="Enable the Journaler ambient listener daemon",
+    )
+    journaler_model_path: str = Field(
+        default="",
+        description="HuggingFace model ID or local path for Journaler MLX model",
+    )
+    journaler_scan_interval_min: int = Field(
+        default=10,
+        description="Interval in minutes between org-roam scans",
+    )
+    journaler_briefing_enabled: bool = Field(
+        default=True,
+        description="Enable scheduled morning briefings",
+    )
+    journaler_briefing_time: str = Field(
+        default="07:00",
+        description="Time for morning briefing (HH:MM, local time)",
+    )
+    journaler_chat_enabled: bool = Field(
+        default=True,
+        description="Enable HTTP chat endpoint",
+    )
+    journaler_chat_host: str = Field(
+        default="127.0.0.1",
+        description="Chat server bind address",
+    )
+    journaler_chat_port: int = Field(
+        default=18790,
+        description="Chat server port",
+    )
+    journaler_slack_enabled: bool = Field(
+        default=False,
+        description="Enable Slack webhook posting",
+    )
+    journaler_slack_webhook_url: str = Field(
+        default="",
+        description="Slack incoming webhook URL (or set JOURNALER_SLACK_WEBHOOK)",
+    )
+    journaler_max_conversation_history: int = Field(
+        default=20,
+        description="Number of conversation turns to keep in memory",
+    )
+    journaler_max_tokens: int = Field(
+        default=4000,
+        description="Max tokens for Journaler model responses",
+    )
+    journaler_temp: float = Field(
+        default=0.7,
+        description="Sampling temperature for Journaler model",
+    )
+    journaler_top_p: float = Field(
+        default=0.9,
+        description="Top-p sampling for Journaler model",
+    )
+    journaler_min_p: float = Field(
+        default=0.05,
+        description="Min-p sampling for Journaler model",
+    )
+    journaler_repetition_penalty: float = Field(
+        default=1.1,
+        description="Repetition penalty for Journaler model",
+    )
+
+    # PDF reference corpus settings
+    corpus_enabled: bool = Field(
+        default=False,
+        description="Enable PDF reference corpus context injection (requires corpus.db)",
+    )
+    corpus_db_path: Path | None = Field(
+        default=None,
+        description="Path to corpus.db produced by libraryfiles_corpus ingest",
+    )
+    corpus_search_k: int = Field(
+        default=5,
+        description="Max corpus chunks injected into agent context per task",
+    )
+    corpus_search_threshold: float = Field(
+        default=0.40,
+        description="Minimum cosine similarity for corpus results (higher than memory threshold)",
     )
 
     @property
@@ -176,6 +302,24 @@ class Settings(BaseSettings):
         return self.output_dir / "staging"
 
     @property
+    def journaler_state_dir(self) -> Path:
+        """Path to the Journaler daemon state directory."""
+        return self.workspace_dir / ".journaler"
+
+    @property
+    def journaler_briefing_output_dir(self) -> Path:
+        """Path to the Journaler briefing output directory."""
+        return self.journaler_state_dir / "briefings"
+
+    @property
+    def resolved_journaler_model_path(self) -> str:
+        """MLX model for Journaler: explicit journaler.model_path, else mlx.model_path."""
+        j = (self.journaler_model_path or "").strip()
+        if j:
+            return j
+        return (self.mlx_model_path or "").strip()
+
+    @property
     def prompts_dir(self) -> Path:
         """Path to the prompts directory."""
         # First check workspace, then fall back to package prompts
@@ -204,11 +348,15 @@ class Settings(BaseSettings):
 
         if "django" in config:
             flat_config["django_api_url"] = config["django"].get("api_url")
-            flat_config["django_api_token"] = config["django"].get("api_token")
+            token = config["django"].get("api_token")
+            if token:
+                flat_config["django_api_token"] = SecretStr(token)
             flat_config["django_cache_ttl"] = config["django"].get("cache_ttl")
 
         if "anthropic" in config:
-            flat_config["anthropic_api_key"] = config["anthropic"].get("api_key")
+            api_key = config["anthropic"].get("api_key")
+            if api_key:
+                flat_config["anthropic_api_key"] = SecretStr(api_key)
             flat_config["anthropic_model"] = config["anthropic"].get("model")
             flat_config["max_tokens"] = config["anthropic"].get("max_tokens")
 
@@ -256,6 +404,24 @@ class Settings(BaseSettings):
             if ollama.get("embed_model"):
                 flat_config["ollama_embed_model"] = ollama["embed_model"]
 
+        if "llm_provider" in config:
+            flat_config["llm_provider"] = config["llm_provider"]
+
+        if "mlx" in config:
+            mlx = config["mlx"]
+            if mlx.get("model_path"):
+                flat_config["mlx_model_path"] = mlx["model_path"]
+            if mlx.get("temp") is not None:
+                flat_config["mlx_temp"] = mlx["temp"]
+            if mlx.get("top_p") is not None:
+                flat_config["mlx_top_p"] = mlx["top_p"]
+            if mlx.get("min_p") is not None:
+                flat_config["mlx_min_p"] = mlx["min_p"]
+            if mlx.get("repetition_penalty") is not None:
+                flat_config["mlx_repetition_penalty"] = mlx["repetition_penalty"]
+            if mlx.get("max_tokens") is not None:
+                flat_config["mlx_max_tokens"] = mlx["max_tokens"]
+
         if "memory" in config:
             mem = config["memory"]
             if mem.get("enabled") is not None:
@@ -265,7 +431,67 @@ class Settings(BaseSettings):
             if mem.get("threshold") is not None:
                 flat_config["memory_search_threshold"] = mem["threshold"]
 
+        if "chunking" in config:
+            chunking = config["chunking"]
+            if chunking.get("enabled") is not None:
+                flat_config["chunk_enabled"] = chunking["enabled"]
+            if chunking.get("max_tokens") is not None:
+                flat_config["chunk_max_tokens"] = chunking["max_tokens"]
+
+        if "journaler" in config:
+            j = config["journaler"]
+            if j.get("enabled") is not None:
+                flat_config["journaler_enabled"] = j["enabled"]
+            if j.get("model_path"):
+                flat_config["journaler_model_path"] = j["model_path"]
+            if j.get("scan_interval_min") is not None:
+                flat_config["journaler_scan_interval_min"] = j["scan_interval_min"]
+            if j.get("briefing_enabled") is not None:
+                flat_config["journaler_briefing_enabled"] = j["briefing_enabled"]
+            if j.get("briefing_time"):
+                flat_config["journaler_briefing_time"] = j["briefing_time"]
+            if j.get("chat_enabled") is not None:
+                flat_config["journaler_chat_enabled"] = j["chat_enabled"]
+            if j.get("chat_host"):
+                flat_config["journaler_chat_host"] = j["chat_host"]
+            if j.get("chat_port") is not None:
+                flat_config["journaler_chat_port"] = j["chat_port"]
+            if j.get("slack_enabled") is not None:
+                flat_config["journaler_slack_enabled"] = j["slack_enabled"]
+            if j.get("slack_webhook_url"):
+                flat_config["journaler_slack_webhook_url"] = j["slack_webhook_url"]
+            if j.get("max_conversation_history") is not None:
+                flat_config["journaler_max_conversation_history"] = j["max_conversation_history"]
+            if j.get("max_tokens") is not None:
+                flat_config["journaler_max_tokens"] = j["max_tokens"]
+            if j.get("temp") is not None:
+                flat_config["journaler_temp"] = j["temp"]
+            if j.get("top_p") is not None:
+                flat_config["journaler_top_p"] = j["top_p"]
+            if j.get("min_p") is not None:
+                flat_config["journaler_min_p"] = j["min_p"]
+            if j.get("repetition_penalty") is not None:
+                flat_config["journaler_repetition_penalty"] = j["repetition_penalty"]
+
+        if "corpus" in config:
+            corpus = config["corpus"]
+            if corpus.get("enabled") is not None:
+                flat_config["corpus_enabled"] = corpus["enabled"]
+            if corpus.get("db_path"):
+                flat_config["corpus_db_path"] = Path(corpus["db_path"]).expanduser()
+            if corpus.get("search_k") is not None:
+                flat_config["corpus_search_k"] = corpus["search_k"]
+            if corpus.get("threshold") is not None:
+                flat_config["corpus_search_threshold"] = corpus["threshold"]
+
+        def _is_empty(v: object) -> bool:
+            if v is None or v == "":
+                return True
+            if isinstance(v, SecretStr) and not v.get_secret_value():
+                return True
+            return False
+
         # Remove None values and empty strings so env vars are not shadowed by blank YAML fields
-        flat_config = {k: v for k, v in flat_config.items() if v is not None and v != ""}
+        flat_config = {k: v for k, v in flat_config.items() if not _is_empty(v)}
 
         return cls(**flat_config)

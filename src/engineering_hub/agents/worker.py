@@ -1,49 +1,52 @@
-"""Agent worker for executing Claude API calls."""
+"""Agent worker for executing tasks via a pluggable LLM backend."""
 
 import logging
 from pathlib import Path
 
-import anthropic
-
+from engineering_hub.agents.backends import AnthropicBackend, LLMBackend
 from engineering_hub.agents.prompts import PromptLoader
 from engineering_hub.agents.registry import AgentRegistry
 from engineering_hub.core.constants import AgentType
-from engineering_hub.core.exceptions import AgentExecutionError
+from engineering_hub.core.exceptions import AgentExecutionError, LLMBackendError
 from engineering_hub.core.models import ParsedTask, TaskResult
 
 logger = logging.getLogger(__name__)
 
 
 class AgentWorker:
-    """Worker that executes agent tasks via Claude API."""
+    """Worker that executes agent tasks via a pluggable LLM backend."""
 
     def __init__(
         self,
+        backend: LLMBackend,
+        prompts_dir: Path | None = None,
+        output_dir: Path | None = None,
+        max_tokens: int = 4000,
+    ) -> None:
+        self._backend = backend
+        self.max_tokens = max_tokens
+        self.output_dir = output_dir or Path("outputs")
+
+        self._prompt_loader = PromptLoader(prompts_dir or Path("prompts"))
+        self._registry = AgentRegistry()
+
+    @classmethod
+    def from_anthropic(
+        cls,
         api_key: str,
         model: str = "claude-sonnet-4-5-20250929",
         prompts_dir: Path | None = None,
         output_dir: Path | None = None,
         max_tokens: int = 4000,
-    ) -> None:
-        """Initialize the agent worker.
-
-        Args:
-            api_key: Anthropic API key
-            model: Claude model to use
-            prompts_dir: Directory containing prompt files
-            output_dir: Directory for output files
-            max_tokens: Maximum tokens for responses
-        """
-        self.model = model
-        self.max_tokens = max_tokens
-        self.output_dir = output_dir or Path("outputs")
-
-        # Initialize Anthropic client
-        self._client = anthropic.Anthropic(api_key=api_key)
-
-        # Initialize prompt loader and registry
-        self._prompt_loader = PromptLoader(prompts_dir or Path("prompts"))
-        self._registry = AgentRegistry()
+    ) -> "AgentWorker":
+        """Convenience constructor that creates an AnthropicBackend internally."""
+        backend = AnthropicBackend(api_key=api_key, model=model)
+        return cls(
+            backend=backend,
+            prompts_dir=prompts_dir,
+            output_dir=output_dir,
+            max_tokens=max_tokens,
+        )
 
     def execute(self, task: ParsedTask, context: str) -> TaskResult:
         """Execute a task with the appropriate agent.
@@ -57,7 +60,6 @@ class AgentWorker:
         """
         agent_type = task.agent_type
 
-        # Check if agent is enabled
         if not self._registry.is_enabled(agent_type):
             return TaskResult(
                 task=task,
@@ -66,17 +68,12 @@ class AgentWorker:
             )
 
         try:
-            # Get system prompt
             system_prompt = self._prompt_loader.get_prompt(agent_type)
-
-            # Build user message with context and task
             user_message = self._build_user_message(task, context)
 
-            # Execute Claude API call
             logger.info(f"Executing {agent_type.value} agent for task: {task.description[:50]}...")
-            response = self._call_claude(system_prompt, user_message)
+            response = self._backend.complete(system_prompt, user_message, self.max_tokens)
 
-            # Write output to file
             output_path = self._write_output(task, response)
 
             logger.info(f"Task completed successfully, output: {output_path}")
@@ -87,12 +84,12 @@ class AgentWorker:
                 agent_response=response,
             )
 
-        except anthropic.APIError as e:
-            logger.error(f"Claude API error: {e}")
+        except LLMBackendError as e:
+            logger.error(f"LLM backend error: {e}")
             return TaskResult(
                 task=task,
                 success=False,
-                error_message=f"Claude API error: {e}",
+                error_message=f"LLM backend error: {e}",
             )
         except Exception as e:
             logger.error(f"Agent execution failed: {e}")
@@ -130,47 +127,11 @@ class AgentWorker:
 
         return "\n".join(parts)
 
-    def _call_claude(self, system_prompt: str, user_message: str) -> str:
-        """Make the Claude API call.
-
-        Args:
-            system_prompt: System prompt for the agent
-            user_message: User message with context and task
-
-        Returns:
-            Agent response text
-        """
-        message = self._client.messages.create(
-            model=self.model,
-            max_tokens=self.max_tokens,
-            system=system_prompt,
-            messages=[{"role": "user", "content": user_message}],
-        )
-
-        # Extract text from response
-        text_parts = []
-        for block in message.content:
-            if hasattr(block, "text"):
-                text_parts.append(block.text)
-
-        return "\n".join(text_parts)
-
     def _write_output(self, task: ParsedTask, response: str) -> Path:
-        """Write agent response to output file.
-
-        Args:
-            task: The task
-            response: Agent response text
-
-        Returns:
-            Path to the output file
-        """
-        # Determine output path
+        """Write agent response to output file."""
         if task.deliverable:
-            # Use specified path (relative to output dir)
             output_path = self.output_dir / task.deliverable.lstrip("/")
         else:
-            # Generate default path
             agent_dirs = {
                 AgentType.RESEARCH: "research",
                 AgentType.TECHNICAL_WRITER: "docs",
@@ -182,7 +143,6 @@ class AgentWorker:
             agent_dir = agent_dirs.get(task.agent_type, "outputs")
             project_id = task.project_id or "unknown"
 
-            # Create filename from description
             desc_slug = "".join(
                 c if c.isalnum() or c == "-" else "-"
                 for c in task.description[:30].lower()
@@ -191,10 +151,7 @@ class AgentWorker:
 
             output_path = self.output_dir / agent_dir / f"project-{project_id}-{desc_slug}.md"
 
-        # Ensure directory exists
         output_path.parent.mkdir(parents=True, exist_ok=True)
-
-        # Write response (raw for .tex, no markdown wrapping)
         output_path.write_text(response, encoding="utf-8")
         logger.debug(f"Wrote output to {output_path}")
 
@@ -215,7 +172,7 @@ class AgentWorker:
             The agent response text
 
         Raises:
-            AgentExecutionError: If the Claude API call or file write fails
+            AgentExecutionError: If the LLM call or file write fails
         """
         config = self._registry.get_config(AgentType.WEEKLY_REVIEWER)
         max_tokens = config.max_tokens if config else 6000
@@ -224,17 +181,9 @@ class AgentWorker:
 
         logger.info("Running weekly reviewer agent...")
         try:
-            message = self._client.messages.create(
-                model=self.model,
-                max_tokens=max_tokens,
-                system=system_prompt,
-                messages=[{"role": "user", "content": context}],
-            )
-        except anthropic.APIError as e:
-            raise AgentExecutionError(f"Claude API error during weekly review: {e}") from e
-
-        text_parts = [block.text for block in message.content if hasattr(block, "text")]
-        response = "\n".join(text_parts)
+            response = self._backend.complete(system_prompt, context, max_tokens)
+        except LLMBackendError as e:
+            raise AgentExecutionError(f"LLM error during weekly review: {e}") from e
 
         output_path.parent.mkdir(parents=True, exist_ok=True)
         output_path.write_text(response, encoding="utf-8")
@@ -243,19 +192,9 @@ class AgentWorker:
         return response
 
     def test_connection(self) -> bool:
-        """Test the Claude API connection.
+        """Test the LLM backend connection.
 
         Returns:
             True if connection is successful
         """
-        try:
-            # Simple test call
-            self._client.messages.create(
-                model=self.model,
-                max_tokens=10,
-                messages=[{"role": "user", "content": "Hi"}],
-            )
-            return True
-        except Exception as e:
-            logger.error(f"Claude API connection test failed: {e}")
-            return False
+        return self._backend.test_connection()

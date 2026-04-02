@@ -1,6 +1,12 @@
 # Engineering Hub Configuration
 # Copy this file to your workspace as config.yaml and fill in values
 
+# ── LLM provider ─────────────────────────────────────────────────
+# Choose which backend agents use for text generation:
+#   "anthropic" — Claude API (default, requires api_key)
+#   "mlx"       — Local Apple Silicon inference via mlx-lm
+llm_provider: "anthropic"
+
 django:
   # Django consultingmanager API URL
   api_url: "http://localhost:8000/api"
@@ -90,6 +96,22 @@ roam:
 staging:
   manifest_name: "manifest.json"
 
+# ── MLX local model (Apple Silicon) ───────────────────────────────
+# Used when llm_provider is "mlx". Install with: pip install 'engineering-hub[mlx]'
+# mlx:
+#   # HuggingFace model ID — mlx-lm resolves from the HF cache automatically:
+#   model_path: "mlx-community/gemma-3-27b-it-qat-4bit"
+#
+#   # Or point directly at a cache snapshot directory:
+#   # model_path: "~/.cache/huggingface/hub/models--mlx-community--gemma-3-27b-it-qat-4bit/snapshots/fc4e000f32af1b7b6779294e490a7d2a80bac611"
+#
+#   # Sampling parameters (defaults shown)
+#   temp: 0.7
+#   top_p: 0.9
+#   min_p: 0.05
+#   repetition_penalty: 1.1
+#   max_tokens: 4000
+
 # ── Local embeddings ──────────────────────────────────────────────
 ollama:
   host: "http://localhost:11434"
@@ -103,6 +125,69 @@ memory:
   enabled: true
   search_k: 5         # memories injected per agent task
   threshold: 0.35     # cosine similarity floor (0.0-1.0)
+
+# ── Document ingest chunking ─────────────────────────────────────
+# When files are ingested (PDF/DOCX), they are chunked and embedded
+# into memory for semantic search. Requires the docling extra:
+#   pip install 'engineering-hub[docling]'
+# Falls back to pypdf/python-docx when docling is not installed.
+chunking:
+  enabled: true
+  max_tokens: 512     # per chunk, aligned with nomic-embed-text context
+
+# ── Journaler daemon (always-on ambient listener) ────────────────
+# The Journaler runs a local ~32B model, continuously monitors your
+# org-roam workspace, delivers morning briefings, and responds to
+# ad-hoc questions via HTTP chat.  Requires: pip install 'engineering-hub[mlx]'
+#
+# journaler:
+#   enabled: true
+#
+#   # HuggingFace model ID for the local MLX model.
+#   # Optional: if omitted, Journaler falls back to mlx.model_path then to a built-in default.
+#   # Pre-download before first use: engineering-hub journaler download
+#   #
+#   # Recommended options (all ~17GB, 4-bit, Apple Silicon):
+#   #
+#   #   mlx-community/Qwen3-30B-A3B-Instruct-2507-4bit  ← default
+#   #     MoE (~3B active params), fastest, lowest RAM; explicit Instruct tuning.
+#   #     Best for structured morning briefings and quick chat. ~32GB unified RAM.
+#   #
+#   #   mlx-community/Qwen2.5-32B-Instruct-4bit
+#   #     Dense 32B, strong instruction following, heavier (~20GB weights, slower).
+#   #     Good choice if you have 64GB+ and want maximum format adherence.
+#   #
+#   #   mlx-community/Qwen3-32B-4bit
+#   #     Dense Qwen3 at full 32B width, highest quality in the family.
+#   #     Recommended for 64–128GB machines where briefing depth matters more than speed.
+#   #
+#   model_path: "mlx-community/Qwen3-30B-A3B-Instruct-2507-4bit"
+#
+#   # Scan interval for org-roam directory (minutes)
+#   scan_interval_min: 10
+#
+#   # Morning briefing schedule
+#   briefing_enabled: true
+#   briefing_time: "07:00"       # local time (HH:MM)
+#
+#   # HTTP chat endpoint
+#   chat_enabled: true
+#   chat_host: "127.0.0.1"
+#   chat_port: 18790
+#
+#   # Slack webhook (outbound only — post briefings and alerts)
+#   slack_enabled: false
+#   slack_webhook_url: ""        # or set JOURNALER_SLACK_WEBHOOK env var
+#
+#   # Conversation settings
+#   max_conversation_history: 20 # turns kept in memory
+#   max_tokens: 4000
+#
+#   # Sampling parameters (defaults shown)
+#   temp: 0.7
+#   top_p: 0.9
+#   min_p: 0.05
+#   repetition_penalty: 1.1
 
 # Agent configurations (optional - defaults are provided)
 # agents:

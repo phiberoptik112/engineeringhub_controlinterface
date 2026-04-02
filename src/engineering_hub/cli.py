@@ -5,13 +5,17 @@ import logging
 import sys
 from datetime import date
 from pathlib import Path
+from urllib.parse import urlparse
 
 from rich.console import Console
 from rich.logging import RichHandler
+from rich.markup import escape
 from rich.table import Table
 
 from engineering_hub.config.loader import find_config_file
 from engineering_hub.config.settings import Settings
+from engineering_hub.journaler.constants import DEFAULT_JOURNALER_MLX_MODEL_ID
+from engineering_hub.journaler.engine import SUPPORTED_EXTENSIONS, ConversationEngine, _is_model_cached
 from engineering_hub.orchestration.orchestrator import Orchestrator
 
 console = Console()
@@ -40,22 +44,42 @@ def load_settings(config_path: Path | None = None) -> Settings:
     return Settings()
 
 
-def cmd_start(args: argparse.Namespace) -> int:
-    """Start the orchestrator."""
-    settings = load_settings(args.config)
-
-    # Validate required settings
-    if not settings.anthropic_api_key:
+def _validate_llm_settings(settings: Settings) -> int | None:
+    """Validate LLM provider settings. Returns an error code or None if OK."""
+    provider = settings.llm_provider.lower()
+    if provider == "anthropic" and not settings.anthropic_api_key.get_secret_value():
         console.print(
             "[red]Error:[/red] Anthropic API key not set. "
             "Set ENGINEERING_HUB_ANTHROPIC_API_KEY or add to config."
         )
         return 1
+    if provider == "mlx" and not settings.mlx_model_path:
+        console.print(
+            "[red]Error:[/red] MLX model path not set. "
+            "Set mlx.model_path in config or ENGINEERING_HUB_MLX_MODEL_PATH."
+        )
+        return 1
+    return None
 
-    if not settings.django_api_token:
+
+def cmd_start(args: argparse.Namespace) -> int:
+    """Start the orchestrator."""
+    settings = load_settings(args.config)
+
+    if err := _validate_llm_settings(settings):
+        return err
+
+    if not settings.django_api_token.get_secret_value():
         console.print(
             "[yellow]Warning:[/yellow] Django API token not set. "
             "API calls will fail."
+        )
+
+    parsed_url = urlparse(settings.django_api_url)
+    if parsed_url.scheme == "http" and parsed_url.hostname not in ("localhost", "127.0.0.1", "::1"):
+        console.print(
+            "[yellow]Warning:[/yellow] Django API URL uses plain HTTP with a remote host. "
+            "API tokens will be sent in cleartext. Consider using HTTPS."
         )
 
     if not settings.notes_file.exists():
@@ -65,7 +89,13 @@ def cmd_start(args: argparse.Namespace) -> int:
         )
         return 1
 
+    provider = settings.llm_provider.lower()
     console.print("[bold green]Starting Engineering Hub...[/bold green]")
+    console.print(f"  Provider: {provider}")
+    if provider == "mlx":
+        console.print(f"  MLX Model: {settings.mlx_model_path}")
+    else:
+        console.print(f"  Model: {settings.anthropic_model}")
     console.print(f"  Notes: {settings.notes_file}")
     console.print(f"  Outputs: {settings.output_dir}")
 
@@ -102,9 +132,17 @@ def cmd_status(args: argparse.Namespace) -> int:
 
     table.add_row("Output Dir", str(settings.output_dir))
     table.add_row("Django API", settings.django_api_url)
-    table.add_row("Django Token", "✓ Set" if settings.django_api_token else "✗ Not set")
-    table.add_row("Anthropic Key", "✓ Set" if settings.anthropic_api_key else "✗ Not set")
-    table.add_row("Model", settings.anthropic_model)
+    has_token = "✓ Set" if settings.django_api_token.get_secret_value() else "✗ Not set"
+    table.add_row("Django Token", has_token)
+
+    provider = settings.llm_provider.lower()
+    table.add_row("LLM Provider", provider)
+    if provider == "mlx":
+        table.add_row("MLX Model", settings.mlx_model_path or "✗ Not set")
+    else:
+        has_key = "✓ Set" if settings.anthropic_api_key.get_secret_value() else "✗ Not set"
+        table.add_row("Anthropic Key", has_key)
+        table.add_row("Model", settings.anthropic_model)
 
     console.print(table)
 
@@ -143,9 +181,8 @@ def cmd_run_once(args: argparse.Namespace) -> int:
     """Run once to process all pending tasks, then exit."""
     settings = load_settings(args.config)
 
-    if not settings.anthropic_api_key:
-        console.print("[red]Error:[/red] Anthropic API key not set.")
-        return 1
+    if err := _validate_llm_settings(settings):
+        return err
 
     if not settings.notes_file.exists():
         console.print(f"[red]Error:[/red] Notes file not found: {settings.notes_file}")
@@ -318,10 +355,10 @@ def cmd_weekly_review(args: argparse.Namespace) -> int:
     """Run the weekly reviewer agent and write a synthesis report."""
     settings = load_settings(args.config)
 
-    if not settings.anthropic_api_key:
-        console.print("[red]Error:[/red] Anthropic API key not set.")
-        return 1
+    if err := _validate_llm_settings(settings):
+        return err
 
+    from engineering_hub.agents.backends import create_backend
     from engineering_hub.agents.worker import AgentWorker
     from engineering_hub.orchestration.weekly_review_builder import WeeklyReviewBuilder
 
@@ -333,9 +370,9 @@ def cmd_weekly_review(args: argparse.Namespace) -> int:
         else builder.default_output_path()
     )
 
+    backend = create_backend(settings)
     worker = AgentWorker(
-        api_key=settings.anthropic_api_key,
-        model=settings.anthropic_model,
+        backend=backend,
         prompts_dir=settings.prompts_dir,
         output_dir=settings.output_dir,
     )
@@ -369,6 +406,316 @@ def cmd_mcp_server(args: argparse.Namespace) -> int:
 
     run_server(transport=transport, host=args.host, port=args.port)
     return 0
+
+
+def _handle_chat_slash_command(
+    raw: str,
+    engine: ConversationEngine,
+    chat_console: Console,
+) -> None:
+    """Intercept and execute a /slash command from the journaler chat loop.
+
+    Recognised commands:
+      /load <path> [-r]   Load a file or directory into the current context.
+      /files              List all currently loaded files.
+      /clear              Remove all loaded files from the context.
+      /help               Show available slash commands.
+    """
+    parts = raw.split()
+    cmd = parts[0].lower()
+
+    if cmd == "/help":
+        chat_console.print(
+            "\n[bold cyan]Slash commands:[/bold cyan]\n"
+            "  [cyan]/load <path> [-r][/cyan]  Load a file or directory into context\n"
+            "                         (-r / --recursive scans subdirectories)\n"
+            "  [cyan]/files[/cyan]             List loaded files\n"
+            "  [cyan]/clear[/cyan]             Remove all loaded files from context\n"
+            "  [cyan]/help[/cyan]              Show this help\n"
+        )
+        return
+
+    if cmd == "/files":
+        entries = engine.list_loaded_files()
+        if not entries:
+            chat_console.print("[dim]No files loaded.[/dim]")
+        else:
+            chat_console.print(f"\n[bold]Loaded files ({len(entries)}):[/bold]")
+            for label, char_count in entries:
+                chat_console.print(f"  [cyan]{label}[/cyan]  ({char_count:,} chars)")
+            chat_console.print()
+        return
+
+    if cmd == "/clear":
+        engine.clear_loaded_files()
+        chat_console.print("[green]Loaded files cleared.[/green]")
+        return
+
+    if cmd == "/load":
+        if len(parts) < 2:
+            chat_console.print("[yellow]Usage: /load <path> [-r][/yellow]")
+            return
+
+        recursive = "-r" in parts or "--recursive" in parts
+        path_str = next(
+            (p for p in parts[1:] if not p.startswith("-")),
+            None,
+        )
+        if not path_str:
+            chat_console.print("[yellow]Usage: /load <path> [-r][/yellow]")
+            return
+
+        path = Path(path_str).expanduser()
+
+        if path.is_dir():
+            ok, msg = engine.load_directory(
+                path,
+                extensions=SUPPORTED_EXTENSIONS,
+                recursive=recursive,
+            )
+        else:
+            ok, msg = engine.load_file(path, extensions=SUPPORTED_EXTENSIONS)
+
+        color = "green" if ok else "red"
+        for line in msg.splitlines():
+            chat_console.print(f"[{color}]{escape(line)}[/{color}]")
+        return
+
+    chat_console.print(
+        f"[yellow]Unknown command '{cmd}'. Type /help for available commands.[/yellow]"
+    )
+
+
+def cmd_journaler(args: argparse.Namespace) -> int:
+    """Journaler daemon commands."""
+    sub = getattr(args, "journaler_command", None)
+    if sub is None:
+        console.print(
+            "[yellow]Usage: engineering-hub journaler"
+            " {start|chat|briefing|status|scan|download}[/yellow]"
+        )
+        return 1
+
+    settings = load_settings(args.config)
+    model_path = settings.resolved_journaler_model_path
+
+    needs_model = sub in ("start", "chat") or (
+        sub == "briefing" and not getattr(args, "latest", False)
+    )
+    if not model_path:
+        model_path = DEFAULT_JOURNALER_MLX_MODEL_ID
+        if needs_model:
+            console.print(
+                "[dim]No [cyan]journaler.model_path[/cyan] or [cyan]mlx.model_path[/cyan] in config; "
+                f"using default Hugging Face id [cyan]{model_path}[/cyan].[/dim]"
+            )
+
+    if needs_model and not _is_model_cached(model_path):
+        console.print(
+            f"[yellow]Model [cyan]{model_path}[/cyan] is not in the local HF cache.[/yellow]\n"
+            "  Run [bold cyan]engineering-hub journaler download[/bold cyan] first to pre-fetch it\n"
+            "  (recommended — ~17GB for a 32B 4-bit checkpoint), or continue and it will\n"
+            "  download automatically now (may take several minutes on a slow connection)."
+        )
+
+    from engineering_hub.journaler.daemon import JournalerConfig, generate_briefing_now, run_daemon
+
+    memory_service = None
+    if settings.memory_enabled:
+        try:
+            from engineering_hub.memory.service import MemoryService
+
+            memory_service = MemoryService.from_workspace(
+                workspace_dir=settings.workspace_dir,
+                ollama_host=settings.ollama_host,
+                ollama_model=settings.ollama_embed_model,
+                enabled=settings.memory_enabled,
+            )
+        except Exception as exc:
+            console.print(f"[yellow]Warning:[/yellow] Memory service unavailable: {exc}")
+
+    config = JournalerConfig(
+        model_path=model_path,
+        org_roam_dir=settings.org_journal_dir.parent,
+        workspace_dir=settings.workspace_dir,
+        state_dir=settings.journaler_state_dir,
+        scan_interval_min=settings.journaler_scan_interval_min,
+        briefing_enabled=settings.journaler_briefing_enabled,
+        briefing_time=settings.journaler_briefing_time,
+        briefing_output_dir=settings.journaler_briefing_output_dir,
+        chat_enabled=settings.journaler_chat_enabled,
+        chat_host=settings.journaler_chat_host,
+        chat_port=settings.journaler_chat_port,
+        slack_enabled=settings.journaler_slack_enabled,
+        slack_webhook_url=settings.journaler_slack_webhook_url,
+        max_conversation_history=settings.journaler_max_conversation_history,
+        max_tokens=settings.journaler_max_tokens,
+        temp=settings.journaler_temp,
+        top_p=settings.journaler_top_p,
+        min_p=settings.journaler_min_p,
+        repetition_penalty=settings.journaler_repetition_penalty,
+        memory_service=memory_service,
+    )
+
+    if sub == "start":
+        console.print("[bold green]Starting Journaler daemon...[/bold green]")
+        console.print(f"  Model: {config.model_path}")
+        console.print(f"  Org-roam: {config.org_roam_dir}")
+        console.print(f"  Scan interval: {config.scan_interval_min}min")
+        if config.briefing_enabled:
+            console.print(f"  Briefing at: {config.briefing_time}")
+        if config.chat_enabled:
+            console.print(f"  Chat: http://{config.chat_host}:{config.chat_port}")
+        try:
+            run_daemon(config)
+        except KeyboardInterrupt:
+            console.print("\n[yellow]Journaler stopped.[/yellow]")
+        except Exception as exc:
+            console.print(f"[red]Error:[/red] {exc}")
+            return 1
+        return 0
+
+    elif sub == "chat":
+        from engineering_hub.journaler.context import JournalContext
+        from engineering_hub.journaler.engine import ConversationalMLXBackend, ConversationEngine
+        from engineering_hub.journaler.prompts import format_system_prompt, load_system_prompt
+
+        console.print("[bold]Loading Journaler model for interactive chat...[/bold]")
+        backend = ConversationalMLXBackend(
+            model_path=config.model_path,
+            temp=config.temp,
+            top_p=config.top_p,
+            min_p=config.min_p,
+            repetition_penalty=config.repetition_penalty,
+        )
+        ctx = JournalContext(
+            org_roam_dir=config.org_roam_dir,
+            workspace_dir=config.workspace_dir,
+            memory_service=config.memory_service,
+            state_dir=config.state_dir,
+        )
+        ctx.scan()
+
+        system_template = load_system_prompt(config.state_dir)
+        system_prompt = format_system_prompt(system_template, ctx.get_current_context())
+        engine = ConversationEngine(
+            backend=backend,
+            system_prompt=system_prompt,
+            log_dir=config.state_dir,
+            max_history=config.max_conversation_history,
+            max_tokens=config.max_tokens,
+        )
+
+        console.print(
+            "[green]Journaler ready. Type your questions (Ctrl-C to exit).[/green]\n"
+            "[dim]Tip: /load <path> to inject a file into context, /help for commands.[/dim]\n"
+        )
+        try:
+            while True:
+                user_input = input("You: ").strip()
+                if not user_input:
+                    continue
+                if user_input.startswith("/"):
+                    _handle_chat_slash_command(user_input, engine, console)
+                    continue
+                response = engine.chat(user_input)
+                console.print(f"\n[bold]Journaler:[/bold] {escape(response)}\n")
+        except (KeyboardInterrupt, EOFError):
+            console.print("\n[dim]Chat ended.[/dim]")
+        return 0
+
+    elif sub == "briefing":
+        if args.latest:
+            briefing_dir = config.briefing_output_dir or (config.state_dir / "briefings")
+            if briefing_dir and briefing_dir.exists():
+                files = sorted(briefing_dir.glob("*.md"), reverse=True)
+                if files:
+                    console.print(files[0].read_text(encoding="utf-8"))
+                    return 0
+            console.print("[dim]No briefings available yet.[/dim]")
+            return 0
+
+        console.print("[bold]Generating briefing on demand...[/bold]")
+        try:
+            briefing = generate_briefing_now(config)
+            console.print(f"\n{escape(briefing)}")
+        except Exception as exc:
+            console.print(f"[red]Error:[/red] {exc}")
+            return 1
+        return 0
+
+    elif sub == "status":
+        state_file = config.state_dir / "state.json"
+        if state_file.exists():
+            import json
+
+            data = json.loads(state_file.read_text(encoding="utf-8"))
+            table = Table(title="Journaler Status")
+            table.add_column("Setting", style="cyan")
+            table.add_column("Value", style="green")
+            table.add_row("Model", config.model_path)
+            table.add_row("State Dir", str(config.state_dir))
+            table.add_row("Last Scan", data.get("last_scan", "never"))
+            table.add_row("Tracked Files", str(len(data.get("file_mtimes", {}))))
+            table.add_row("Chat Endpoint", f"http://{config.chat_host}:{config.chat_port}")
+            console.print(table)
+        else:
+            console.print("[dim]Journaler has not run yet. No state file found.[/dim]")
+            console.print(f"  Expected at: {state_file}")
+        return 0
+
+    elif sub == "scan":
+        console.print("[bold]Running scan...[/bold]")
+        ctx = JournalContext(
+            org_roam_dir=config.org_roam_dir,
+            workspace_dir=config.workspace_dir,
+            memory_service=config.memory_service,
+            state_dir=config.state_dir,
+        )
+        snapshot = ctx.scan()
+        console.print(f"  Last scan: {snapshot.last_scan}")
+        console.print(f"  Pending tasks: {len(snapshot.pending_tasks)}")
+        console.print(f"  Completed tasks: {len(snapshot.completed_tasks)}")
+        console.print(f"  Changes: {snapshot.change_summary}")
+        return 0
+
+    elif sub == "download":
+        resolved_local = Path(model_path).expanduser()
+        if resolved_local.is_dir():
+            console.print(f"[green]Model is a local directory — nothing to download:[/green] {resolved_local}")
+            return 0
+
+        if _is_model_cached(model_path):
+            try:
+                from huggingface_hub import try_to_load_from_cache
+
+                cached_path = try_to_load_from_cache(model_path, "config.json")
+                parent = Path(cached_path).parent if cached_path else "HF cache"
+            except Exception:
+                parent = "HF cache"
+            console.print(f"[green]Model already cached:[/green] {parent}")
+            return 0
+
+        console.print(f"[bold]Downloading Journaler model:[/bold] {model_path}")
+        console.print("[dim](This may take several minutes for a ~17GB 4-bit checkpoint)[/dim]\n")
+        try:
+            from huggingface_hub import snapshot_download
+
+            local_dir = snapshot_download(repo_id=model_path)
+            console.print(f"\n[bold green]Download complete.[/bold green] Cached at: {local_dir}")
+        except ImportError:
+            console.print(
+                "[red]Error:[/red] huggingface_hub is not installed. "
+                "Install with: pip install 'engineering-hub[mlx]'"
+            )
+            return 1
+        except Exception as exc:
+            console.print(f"[red]Download failed:[/red] {exc}")
+            return 1
+        return 0
+
+    console.print("[yellow]Unknown journaler command.[/yellow]")
+    return 1
 
 
 def cmd_memory(args: argparse.Namespace) -> int:
@@ -410,6 +757,86 @@ def cmd_memory(args: argparse.Namespace) -> int:
 
     svc.db.close()
     return 0
+
+
+def cmd_load(args: argparse.Namespace) -> int:
+    """Load a file or directory into the persistent memory store."""
+    setup_logging(args.verbose)
+    settings = load_settings(args.config)
+
+    path = Path(args.path).expanduser().resolve()
+    if not path.exists():
+        console.print(f"[red]Error:[/red] Path not found: {path}")
+        return 1
+
+    from engineering_hub.memory.service import MemoryService
+
+    svc = MemoryService.from_workspace(
+        workspace_dir=settings.workspace_dir,
+        ollama_host=settings.ollama_host,
+        ollama_model=settings.ollama_embed_model,
+        enabled=settings.memory_enabled,
+    )
+
+    if not settings.memory_enabled:
+        console.print(
+            "[yellow]Warning:[/yellow] Memory is disabled in config. "
+            "Enable it with `memory.enabled: true`."
+        )
+        return 1
+
+    extra_tags: list[str] = list(args.tag) if args.tag else []
+    project_id: int | None = args.project
+
+    def _collect_files(root: Path) -> list[Path]:
+        if root.is_file():
+            return [root]
+        pattern = "**/*" if args.recursive else "*"
+        return sorted(
+            p for p in root.glob(pattern)
+            if p.is_file() and p.suffix.lower() in SUPPORTED_EXTENSIONS
+        )
+
+    candidates = _collect_files(path)
+    if not candidates:
+        console.print(
+            f"[yellow]No supported files found at:[/yellow] {path}\n"
+            f"Supported extensions: {', '.join(sorted(SUPPORTED_EXTENSIONS))}"
+        )
+        return 1
+
+    console.print(f"[bold]Loading {len(candidates)} file(s) into memory...[/bold]")
+
+    stored = 0
+    skipped = 0
+    for file_path in candidates:
+        try:
+            content = file_path.read_text(encoding="utf-8", errors="replace")
+        except OSError as exc:
+            console.print(f"  [red]✗[/red] {file_path.name}: {exc}")
+            skipped += 1
+            continue
+
+        tags = ["manual", f"file:{file_path.name}"] + extra_tags
+        row_id = svc.capture(
+            content=content,
+            source="manual",
+            project_id=project_id,
+            tags=tags,
+        )
+        if row_id is not None:
+            size_kb = len(content) / 1024
+            console.print(f"  [green]✓[/green] {file_path.name} ({size_kb:.1f} KB) → memory #{row_id}")
+            stored += 1
+        else:
+            console.print(f"  [yellow]![/yellow] {file_path.name}: stored without embedding (Ollama unavailable?)")
+            stored += 1
+
+    svc.db.close()
+    console.print(
+        f"\n[bold green]Done.[/bold green] {stored} file(s) captured, {skipped} skipped."
+    )
+    return 0 if skipped == 0 else 1
 
 
 def main() -> int:
@@ -495,6 +922,53 @@ def main() -> int:
         help="Override output file path (default: outputs/reviews/weekly-YYYY-WNN.md)",
     )
 
+    # journaler command
+    journaler_parser = subparsers.add_parser(
+        "journaler", help="Journaler ambient listener daemon"
+    )
+    journaler_sub = journaler_parser.add_subparsers(dest="journaler_command")
+    journaler_sub.add_parser("start", help="Start the Journaler daemon")
+    journaler_sub.add_parser("chat", help="Interactive chat with the Journaler model")
+
+    briefing_p = journaler_sub.add_parser("briefing", help="Generate or view a briefing")
+    briefing_p.add_argument(
+        "--latest", action="store_true", help="View the latest briefing instead of generating"
+    )
+
+    journaler_sub.add_parser("status", help="Show Journaler status")
+    journaler_sub.add_parser("scan", help="Run a single org-roam scan")
+    journaler_sub.add_parser(
+        "download", help="Pre-download the Journaler model to local HF cache"
+    )
+
+    # load command
+    load_parser = subparsers.add_parser(
+        "load",
+        help="Load a file or directory into the persistent memory store",
+    )
+    load_parser.add_argument(
+        "path",
+        help="File or directory to load",
+    )
+    load_parser.add_argument(
+        "-r", "--recursive",
+        action="store_true",
+        help="Recurse into subdirectories (directory mode only)",
+    )
+    load_parser.add_argument(
+        "--project",
+        type=int,
+        default=None,
+        metavar="PROJECT_ID",
+        help="Associate loaded content with a Django project ID",
+    )
+    load_parser.add_argument(
+        "--tag",
+        action="append",
+        metavar="TAG",
+        help="Extra tag to attach (can be used multiple times)",
+    )
+
     # memory command
     memory_parser = subparsers.add_parser("memory", help="Inspect the local memory database")
     memory_sub = memory_parser.add_subparsers(dest="memory_command")
@@ -521,6 +995,8 @@ def main() -> int:
         "run-once": cmd_run_once,
         "init": cmd_init,
         "mcp-server": cmd_mcp_server,
+        "journaler": cmd_journaler,
+        "load": cmd_load,
         "memory": cmd_memory,
         "weekly-review": cmd_weekly_review,
     }

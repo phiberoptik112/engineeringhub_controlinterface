@@ -34,6 +34,10 @@ class ContextFormatter:
         if memory_block:
             base += "\n\n---\n\n" + memory_block
 
+        corpus_block = context.metadata.get("corpus_context_block", "")
+        if corpus_block:
+            base += "\n\n---\n\n" + corpus_block
+
         return base
 
     @classmethod

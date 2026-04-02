@@ -45,6 +45,7 @@ class MemoryResult:
             "task_output": "Prior output",
             "journal_entry": "Journal note",
             "agent_message": "Agent message",
+            "file_ingest": "Ingested doc",
             "manual": "Note",
         }.get(self.source, self.source)
 
@@ -167,6 +168,47 @@ class MemoryService:
         except Exception as e:
             logger.warning(f"Memory DB write failed (non-fatal): {e}")
             return None
+
+    def capture_document(
+        self,
+        chunks: list,
+        project_id: Optional[int] = None,
+    ) -> int:
+        """Embed and store each document chunk. Returns count of stored chunks.
+
+        Each chunk is stored with source='file_ingest' and provenance tags
+        so it can be filtered or traced back to the original file.
+
+        Args:
+            chunks: List of DocumentChunk objects from memory.chunker.
+            project_id: Optional project ID for all chunks.
+        """
+        if not self.enabled or not chunks:
+            return 0
+
+        stored = 0
+        for chunk in chunks:
+            tags = [
+                "file_chunk",
+                f"file:{chunk.source_file}",
+            ]
+            if chunk.heading:
+                tags.append(f"heading:{chunk.heading[:80]}")
+
+            row_id = self.capture(
+                content=chunk.text,
+                source="file_ingest",
+                project_id=project_id,
+                tags=tags,
+            )
+            if row_id is not None:
+                stored += 1
+
+        logger.info(
+            f"Captured {stored}/{len(chunks)} chunks from "
+            f"{chunks[0].source_file if chunks else '?'}"
+        )
+        return stored
 
     # ------------------------------------------------------------------
     # Search

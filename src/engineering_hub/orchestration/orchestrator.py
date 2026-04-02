@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Optional
 
 from engineering_hub.actions.file_ingest import FileIngestAction
+from engineering_hub.agents.backends import create_backend
 from engineering_hub.agents.worker import AgentWorker
 from engineering_hub.config.settings import Settings
 from engineering_hub.context.manager import ContextManager
@@ -71,7 +72,7 @@ class Orchestrator:
         # Django client
         self.django_client = DjangoClient(
             api_url=self.settings.django_api_url,
-            api_token=self.settings.django_api_token,
+            api_token=self.settings.django_api_token.get_secret_value(),
             cache_ttl=self.settings.django_cache_ttl,
         )
 
@@ -89,10 +90,10 @@ class Orchestrator:
             history_notes_manager=self._history_notes_manager,
         )
 
-        # Agent worker
+        # Agent worker (provider chosen by llm_provider setting)
+        backend = create_backend(self.settings)
         self.agent_worker = AgentWorker(
-            api_key=self.settings.anthropic_api_key,
-            model=self.settings.anthropic_model,
+            backend=backend,
             prompts_dir=self.settings.prompts_dir,
             output_dir=self.settings.output_dir,
             max_tokens=self.settings.max_tokens,
@@ -167,17 +168,37 @@ class Orchestrator:
         return result
 
     def _execute_ingest(self, task: ParsedTask) -> TaskResult:
-        """Execute file ingest action for a task."""
+        """Execute file ingest action for a task, then chunk + embed into memory."""
         result = self._ingest_action.execute_from_description(
             description=task.description,
             project_id=task.project_id,
         )
+
+        if result.success and self.memory_service and self.settings.chunk_enabled:
+            self._embed_ingest_chunks(result.converted_docs, task.project_id)
+
         return TaskResult(
             task=task,
             success=result.success,
             output_path=result.manifest_path,
             error_message=result.error_message,
         )
+
+    def _embed_ingest_chunks(
+        self,
+        converted_docs: dict,
+        project_id: int | None,
+    ) -> None:
+        """Chunk converted documents and embed into memory."""
+        from engineering_hub.memory.chunker import chunk_document
+
+        for filename, (markdown, docling_doc) in converted_docs.items():
+            try:
+                chunks = chunk_document(markdown, filename, docling_doc)
+                if chunks:
+                    self.memory_service.capture_document(chunks, project_id=project_id)  # type: ignore[union-attr]
+            except Exception as exc:
+                logger.warning(f"Failed to chunk/embed {filename} (non-fatal): {exc}")
 
     def _init_memory_service(self) -> Optional[MemoryService]:
         """Initialise memory service. Returns None if disabled or on error."""

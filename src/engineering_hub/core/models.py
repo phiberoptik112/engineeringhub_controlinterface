@@ -115,7 +115,14 @@ class TaskResult(BaseModel):
 class IngestResult(BaseModel):
     """Result of file ingest action."""
 
+    model_config = {"arbitrary_types_allowed": True}
+
     success: bool
     files_converted: int = 0
     manifest_path: str | None = None
     error_message: str | None = None
+    converted_docs: dict[str, Any] = Field(
+        default_factory=dict,
+        exclude=True,
+        description="In-memory only: {filename: (markdown, docling_doc | None)}",
+    )
