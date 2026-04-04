@@ -1,19 +1,30 @@
 """ConversationEngine: manages a persistent conversation with a local MLX model.
 
 The engine keeps the model loaded ("warm") between calls, maintains a rolling
-conversation history, and refreshes its context block on each scan cycle.
-Briefing generation uses a separate prompt path to avoid polluting chat history.
+conversation history with automatic token-pressure management, and refreshes
+its context block on each scan cycle. Briefing generation uses a separate
+prompt path to avoid polluting chat history.
 """
 
 from __future__ import annotations
 
 import json
 import logging
-from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
 from engineering_hub.core.exceptions import LLMBackendError
+from engineering_hub.journaler.context_manager import (
+    ClearStrategy,
+    ContextCompressor,
+    ContextPressureManager,
+    ConversationHistory,
+    PressureConfig,
+    TokenBudget,
+    TopicTracker,
+    estimate_tokens,
+    execute_clear,
+)
 
 SUPPORTED_EXTENSIONS: frozenset[str] = frozenset(
     {".md", ".txt", ".org", ".py", ".yaml", ".yml", ".json", ".tex", ".csv", ".toml", ".rst"}
@@ -41,21 +52,57 @@ def _is_model_cached(model_id: str) -> bool:
         return False
 
 
-@dataclass
-class _Turn:
-    """A single conversation turn (user or assistant)."""
+_VLM_MODEL_TYPES: frozenset[str] = frozenset(
+    {"gemma4", "paligemma", "llava", "idefics", "blip", "flamingo", "internvl", "qwen2_vl"}
+)
 
-    role: str
-    content: str
-    timestamp: str
+
+def _detect_vlm(load_path: str) -> bool:
+    """Return True if the model at *load_path* is a Vision-Language Model.
+
+    Peeks at config.json without loading model weights — works for both local
+    directories and HF Hub cache entries.  Falls back to False on any error so
+    a mis-detection never hard-blocks startup.
+    """
+    config_path: Path | None = None
+
+    local = Path(load_path).expanduser()
+    if local.is_dir():
+        candidate = local / "config.json"
+        if candidate.exists():
+            config_path = candidate
+    else:
+        try:
+            from huggingface_hub import try_to_load_from_cache
+
+            cached = try_to_load_from_cache(load_path, "config.json")
+            if cached and Path(cached).exists():
+                config_path = Path(cached)
+        except Exception:
+            pass
+
+    if config_path is None:
+        return False
+
+    try:
+        cfg = json.loads(config_path.read_text(encoding="utf-8"))
+        if "vision_config" in cfg:
+            return True
+        model_type = cfg.get("model_type", "").lower()
+        return model_type in _VLM_MODEL_TYPES
+    except Exception:
+        return False
 
 
 class ConversationalMLXBackend:
     """MLX backend with multi-turn chat support.
 
-    Reuses the same loaded model/tokenizer from mlx-lm but accepts a full
-    message history instead of a single system+user pair.  The model is
-    loaded once on init and stays resident in memory.
+    Supports both text-only models (via mlx-lm) and Vision-Language Models
+    such as Gemma 4 (via mlx-vlm).  The appropriate library is selected
+    automatically by inspecting the model's config.json, or can be forced
+    with the *backend* parameter.
+
+    The model is loaded once on init and stays resident in memory.
     """
 
     def __init__(
@@ -66,7 +113,39 @@ class ConversationalMLXBackend:
         min_p: float = 0.05,
         repetition_penalty: float = 1.1,
         repetition_context_size: int = 20,
+        backend: str = "auto",
     ) -> None:
+        self._temp = temp
+        self._top_p = top_p
+        self._min_p = min_p
+        self._repetition_penalty = repetition_penalty
+        self._repetition_context_size = repetition_context_size
+
+        resolved = str(Path(model_path).expanduser())
+        load_path = resolved if Path(resolved).is_dir() else model_path
+
+        if backend == "mlx-vlm":
+            self._is_vlm = True
+        elif backend == "mlx-lm":
+            self._is_vlm = False
+        else:
+            self._is_vlm = _detect_vlm(load_path)
+
+        logger.info(
+            f"Loading Journaler model from: {load_path} "
+            f"(backend={'mlx-vlm' if self._is_vlm else 'mlx-lm'})"
+        )
+
+        if self._is_vlm:
+            self._load_vlm(load_path, model_path)
+        else:
+            self._load_lm(load_path, model_path)
+
+    # ------------------------------------------------------------------
+    # Backend-specific loaders
+    # ------------------------------------------------------------------
+
+    def _load_lm(self, load_path: str, model_path: str) -> None:
         try:
             import mlx_lm
             from mlx_lm.sample_utils import make_logits_processors, make_sampler
@@ -79,17 +158,9 @@ class ConversationalMLXBackend:
         self._mlx_lm = mlx_lm
         self._make_sampler = make_sampler
         self._make_logits_processors = make_logits_processors
+        self._mlx_vlm = None
+        self._processor = None
 
-        self._temp = temp
-        self._top_p = top_p
-        self._min_p = min_p
-        self._repetition_penalty = repetition_penalty
-        self._repetition_context_size = repetition_context_size
-
-        resolved = str(Path(model_path).expanduser())
-        load_path = resolved if Path(resolved).is_dir() else model_path
-
-        logger.info(f"Loading Journaler MLX model from: {load_path}")
         try:
             self._model, self._tokenizer = mlx_lm.load(load_path)
         except Exception as exc:
@@ -97,7 +168,35 @@ class ConversationalMLXBackend:
                 f"Failed to load Journaler model from '{load_path}': {exc}",
                 provider="mlx",
             ) from exc
-        logger.info(f"Journaler model loaded: {model_path}")
+        logger.info(f"Journaler model loaded (mlx-lm): {model_path}")
+
+    def _load_vlm(self, load_path: str, model_path: str) -> None:
+        try:
+            import mlx_vlm
+        except ImportError as exc:
+            raise LLMBackendError(
+                "mlx-vlm is not installed. Install with: pip install 'engineering-hub[mlx]'",
+                provider="mlx",
+            ) from exc
+
+        self._mlx_vlm = mlx_vlm
+        self._mlx_lm = None
+        self._make_sampler = None
+        self._make_logits_processors = None
+
+        try:
+            self._model, self._processor = mlx_vlm.load(load_path)
+            self._tokenizer = self._processor.tokenizer
+        except Exception as exc:
+            raise LLMBackendError(
+                f"Failed to load Journaler VLM from '{load_path}': {exc}",
+                provider="mlx",
+            ) from exc
+        logger.info(f"Journaler model loaded (mlx-vlm): {model_path}")
+
+    # ------------------------------------------------------------------
+    # Public interface
+    # ------------------------------------------------------------------
 
     def chat(self, messages: list[dict[str, str]], max_tokens: int) -> str:
         """Generate a response given a full message history.
@@ -113,16 +212,20 @@ class ConversationalMLXBackend:
             messages, tokenize=False, add_generation_prompt=True
         )
 
-        sampler = self._make_sampler(
+        if self._is_vlm:
+            return self._chat_vlm(prompt, max_tokens)
+        return self._chat_lm(prompt, max_tokens)
+
+    def _chat_lm(self, prompt: str, max_tokens: int) -> str:
+        sampler = self._make_sampler(  # type: ignore[misc]
             temp=self._temp, top_p=self._top_p, min_p=self._min_p
         )
-        logits_processors = self._make_logits_processors(
+        logits_processors = self._make_logits_processors(  # type: ignore[misc]
             repetition_penalty=self._repetition_penalty,
             repetition_context_size=self._repetition_context_size,
         )
-
         try:
-            return self._mlx_lm.generate(
+            return self._mlx_lm.generate(  # type: ignore[union-attr]
                 self._model,
                 self._tokenizer,
                 prompt=prompt,
@@ -135,6 +238,23 @@ class ConversationalMLXBackend:
                 f"Journaler MLX generation failed: {exc}", provider="mlx"
             ) from exc
 
+    def _chat_vlm(self, prompt: str, max_tokens: int) -> str:
+        try:
+            return self._mlx_vlm.generate(  # type: ignore[union-attr]
+                self._model,
+                self._processor,
+                prompt=prompt,
+                image=None,
+                max_tokens=max_tokens,
+                temp=self._temp,
+                top_p=self._top_p,
+                verbose=False,
+            )
+        except Exception as exc:
+            raise LLMBackendError(
+                f"Journaler MLX-VLM generation failed: {exc}", provider="mlx"
+            ) from exc
+
     def is_loaded(self) -> bool:
         return self._model is not None
 
@@ -143,7 +263,9 @@ class ConversationEngine:
     """Manages a persistent conversation session with a local model.
 
     Context is refreshed every scan cycle; conversation history is maintained
-    in memory and logged to conversation.jsonl.
+    in memory with automatic token-pressure management and logged to
+    conversation.jsonl. Supports soft/hard/summarize clears, status queries,
+    and briefing generation.
     """
 
     def __init__(
@@ -153,41 +275,119 @@ class ConversationEngine:
         log_dir: Path,
         max_history: int = 20,
         max_tokens: int = 4000,
+        pressure_config: PressureConfig | None = None,
+        model_context_window: int = 32768,
     ) -> None:
         self._backend = backend
         self._system_prompt = system_prompt
         self._context_block = ""
-        self._loaded_files: dict[str, str] = {}  # label -> content
-        self._history: list[_Turn] = []
-        self._max_history = max_history
+        self._loaded_files: dict[str, str] = {}
         self._max_tokens = max_tokens
         self._log_dir = log_dir
         self._log_file = log_dir / "conversation.jsonl"
 
+        cfg = pressure_config or PressureConfig(
+            max_history_turns=max_history,
+            model_context_window=model_context_window,
+        )
+
+        self.history = ConversationHistory(
+            max_turns=cfg.max_history_turns,
+            max_tokens=cfg.max_history_tokens,
+        )
+        self.budget = TokenBudget(
+            window_size=cfg.model_context_window,
+            system_prompt_tokens=estimate_tokens(system_prompt),
+            context_snapshot_tokens=0,
+            history_tokens=0,
+            reserved_for_generation=cfg.reserved_for_generation,
+        )
+        self.compressor = ContextCompressor(
+            engine_call=self._raw_complete,
+            pressure_threshold=cfg.compress_at,
+        )
+        self.topic_tracker = TopicTracker()
+        self.pressure_manager = ContextPressureManager(
+            budget=self.budget,
+            history=self.history,
+            compressor=self.compressor,
+            topic_tracker=self.topic_tracker,
+            config=cfg,
+        )
+        self._pressure_config = cfg
+
     def update_context(self, context_block: str) -> None:
         """Replace the rolling context section of the system prompt."""
         self._context_block = context_block
+        self.budget.context_snapshot_tokens = estimate_tokens(context_block)
 
     def chat(self, message: str) -> str:
         """Send a user message and get a response.
 
-        Appends both to conversation history and logs to conversation.jsonl.
+        Runs pre-call pressure checks (compression / trim if needed), builds
+        the message array, calls the model, runs post-call topic tracking,
+        and flushes archived turns to conversation.jsonl.
         """
-        now = datetime.now().isoformat(timespec="seconds")
-
-        self._history.append(_Turn(role="user", content=message, timestamp=now))
+        # Pre-call: check pressure, compress/trim if necessary
+        pre_actions = self.pressure_manager.pre_call_check()
 
         messages = self._build_messages()
+        messages.append({"role": "user", "content": message})
+
         response = self._backend.chat(messages, self._max_tokens)
 
+        # Record in history (post-generation so history doesn't include this turn in the call)
+        now = datetime.now().isoformat(timespec="seconds")
         resp_time = datetime.now().isoformat(timespec="seconds")
-        self._history.append(_Turn(role="assistant", content=response, timestamp=resp_time))
+        self.history.add("user", message)
+        self.history.add("assistant", response)
+        self.budget.history_tokens = self.history.total_tokens
 
-        self._trim_history()
+        # Post-call: topic tracking
+        post_actions = self.pressure_manager.post_call_check(message, response)
+
+        # Log raw turns to JSONL
         self._log_turn("user", message, now)
         self._log_turn("assistant", response, resp_time)
 
+        # Flush evicted/archived turns to JSONL
+        archived = self.history.flush_archive()
+        if archived:
+            self._log_archived_turns(archived)
+
+        # Prepend action notifications when configured
+        all_actions = pre_actions + post_actions
+        if all_actions and self._pressure_config.notify_user_on_action:
+            action_text = "\n".join(all_actions)
+            response = f"{action_text}\n\n{response}"
+
         return response
+
+    def clear(self, strategy: ClearStrategy) -> str:
+        """Execute a manual clear command. Returns a status message."""
+        last_scan = ""
+        return execute_clear(
+            strategy=strategy,
+            history=self.history,
+            compressor=self.compressor,
+            last_scan_time=last_scan,
+        )
+
+    def get_status(self) -> dict:
+        """Return current context management state for display / /status command."""
+        self.budget.history_tokens = self.history.total_tokens
+        return {
+            "context_window": self.budget.window_size,
+            "utilization": f"{self.budget.utilization:.0%}",
+            "pressure": self.budget.pressure,
+            "history_turns": len(self.history.turns),
+            "history_tokens": self.history.total_tokens,
+            "context_snapshot_tokens": self.budget.context_snapshot_tokens,
+            "system_prompt_tokens": self.budget.system_prompt_tokens,
+            "available_tokens": self.budget.available,
+            "compressions_today": self.compressor.compression_count,
+            "current_topic": self.topic_tracker.current_topic,
+        }
 
     def generate_briefing(self, briefing_context: str, briefing_prompt: str) -> str:
         """Generate a morning briefing using a separate prompt.
@@ -212,10 +412,10 @@ class ConversationEngine:
 
     def get_history_summary(self) -> str:
         """Return a brief summary of recent conversation for status display."""
-        if not self._history:
+        if not self.history.turns:
             return "No conversation history."
-        count = len(self._history)
-        last = self._history[-1]
+        count = len(self.history.turns)
+        last = self.history.turns[-1]
         return f"{count} turns, last at {last.timestamp} ({last.role})"
 
     # ------------------------------------------------------------------
@@ -331,8 +531,17 @@ class ConversationEngine:
         """Return a list of (filename, char_count) tuples for all loaded files."""
         return [(label, len(content)) for label, content in self._loaded_files.items()]
 
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _raw_complete(self, prompt: str, max_tokens: int = 500) -> str:
+        """Single-turn model call used by the compressor and briefing generator."""
+        messages = [{"role": "user", "content": prompt}]
+        return self._backend.chat(messages, max_tokens)
+
     def _build_messages(self) -> list[dict[str, str]]:
-        """Build the full message list for the model."""
+        """Build the system + history message list for the model (without current user turn)."""
         system_content = self._system_prompt
         if self._context_block:
             system_content += f"\n\n{self._context_block}"
@@ -346,28 +555,31 @@ class ConversationEngine:
         messages: list[dict[str, str]] = [
             {"role": "system", "content": system_content}
         ]
-
-        for turn in self._history:
-            messages.append({"role": turn.role, "content": turn.content})
-
+        messages.extend(self.history.as_messages())
         return messages
-
-    def _trim_history(self) -> None:
-        """Keep only the last max_history turns (pairs of user+assistant)."""
-        max_turns = self._max_history * 2
-        if len(self._history) > max_turns:
-            self._history = self._history[-max_turns:]
 
     def _log_turn(self, role: str, content: str, timestamp: str) -> None:
         """Append a turn to the conversation JSONL log."""
         self._log_dir.mkdir(parents=True, exist_ok=True)
-        entry = {
-            "timestamp": timestamp,
-            "role": role,
-            "content": content,
-        }
+        entry = {"timestamp": timestamp, "role": role, "content": content}
         try:
             with open(self._log_file, "a", encoding="utf-8") as f:
                 f.write(json.dumps(entry) + "\n")
         except OSError as exc:
             logger.warning(f"Failed to log conversation turn: {exc}")
+
+    def _log_archived_turns(self, turns: list) -> None:
+        """Append archived/evicted turns to conversation.jsonl."""
+        self._log_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            with open(self._log_file, "a", encoding="utf-8") as f:
+                for turn in turns:
+                    entry = {
+                        "timestamp": turn.timestamp,
+                        "role": turn.role,
+                        "content": turn.content,
+                        "archived": True,
+                    }
+                    f.write(json.dumps(entry) + "\n")
+        except OSError as exc:
+            logger.warning(f"Failed to log archived turns: {exc}")

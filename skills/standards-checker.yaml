@@ -1,0 +1,41 @@
+name: standards-checker
+display_name: Standards Checker Agent
+agent_type: standards-checker
+
+description: |
+  Audits technical documents for standards compliance, citation accuracy, and scope coverage.
+  Specializes in ASTM, ISO, ANSI, and IBC standards for acoustic and building science work.
+  Produces a structured gap analysis with a decision-ready compliance assessment (PASS /
+  CONDITIONAL PASS / FAIL). Treats citation accuracy with the same rigor as calculation
+  errors — wrong edition year = substantive error.
+
+when_to_use:
+  - User wants a document audited for standards compliance
+  - User needs citation accuracy checked before client delivery
+  - User asks whether a document covers all required scope elements
+  - User has a draft report and needs to know what's missing before submission
+  - User wants to verify edition years and section references are current
+
+invocation_examples:
+  - "/agent standards-checker audit draft report for project 42 --project 42"
+  - "/agent standards-checker check ASTM citations in test protocol"
+  - "/agent standards-checker review scope coverage for E336 and E1007 compliance"
+  - "/agent standards-checker verify edition years in executive summary"
+
+parameters:
+  project_id:
+    description: Django project ID for context enrichment (optional)
+    required: false
+  description:
+    description: The document or content to audit, with the standards scope to check against
+    required: true
+
+output:
+  format: markdown
+  structure:
+    - Standards Summary Table
+    - Citation Issues (numbered, with severity)
+    - Scope Coverage Gaps
+    - Overall Compliance Assessment (PASS / CONDITIONAL PASS / FAIL)
+    - Recommended Actions
+  output_dir: analysis

@@ -1,0 +1,40 @@
+name: technical-reviewer
+display_name: Technical Reviewer Agent
+agent_type: technical-reviewer
+
+description: |
+  Acts as a technical arbitrator between peer reviewer comments and a working document draft.
+  Categorizes each comment (REGULATORY / TECHNICAL / EDITORIAL / REFERENCE), cross-references
+  against the source document, and presents a decision matrix with ACCEPT / ACCEPT WITH
+  MODIFICATION / REJECT / NEEDS VERIFICATION recommendations. Produces implementation options
+  and — once a path is chosen — a revised document with a change log.
+
+when_to_use:
+  - User has received peer review comments on a technical document
+  - User needs help deciding which review comments to accept or reject
+  - User wants to reconcile conflicting reviewer suggestions
+  - User has a .tex or markdown draft and a set of marked-up review notes
+  - User needs a revised document produced after review arbitration
+
+invocation_examples:
+  - "/agent technical-reviewer arbitrate reviewer comments on project 18 report --project 18"
+  - "/agent technical-reviewer review comments from peer reviewer on STC report"
+  - "/agent technical-reviewer produce decision matrix for impact noise study review"
+  - "/agent technical-reviewer implement option B for project 31 reviewer feedback --project 31"
+
+parameters:
+  project_id:
+    description: Django project ID for context enrichment (optional)
+    required: false
+  description:
+    description: The review task — what document and what reviewer input to process
+    required: true
+
+output:
+  format: markdown
+  structure:
+    - Comment Categorization Table (Phase 1-2)
+    - Decision Matrix with narrative summary (Phase 3)
+    - Implementation Options A / B / C (Phase 4)
+    - Revised document with change log (Phase 5, on request)
+  output_dir: reviews

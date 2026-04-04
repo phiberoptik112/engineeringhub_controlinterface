@@ -1,0 +1,39 @@
+name: research
+display_name: Research Agent
+agent_type: research
+
+description: |
+  Gathers and synthesizes technical information from authoritative sources for acoustic
+  engineering and building science topics. Produces structured research documents with
+  citations, findings, and recommendations. Best for standards lookups, literature reviews,
+  and comparing technical alternatives.
+
+when_to_use:
+  - User asks to research a topic or standard
+  - User needs information about ASTM, ISO, IBC, or ANSI requirements
+  - User wants a comparison of technical approaches or products
+  - Task involves gathering evidence to support a design or recommendation
+  - User asks about code amendments, editions, or publication dates of standards
+
+invocation_examples:
+  - "/agent research IBC 1207.3 occupant comfort requirements --project 42"
+  - "/agent research ASTM E336-17a vs E336-21 material differences"
+  - "/agent research absorption coefficients for 50mm mineral wool at 500Hz"
+  - "/agent research NRC vs SAA rating comparison for ceiling tiles"
+
+parameters:
+  project_id:
+    description: Django project ID for context enrichment (optional)
+    required: false
+  description:
+    description: The research question or topic to investigate
+    required: true
+
+output:
+  format: markdown
+  structure:
+    - Executive Summary
+    - Detailed Findings (with citations)
+    - Recommendations
+    - References
+  output_dir: research

@@ -26,6 +26,7 @@ dependencies = [
 [project.optional-dependencies]
 mlx = [
     "mlx-lm>=0.31",
+    "mlx-vlm>=0.4.3",
 ]
 docling = [
     "docling>=2.60",

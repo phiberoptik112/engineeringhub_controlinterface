@@ -412,30 +412,74 @@ def _handle_chat_slash_command(
     raw: str,
     engine: ConversationEngine,
     chat_console: Console,
+    org_roam_dir: Path | None = None,
 ) -> None:
     """Intercept and execute a /slash command from the journaler chat loop.
 
     Recognised commands:
-      /load <path> [-r]   Load a file or directory into the current context.
-      /files              List all currently loaded files.
-      /clear              Remove all loaded files from the context.
-      /help               Show available slash commands.
+      /load <path> [-r]          Load a file or directory into context.
+      /files                     List all currently loaded files.
+      /files clear               Remove all loaded files from the context.
+      /clear [--hard|--summarize] Clear conversation history (soft by default).
+      /status                    Show context management state (pressure, turns, etc.)
+      /budget                    Show token budget breakdown.
+      /topic                     Show the currently detected conversation topic.
+      /find <title fragment>     Search org-roam files by #+title:.
+      /task <description>        Add a TODO to today's journal.
+      /done <fragment>           Mark a matching TODO as done in today's journal.
+      /note <heading> :: <text>  Append text under a heading in today's journal.
+      /help                      Show available slash commands.
     """
+    from engineering_hub.journaler.context_manager import ClearStrategy
+    from engineering_hub.journaler.org_writer import (
+        add_todo_to_journal,
+        append_to_heading,
+        find_org_by_title,
+        mark_done_in_journal,
+    )
+
     parts = raw.split()
     cmd = parts[0].lower()
 
+    # Determine the daily journal directory (child of org_roam_dir named "journal")
+    journal_dir: Path | None = None
+    if org_roam_dir is not None:
+        candidate = org_roam_dir / "journal"
+        journal_dir = candidate if candidate.exists() else org_roam_dir
+
     if cmd == "/help":
+        write_cmds = (
+            "\n  [bold]File operations (requires org-roam dir):[/bold]\n"
+            "  [cyan]/task <description>[/cyan]          Add a TODO to today's journal\n"
+            "  [cyan]/done <fragment>[/cyan]             Mark a matching TODO as done\n"
+            "  [cyan]/note <heading> :: <text>[/cyan]   Append text under a heading in today's journal\n"
+            "  [cyan]/find <title fragment>[/cyan]       Search org-roam files by title\n"
+        ) if org_roam_dir else ""
+
         chat_console.print(
             "\n[bold cyan]Slash commands:[/bold cyan]\n"
-            "  [cyan]/load <path> [-r][/cyan]  Load a file or directory into context\n"
-            "                         (-r / --recursive scans subdirectories)\n"
-            "  [cyan]/files[/cyan]             List loaded files\n"
-            "  [cyan]/clear[/cyan]             Remove all loaded files from context\n"
-            "  [cyan]/help[/cyan]              Show this help\n"
+            "  [cyan]/load <path> [-r][/cyan]          Load a file or directory into context\n"
+            "                                 (-r / --recursive scans subdirectories)\n"
+            "  [cyan]/files[/cyan]                     List loaded files\n"
+            "  [cyan]/files clear[/cyan]               Remove all loaded files from context\n"
+            "  [cyan]/clear[/cyan]                     Clear conversation history (keeps context snapshot)\n"
+            "  [cyan]/clear --summarize[/cyan]         Compress history into a summary, then clear\n"
+            "  [cyan]/clear --hard[/cyan]              Full reset: conversation + scan state\n"
+            "  [cyan]/status[/cyan]                    Show context pressure and token usage\n"
+            "  [cyan]/budget[/cyan]                    Show token budget breakdown\n"
+            "  [cyan]/topic[/cyan]                     Show currently detected conversation topic\n"
+            + write_cmds +
+            "  [cyan]/help[/cyan]                      Show this help\n"
         )
         return
 
     if cmd == "/files":
+        # /files clear — remove all loaded files
+        if len(parts) >= 2 and parts[1].lower() == "clear":
+            engine.clear_loaded_files()
+            chat_console.print("[green]Loaded files cleared.[/green]")
+            return
+        # /files — list loaded files
         entries = engine.list_loaded_files()
         if not entries:
             chat_console.print("[dim]No files loaded.[/dim]")
@@ -447,8 +491,51 @@ def _handle_chat_slash_command(
         return
 
     if cmd == "/clear":
-        engine.clear_loaded_files()
-        chat_console.print("[green]Loaded files cleared.[/green]")
+        flags = {p.lower() for p in parts[1:]}
+        if "--hard" in flags:
+            strategy = ClearStrategy.HARD
+        elif "--summarize" in flags:
+            strategy = ClearStrategy.SUMMARIZE
+        else:
+            strategy = ClearStrategy.SOFT
+        msg = engine.clear(strategy)
+        chat_console.print(f"[green]{escape(msg)}[/green]")
+        return
+
+    if cmd == "/status":
+        status = engine.get_status()
+        table = Table(title="Context Status")
+        table.add_column("Field", style="cyan")
+        table.add_column("Value", style="green")
+        for key, val in status.items():
+            table.add_row(key.replace("_", " ").title(), str(val))
+        chat_console.print(table)
+        return
+
+    if cmd == "/budget":
+        engine.budget.history_tokens = engine.history.total_tokens
+        b = engine.budget
+        table = Table(title="Token Budget")
+        table.add_column("Component", style="cyan")
+        table.add_column("Tokens", justify="right", style="green")
+        table.add_row("Context window", f"{b.window_size:,}")
+        table.add_row("System prompt", f"{b.system_prompt_tokens:,}")
+        table.add_row("Context snapshot", f"{b.context_snapshot_tokens:,}")
+        table.add_row("Conversation history", f"{b.history_tokens:,}")
+        table.add_row("Reserved for generation", f"{b.reserved_for_generation:,}")
+        table.add_row("─" * 20, "─" * 10)
+        table.add_row("[bold]Used[/bold]", f"[bold]{b.used:,}[/bold]")
+        table.add_row("[bold]Available[/bold]", f"[bold]{b.available:,}[/bold]")
+        table.add_row("[bold]Utilization[/bold]", f"[bold]{b.utilization:.0%}[/bold]")
+        chat_console.print(table)
+        return
+
+    if cmd == "/topic":
+        topic = engine.topic_tracker.current_topic
+        if topic:
+            chat_console.print(f"[cyan]Current topic:[/cyan] {topic}")
+        else:
+            chat_console.print("[dim]No topic detected yet.[/dim]")
         return
 
     if cmd == "/load":
@@ -481,6 +568,76 @@ def _handle_chat_slash_command(
             chat_console.print(f"[{color}]{escape(line)}[/{color}]")
         return
 
+    if cmd == "/find":
+        if org_roam_dir is None:
+            chat_console.print("[yellow]/find requires org_roam_dir (start with 'journaler start' or 'journaler chat')[/yellow]")
+            return
+        if len(parts) < 2:
+            chat_console.print("[yellow]Usage: /find <title fragment>[/yellow]")
+            return
+        fragment = " ".join(parts[1:])
+        ok, matches = find_org_by_title(org_roam_dir, fragment)
+        if not ok:
+            chat_console.print(f"[red]Could not search: {org_roam_dir}[/red]")
+        elif not matches:
+            chat_console.print(f"[dim]No org files found matching '{fragment}'.[/dim]")
+        else:
+            chat_console.print(f"\n[bold]Found {len(matches)} file(s):[/bold]")
+            for p in matches:
+                chat_console.print(f"  [cyan]{p}[/cyan]")
+            chat_console.print()
+        return
+
+    if cmd == "/task":
+        if journal_dir is None:
+            chat_console.print("[yellow]/task requires org-roam dir (start with 'journaler chat')[/yellow]")
+            return
+        if len(parts) < 2:
+            chat_console.print("[yellow]Usage: /task <description>[/yellow]")
+            return
+        description = " ".join(parts[1:])
+        ok, msg = add_todo_to_journal(journal_dir, description)
+        color = "green" if ok else "red"
+        chat_console.print(f"[{color}]{escape(msg)}[/{color}]")
+        return
+
+    if cmd == "/done":
+        if journal_dir is None:
+            chat_console.print("[yellow]/done requires org-roam dir (start with 'journaler chat')[/yellow]")
+            return
+        if len(parts) < 2:
+            chat_console.print("[yellow]Usage: /done <description fragment>[/yellow]")
+            return
+        fragment = " ".join(parts[1:])
+        ok, msg = mark_done_in_journal(journal_dir, fragment)
+        color = "green" if ok else "red"
+        chat_console.print(f"[{color}]{escape(msg)}[/{color}]")
+        return
+
+    if cmd == "/note":
+        if journal_dir is None:
+            chat_console.print("[yellow]/note requires org-roam dir (start with 'journaler chat')[/yellow]")
+            return
+        # Syntax: /note <heading> :: <text>
+        rest = raw[len("/note"):].strip()
+        if " :: " not in rest:
+            chat_console.print("[yellow]Usage: /note <heading> :: <text>[/yellow]")
+            return
+        heading, _, text = rest.partition(" :: ")
+        heading = heading.strip()
+        text = text.strip()
+        if not heading or not text:
+            chat_console.print("[yellow]Usage: /note <heading> :: <text>[/yellow]")
+            return
+        from datetime import datetime as _dt
+        from engineering_hub.journaler.org_writer import _today_journal_path, _create_journal_file
+        today_path = _today_journal_path(journal_dir)
+        _create_journal_file(today_path)
+        ok, msg = append_to_heading(today_path, heading, text, create_heading_if_missing=True)
+        color = "green" if ok else "red"
+        chat_console.print(f"[{color}]{escape(msg)}[/{color}]")
+        return
+
     chat_console.print(
         f"[yellow]Unknown command '{cmd}'. Type /help for available commands.[/yellow]"
     )
@@ -492,7 +649,7 @@ def cmd_journaler(args: argparse.Namespace) -> int:
     if sub is None:
         console.print(
             "[yellow]Usage: engineering-hub journaler"
-            " {start|chat|briefing|status|scan|download}[/yellow]"
+            " {start|chat|briefing|status|scan|clear|download}[/yellow]"
         )
         return 1
 
@@ -597,18 +754,27 @@ def cmd_journaler(args: argparse.Namespace) -> int:
         ctx.scan()
 
         system_template = load_system_prompt(config.state_dir)
-        system_prompt = format_system_prompt(system_template, ctx.get_current_context())
+        from engineering_hub.journaler.prompts import build_workspace_layout
+        workspace_map = build_workspace_layout(config.org_roam_dir, config.workspace_dir)
+        system_prompt = format_system_prompt(
+            system_template,
+            ctx.get_current_context(),
+            workspace_map=workspace_map,
+        )
         engine = ConversationEngine(
             backend=backend,
             system_prompt=system_prompt,
             log_dir=config.state_dir,
             max_history=config.max_conversation_history,
             max_tokens=config.max_tokens,
+            pressure_config=config.get_pressure_config(),
+            model_context_window=config.model_context_window,
         )
 
         console.print(
             "[green]Journaler ready. Type your questions (Ctrl-C to exit).[/green]\n"
-            "[dim]Tip: /load <path> to inject a file into context, /help for commands.[/dim]\n"
+            "[dim]Tip: /load <path> to inject a file, /task <desc> to add a TODO, /help for all commands.[/dim]\n"
+            "[dim]Context: /status, /budget, /topic — Clear: /clear, /clear --summarize, /clear --hard[/dim]\n"
         )
         try:
             while True:
@@ -616,7 +782,9 @@ def cmd_journaler(args: argparse.Namespace) -> int:
                 if not user_input:
                     continue
                 if user_input.startswith("/"):
-                    _handle_chat_slash_command(user_input, engine, console)
+                    _handle_chat_slash_command(
+                        user_input, engine, console, org_roam_dir=config.org_roam_dir
+                    )
                     continue
                 response = engine.chat(user_input)
                 console.print(f"\n[bold]Journaler:[/bold] {escape(response)}\n")
@@ -679,6 +847,67 @@ def cmd_journaler(args: argparse.Namespace) -> int:
         console.print(f"  Changes: {snapshot.change_summary}")
         return 0
 
+    elif sub == "clear":
+        from engineering_hub.journaler.context_manager import ClearStrategy
+        from engineering_hub.journaler.engine import ConversationalMLXBackend, ConversationEngine
+
+        hard = getattr(args, "hard", False)
+        summarize = getattr(args, "summarize", False)
+
+        if hard:
+            strategy = ClearStrategy.HARD
+        elif summarize:
+            strategy = ClearStrategy.SUMMARIZE
+        else:
+            strategy = ClearStrategy.SOFT
+
+        if strategy == ClearStrategy.SUMMARIZE:
+            console.print("[bold]Loading model to compress history before clearing...[/bold]")
+            backend = ConversationalMLXBackend(
+                model_path=config.model_path,
+                temp=config.temp,
+                top_p=config.top_p,
+                min_p=config.min_p,
+                repetition_penalty=config.repetition_penalty,
+            )
+        else:
+            backend = None  # type: ignore[assignment]
+
+        # Build a temporary engine pointed at the existing state dir
+        # (history is loaded from conversation.jsonl — this is a best-effort
+        # in-process clear; primary effect is the JSONL audit trail)
+        if backend is not None:
+            engine = ConversationEngine(
+                backend=backend,
+                system_prompt="",
+                log_dir=config.state_dir,
+                max_tokens=config.max_tokens,
+                pressure_config=config.get_pressure_config(),
+                model_context_window=config.model_context_window,
+            )
+            msg = engine.clear(strategy)
+        else:
+            from engineering_hub.journaler.context_manager import (
+                ConversationHistory,
+                ContextCompressor,
+                execute_clear,
+            )
+            history = ConversationHistory()
+            compressor = ContextCompressor(engine_call=lambda p, t: "")
+            msg = execute_clear(strategy, history, compressor)
+
+        console.print(f"[green]{escape(msg)}[/green]")
+
+        if strategy == ClearStrategy.HARD:
+            state_file = config.state_dir / "state.json"
+            context_cache = config.state_dir / "context_cache.json"
+            for f in (state_file, context_cache):
+                if f.exists():
+                    f.unlink()
+                    console.print(f"[dim]Removed {f.name}[/dim]")
+
+        return 0
+
     elif sub == "download":
         resolved_local = Path(model_path).expanduser()
         if resolved_local.is_dir():
@@ -697,7 +926,7 @@ def cmd_journaler(args: argparse.Namespace) -> int:
             return 0
 
         console.print(f"[bold]Downloading Journaler model:[/bold] {model_path}")
-        console.print("[dim](This may take several minutes for a ~17GB 4-bit checkpoint)[/dim]\n")
+        console.print("[dim](This may take several minutes for a ~34GB 8-bit checkpoint)[/dim]\n")
         try:
             from huggingface_hub import snapshot_download
 
@@ -939,6 +1168,20 @@ def main() -> int:
     journaler_sub.add_parser("scan", help="Run a single org-roam scan")
     journaler_sub.add_parser(
         "download", help="Pre-download the Journaler model to local HF cache"
+    )
+
+    clear_p = journaler_sub.add_parser(
+        "clear", help="Clear conversation history (soft by default)"
+    )
+    clear_p.add_argument(
+        "--hard",
+        action="store_true",
+        help="Full reset: clear conversation and wipe scan state",
+    )
+    clear_p.add_argument(
+        "--summarize",
+        action="store_true",
+        help="Compress history into a summary before clearing (requires model load)",
     )
 
     # load command

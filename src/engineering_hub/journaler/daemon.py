@@ -10,7 +10,7 @@ from __future__ import annotations
 import logging
 import signal
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -18,8 +18,11 @@ from typing import TYPE_CHECKING
 import schedule
 
 from engineering_hub.journaler.context import JournalContext
+from engineering_hub.journaler.context_manager import PressureConfig
 from engineering_hub.journaler.engine import ConversationalMLXBackend, ConversationEngine
 from engineering_hub.journaler.prompts import (
+    build_skills_block,
+    build_workspace_layout,
     format_briefing_prompt,
     format_system_prompt,
     load_briefing_prompt,
@@ -28,6 +31,7 @@ from engineering_hub.journaler.prompts import (
 
 if TYPE_CHECKING:
     from engineering_hub.journaler.chat_server import ChatServer
+    from engineering_hub.journaler.delegator import AgentDelegator
     from engineering_hub.journaler.slack import SlackPoster
     from engineering_hub.memory.service import MemoryService
 
@@ -60,6 +64,10 @@ class JournalerConfig:
     max_conversation_history: int = 20
     max_tokens: int = 4000
 
+    # Context management
+    model_context_window: int = 32768
+    context_management: PressureConfig | None = None
+
     # MLX sampling parameters
     temp: float = 0.7
     top_p: float = 0.9
@@ -69,6 +77,28 @@ class JournalerConfig:
     watch_dirs: list[Path] | None = None
 
     memory_service: MemoryService | None = None
+
+    # Agent delegation settings
+    # anthropic_api_key: Anthropic API key for Claude-backed agent delegation.
+    #   If empty, delegation falls back to the local MLX model.
+    anthropic_api_key: str = ""
+    # agent_backend: Which LLM to use for delegated agent tasks.
+    #   "auto"   — Claude if api key present, else local MLX (default)
+    #   "claude" — always Claude API (error if no key)
+    #   "mlx"    — always local model (reuses Journaler's loaded model, no extra RAM)
+    agent_backend: str = "auto"
+    # skills_dir: Path to the skills/ YAML directory.
+    #   Defaults to the skills/ directory at the repo root.
+    skills_dir: Path | None = None
+
+    def get_pressure_config(self) -> PressureConfig:
+        """Return the PressureConfig, defaulting from scalar fields if not set."""
+        if self.context_management is not None:
+            return self.context_management
+        return PressureConfig(
+            model_context_window=self.model_context_window,
+            max_history_turns=self.max_conversation_history,
+        )
 
 
 def run_daemon(config: JournalerConfig) -> None:
@@ -103,7 +133,8 @@ def run_daemon(config: JournalerConfig) -> None:
         repetition_penalty=config.repetition_penalty,
     )
 
-    # Init conversation engine
+    # Init conversation engine with context management
+    pressure_cfg = config.get_pressure_config()
     system_prompt = format_system_prompt(system_template, "(initial scan pending)")
     engine = ConversationEngine(
         backend=backend,
@@ -111,16 +142,57 @@ def run_daemon(config: JournalerConfig) -> None:
         log_dir=config.state_dir,
         max_history=config.max_conversation_history,
         max_tokens=config.max_tokens,
+        pressure_config=pressure_cfg,
+        model_context_window=config.model_context_window,
     )
 
     # Do initial scan
     logger.info("Running initial scan...")
     context.scan()
+    workspace_map = build_workspace_layout(config.org_roam_dir, config.workspace_dir)
     engine.update_context(context.get_current_context())
-    # Re-set system prompt with actual context
+    # Re-set system prompt with actual context and workspace layout
     engine._system_prompt = format_system_prompt(
-        system_template, context.get_current_context()
+        system_template,
+        context.get_current_context(),
+        workspace_map=workspace_map,
     )
+
+    # Init agent delegator (bridges Journaler chat → AgentWorker)
+    delegator: AgentDelegator | None = None
+    try:
+        from engineering_hub.agents.worker import AgentWorker
+        from engineering_hub.journaler.delegator import AgentDelegator
+
+        anthropic_worker = None
+        if config.anthropic_api_key:
+            anthropic_worker = AgentWorker.from_anthropic(
+                api_key=config.anthropic_api_key,
+                prompts_dir=None,
+                output_dir=config.workspace_dir / "outputs",
+            )
+            logger.info("Claude API worker initialized for agent delegation")
+
+        delegator = AgentDelegator(
+            mlx_backend=backend,
+            anthropic_worker=anthropic_worker,
+            skills_dir=config.skills_dir,
+            default_backend=config.agent_backend,
+            output_dir=config.workspace_dir / "outputs",
+        )
+        logger.info(
+            f"AgentDelegator ready (default backend: {config.agent_backend}, "
+            f"skills: {len(delegator.list_skills())})"
+        )
+
+        # Inject skills block into system prompt when delegation is available
+        skills_block = build_skills_block(delegator)
+        if skills_block:
+            engine._system_prompt = engine._system_prompt.rstrip() + "\n\n" + skills_block
+
+    except Exception as exc:
+        logger.warning(f"AgentDelegator init failed — delegation unavailable: {exc}")
+        delegator = None
 
     # Init optional components
     slack: SlackPoster | None = None
@@ -140,6 +212,7 @@ def run_daemon(config: JournalerConfig) -> None:
             host=config.chat_host,
             port=config.chat_port,
             start_time=start_time,
+            delegator=delegator,
         )
 
     # Schedule recurring tasks
@@ -148,6 +221,7 @@ def run_daemon(config: JournalerConfig) -> None:
         context=context,
         engine=engine,
         system_template=system_template,
+        workspace_map=workspace_map,
     )
 
     if config.briefing_enabled:
@@ -160,6 +234,15 @@ def run_daemon(config: JournalerConfig) -> None:
             slack=slack,
         )
         logger.info(f"Morning briefing scheduled at {config.briefing_time}")
+
+    # Schedule end-of-day context clear
+    eod_time = pressure_cfg.end_of_day_time
+    schedule.every().day.at(eod_time).do(
+        _end_of_day_clear,
+        engine=engine,
+        config=config,
+    )
+    logger.info(f"End-of-day context clear scheduled at {eod_time}")
 
     # Start chat server in background thread
     if chat_server:
@@ -235,6 +318,8 @@ def generate_briefing_now(
             system_prompt="You are the Journaler.",
             log_dir=config.state_dir,
             max_tokens=config.max_tokens,
+            pressure_config=config.get_pressure_config(),
+            model_context_window=config.model_context_window,
         )
 
     briefing = engine.generate_briefing(briefing_context, prompt)
@@ -261,12 +346,15 @@ def _tick(
     context: JournalContext,
     engine: ConversationEngine,
     system_template: str,
+    workspace_map: str = "",
 ) -> None:
     """10-minute scan cycle."""
     snapshot = context.scan()
     current_context = context.get_current_context()
     engine.update_context(current_context)
-    engine._system_prompt = format_system_prompt(system_template, current_context)
+    engine._system_prompt = format_system_prompt(
+        system_template, current_context, workspace_map=workspace_map
+    )
 
     if snapshot.has_significant_changes:
         logger.info(f"Significant changes detected: {snapshot.change_summary}")
@@ -280,7 +368,6 @@ def _morning_briefing(
     slack: SlackPoster | None,
 ) -> None:
     """Generate and deliver the morning briefing."""
-    # Run a fresh scan first
     context.scan()
     briefing_context = context.get_briefing_context()
     today_str = date.today().isoformat()
@@ -288,7 +375,6 @@ def _morning_briefing(
 
     briefing = engine.generate_briefing(briefing_context, prompt)
 
-    # Save to file
     output_dir = config.briefing_output_dir or (config.state_dir / "briefings")
     output_dir.mkdir(parents=True, exist_ok=True)
     briefing_path = output_dir / f"{today_str}.md"
@@ -298,6 +384,79 @@ def _morning_briefing(
     )
     logger.info(f"Morning briefing generated: {briefing_path}")
 
-    # Post to Slack
     if slack:
         slack.post_briefing(briefing)
+
+
+def _end_of_day_clear(
+    engine: ConversationEngine,
+    config: JournalerConfig,
+) -> None:
+    """End-of-day housekeeping: compress today's conversation, archive, and reset.
+
+    Writes a daily summary to ``<state_dir>/daily_summaries/YYYY-MM-DD.md``
+    and optionally captures it to memory if ``capture_daily_to_memory`` is
+    enabled in the PressureConfig.
+    """
+    history = engine.history
+
+    if not history.turns:
+        logger.debug("End-of-day clear: no conversation history to archive.")
+        return
+
+    all_turns = [t for t in history.turns if t.role != "system"]
+    if not all_turns:
+        history.turns.clear()
+        return
+
+    all_text = "\n".join(
+        f"{t.role.upper()} ({t.timestamp[:16]}): {t.content}"
+        for t in all_turns
+    )
+
+    try:
+        summary = engine._raw_complete(
+            f"Summarize today's conversation for archival. "
+            f"Include key decisions, open questions, and action items.\n\n"
+            f"{all_text}",
+            max_tokens=800,
+        )
+    except Exception as exc:
+        logger.warning(f"End-of-day summary generation failed: {exc}")
+        summary = "(Summary generation failed — raw turns archived to conversation.jsonl)"
+
+    date_str = datetime.now().strftime("%Y-%m-%d")
+    summary_dir = config.state_dir / "daily_summaries"
+    summary_dir.mkdir(parents=True, exist_ok=True)
+    summary_path = summary_dir / f"{date_str}.md"
+    summary_path.write_text(
+        f"# Journaler Daily Summary — {date_str}\n\n"
+        f"Exchanges: {len(all_turns)}\n\n"
+        f"{summary}\n",
+        encoding="utf-8",
+    )
+    logger.info(f"Daily summary written to {summary_path}")
+
+    # Optionally capture to memory
+    pressure_cfg = config.get_pressure_config()
+    if pressure_cfg.capture_daily_to_memory and config.memory_service:
+        try:
+            config.memory_service.capture(
+                content=f"Journaler daily summary ({date_str}):\n{summary}",
+                source="journaler",
+                tags=["daily_summary", date_str],
+            )
+        except Exception as exc:
+            logger.warning(f"Failed to capture daily summary to memory: {exc}")
+
+    # Archive all turns to JSONL then reset
+    archived = list(history.turns)
+    engine._log_archived_turns(archived)
+
+    history.turns.clear()
+    engine.budget.history_tokens = 0
+
+    logger.info(
+        f"End-of-day clear: {len(archived)} turns archived, "
+        f"summary saved to {summary_path.name}"
+    )

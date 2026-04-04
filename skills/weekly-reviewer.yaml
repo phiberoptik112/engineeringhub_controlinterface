@@ -1,0 +1,42 @@
+name: weekly-reviewer
+display_name: Weekly Reviewer Agent
+agent_type: weekly-reviewer
+
+description: |
+  Analyzes a week's worth of org-roam journal entries, agent outputs, and project activity
+  to surface patterns, open loops, and actionable focus areas. Looks for items falling
+  through the cracks, connects dots across different projects and days, and assesses
+  whether the agent delegation pipeline is functioning. Produces a scannable weekly review
+  readable in under 2 minutes. Best run once per week with the full journal context.
+
+when_to_use:
+  - User wants a weekly review of their journal and project activity
+  - User asks "what did I do this week?" or "what needs attention?"
+  - User wants to assess agent delegation effectiveness over the past week
+  - User needs a structured summary before a planning session
+  - User wants to identify open loops and patterns across the week
+
+invocation_examples:
+  - "/agent weekly-reviewer summarize this week's work and open loops"
+  - "/agent weekly-reviewer review journal activity and agent outputs this week"
+  - "/agent weekly-reviewer produce weekly review with focus on project momentum"
+
+parameters:
+  project_id:
+    description: Django project ID for context enrichment (optional)
+    required: false
+  description:
+    description: The review scope — typically "this week" with optional focus area
+    required: true
+
+output:
+  format: markdown
+  structure:
+    - Week at a Glance (entry count, date range, top themes)
+    - This Week's Themes (3-5 themes, synthesized)
+    - Open Loops
+    - Agent Work This Week
+    - Connections You Might Have Missed
+    - Gaps
+    - Suggested Focus for Next Week
+  output_dir: reviews
