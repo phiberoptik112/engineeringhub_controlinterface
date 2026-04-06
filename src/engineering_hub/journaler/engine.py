@@ -240,7 +240,7 @@ class ConversationalMLXBackend:
 
     def _chat_vlm(self, prompt: str, max_tokens: int) -> str:
         try:
-            return self._mlx_vlm.generate(  # type: ignore[union-attr]
+            raw = self._mlx_vlm.generate(  # type: ignore[union-attr]
                 self._model,
                 self._processor,
                 prompt=prompt,
@@ -250,6 +250,13 @@ class ConversationalMLXBackend:
                 top_p=self._top_p,
                 verbose=False,
             )
+            # mlx_vlm.generate returns GenerationResult (dataclass with .text), not str.
+            if isinstance(raw, str):
+                return raw
+            text = getattr(raw, "text", None)
+            if isinstance(text, str):
+                return text
+            return str(raw)
         except Exception as exc:
             raise LLMBackendError(
                 f"Journaler MLX-VLM generation failed: {exc}", provider="mlx"

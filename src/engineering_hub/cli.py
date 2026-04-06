@@ -21,6 +21,10 @@ from engineering_hub.orchestration.orchestrator import Orchestrator
 console = Console()
 
 
+class JournalerChatExit(Exception):
+    """Raised to leave the interactive journaler chat loop (e.g. /exit)."""
+
+
 def setup_logging(verbose: bool = False) -> None:
     """Set up logging with rich handler."""
     level = logging.DEBUG if verbose else logging.INFO
@@ -428,6 +432,7 @@ def _handle_chat_slash_command(
       /task <description>        Add a TODO to today's journal.
       /done <fragment>           Mark a matching TODO as done in today's journal.
       /note <heading> :: <text>  Append text under a heading in today's journal.
+      /exit, /quit               Leave the chat (same as bare exit, quit, or :q).
       /help                      Show available slash commands.
     """
     from engineering_hub.journaler.context_manager import ClearStrategy
@@ -440,6 +445,9 @@ def _handle_chat_slash_command(
 
     parts = raw.split()
     cmd = parts[0].lower()
+
+    if cmd in ("/exit", "/quit"):
+        raise JournalerChatExit()
 
     # Determine the daily journal directory (child of org_roam_dir named "journal")
     journal_dir: Path | None = None
@@ -469,6 +477,7 @@ def _handle_chat_slash_command(
             "  [cyan]/budget[/cyan]                    Show token budget breakdown\n"
             "  [cyan]/topic[/cyan]                     Show currently detected conversation topic\n"
             + write_cmds +
+            "  [cyan]/exit[/cyan], [cyan]/quit[/cyan]          Leave chat (or type exit, quit, :q)\n"
             "  [cyan]/help[/cyan]                      Show this help\n"
         )
         return
@@ -675,6 +684,7 @@ def cmd_journaler(args: argparse.Namespace) -> int:
             "  download automatically now (may take several minutes on a slow connection)."
         )
 
+    from engineering_hub.journaler.context import JournalContext
     from engineering_hub.journaler.daemon import JournalerConfig, generate_briefing_now, run_daemon
 
     memory_service = None
@@ -733,7 +743,6 @@ def cmd_journaler(args: argparse.Namespace) -> int:
         return 0
 
     elif sub == "chat":
-        from engineering_hub.journaler.context import JournalContext
         from engineering_hub.journaler.engine import ConversationalMLXBackend, ConversationEngine
         from engineering_hub.journaler.prompts import format_system_prompt, load_system_prompt
 
@@ -772,24 +781,48 @@ def cmd_journaler(args: argparse.Namespace) -> int:
         )
 
         console.print(
-            "[green]Journaler ready. Type your questions (Ctrl-C to exit).[/green]\n"
+            "[green]Journaler ready. Type your questions (Ctrl-C, /exit, or exit to leave).[/green]\n"
             "[dim]Tip: /load <path> to inject a file, /task <desc> to add a TODO, /help for all commands.[/dim]\n"
             "[dim]Context: /status, /budget, /topic — Clear: /clear, /clear --summarize, /clear --hard[/dim]\n"
         )
+        log = logging.getLogger(__name__)
         try:
             while True:
-                user_input = input("You: ").strip()
+                try:
+                    user_input = input("You: ").strip()
+                except (KeyboardInterrupt, EOFError):
+                    raise
                 if not user_input:
                     continue
+                if user_input.lower() in ("exit", "quit", ":q"):
+                    break
                 if user_input.startswith("/"):
-                    _handle_chat_slash_command(
-                        user_input, engine, console, org_roam_dir=config.org_roam_dir
+                    try:
+                        _handle_chat_slash_command(
+                            user_input, engine, console, org_roam_dir=config.org_roam_dir
+                        )
+                    except JournalerChatExit:
+                        break
+                    except Exception as exc:
+                        log.exception("Journaler slash command failed")
+                        console.print(
+                            f"[red]Command failed:[/red] {escape(str(exc))}\n"
+                            "[dim]Type /help for commands. You can keep chatting.[/dim]\n"
+                        )
+                    continue
+                try:
+                    response = engine.chat(user_input)
+                except Exception as exc:
+                    log.exception("Journaler chat turn failed")
+                    console.print(
+                        f"\n[red]Something went wrong:[/red] {escape(str(exc))}\n"
+                        "[dim]You can try again, or type /exit to leave.[/dim]\n"
                     )
                     continue
-                response = engine.chat(user_input)
                 console.print(f"\n[bold]Journaler:[/bold] {escape(response)}\n")
         except (KeyboardInterrupt, EOFError):
-            console.print("\n[dim]Chat ended.[/dim]")
+            pass
+        console.print("\n[dim]Chat ended.[/dim]")
         return 0
 
     elif sub == "briefing":

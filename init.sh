@@ -25,6 +25,10 @@ if [ -f "$SCRIPT_DIR/.env" ]; then
     echo "✓ Loaded environment from .env"
 fi
 
+# run the .venv 
+source "$SCRIPT_DIR/.venv/bin/activate"
+echo "✓ Activated virtual environment"
+
 # Check for required API keys (warn if missing)
 if [ -z "${ENGINEERING_HUB_ANTHROPIC_API_KEY:-}" ] && [ -z "${ANTHROPIC_API_KEY:-}" ]; then
     echo "⚠ Warning: No Anthropic API key set (ENGINEERING_HUB_ANTHROPIC_API_KEY or ANTHROPIC_API_KEY)"
