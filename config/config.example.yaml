@@ -128,6 +128,16 @@ memory:
   search_k: 5         # memories injected per agent task
   threshold: 0.35     # cosine similarity floor (0.0-1.0)
 
+# ── PDF reference corpus (libraryfiles-corpus) ───────────────────
+# Install in the same venv: pip install -e /path/to/libraryfiles_corpus
+# Uses ollama.host / ollama.embed_model above for query-time embeddings.
+#
+# corpus:
+#   enabled: false
+#   db_path: "~/dev/libraryfiles_corpus/corpus.db"
+#   search_k: 5
+#   threshold: 0.40
+
 # ── Document ingest chunking ─────────────────────────────────────
 # When files are ingested (PDF/DOCX), they are chunked and embedded
 # into memory for semantic search. Requires the docling extra:
@@ -165,6 +175,26 @@ chunking:
 #   #
 #   model_path: "mlx-community/gemma-4-31b-it-8bit"
 #
+#   # Named profiles (optional). When ``models`` is non-empty, ``model_profile``
+#   # selects which entry to use. Override on the CLI:
+#   #   engineering-hub journaler --profile reasoning chat
+#   #   engineering-hub journaler --model mlx-community/other-id start
+#   # In chat (CLI or HTTP): /model , /model reasoning , /model path <hf-id>
+#   #
+#   # model_profile: "default"
+#   # models:
+#   #   default:
+#   #     model_path: "mlx-community/gemma-4-31b-it-8bit"
+#   #     model_context_window: 131072
+#   #     mlx_backend: auto          # auto | mlx-lm | mlx-vlm
+#   #     enable_thinking: null       # null = omit (Gemma); true/false for Qwen3 templates
+#   #   reasoning:
+#   #     model_path: "mlx-community/Qwen3-30B-A3B-Instruct-2507-4bit"
+#   #     model_context_window: 32768
+#   #     temp: 0.6
+#   #     top_p: 0.95
+#   #     enable_thinking: true
+#
 #   # The model's actual context window in tokens.
 #   # Used by the context pressure manager to calculate utilization.
 #   # Gemma 4 31B: 131072  |  Qwen3-30B-A3B: 32768  |  Qwen2.5-32B: 32768
@@ -195,6 +225,14 @@ chunking:
 #   top_p: 0.9
 #   min_p: 0.05
 #   repetition_penalty: 1.1
+#
+#   # Slash /load: how much of the *remaining* context (after system, snapshot,
+#   # history, reserved output, slack) may go to each file chunk. Uses the same
+#   # len//3 token estimate as the pressure manager.
+#   # load_max_context_fraction: 0.40   # (0, 1]; fraction of remaining tokens
+#   # load_max_chars_absolute: 200000  # hard cap per file
+#   # load_min_chars: 1024            # aim for at least this many chars when headroom allows
+#   # load_slack_tokens: 256          # extra margin subtracted from headroom
 #
 #   # ── Context management ─────────────────────────────────────────
 #   # Controls how the daemon manages its finite context window over

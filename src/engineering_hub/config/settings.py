@@ -1,6 +1,7 @@
 """Application settings using pydantic-settings."""
 
 from pathlib import Path
+from typing import Any
 
 from pydantic import Field, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -197,6 +198,18 @@ class Settings(BaseSettings):
         default="",
         description="HuggingFace model ID or local path for Journaler MLX model",
     )
+    journaler_model_profile: str = Field(
+        default="default",
+        description="Named profile under journaler.models (when models map is non-empty)",
+    )
+    journaler_models: dict[str, dict[str, Any]] = Field(
+        default_factory=dict,
+        description="Named Journaler MLX profiles (model_path, sampling, enable_thinking, ...)",
+    )
+    journaler_model_context_window: int = Field(
+        default=32768,
+        description="Context window in tokens for pressure management (default when not in profile)",
+    )
     journaler_scan_interval_min: int = Field(
         default=10,
         description="Interval in minutes between org-roam scans",
@@ -253,6 +266,34 @@ class Settings(BaseSettings):
         default=1.1,
         description="Repetition penalty for Journaler model",
     )
+    journaler_load_max_context_fraction: float = Field(
+        default=0.40,
+        gt=0.0,
+        le=1.0,
+        description="Fraction of remaining context (after history, etc.) for each /load chunk",
+    )
+    journaler_load_max_chars_absolute: int = Field(
+        default=200_000,
+        ge=1,
+        description="Hard ceiling on characters loaded per file (slash /load)",
+    )
+    journaler_load_min_chars: int = Field(
+        default=1024,
+        ge=0,
+        description="When budget allows, prefer at least this many chars per /load (within token headroom)",
+    )
+    journaler_load_slack_tokens: int = Field(
+        default=256,
+        ge=0,
+        description="Extra tokens subtracted from headroom when sizing /load (safety margin)",
+    )
+
+    # Report template settings
+    templates_dir: Path | None = Field(
+        default=None,
+        description="Directory containing report template skeletons. "
+        "Defaults to workspace_dir/templates",
+    )
 
     # PDF reference corpus settings
     corpus_enabled: bool = Field(
@@ -271,6 +312,13 @@ class Settings(BaseSettings):
         default=0.40,
         description="Minimum cosine similarity for corpus results (higher than memory threshold)",
     )
+
+    @property
+    def resolved_templates_dir(self) -> Path:
+        """Effective templates directory — custom path if set, else workspace_dir/templates."""
+        if self.templates_dir is not None:
+            return self.templates_dir
+        return self.workspace_dir / "templates"
 
     @property
     def resolved_inputs_dir(self) -> Path:
@@ -444,6 +492,12 @@ class Settings(BaseSettings):
                 flat_config["journaler_enabled"] = j["enabled"]
             if j.get("model_path"):
                 flat_config["journaler_model_path"] = j["model_path"]
+            if j.get("model_profile"):
+                flat_config["journaler_model_profile"] = j["model_profile"]
+            if j.get("models") is not None:
+                flat_config["journaler_models"] = j["models"] or {}
+            if j.get("model_context_window") is not None:
+                flat_config["journaler_model_context_window"] = j["model_context_window"]
             if j.get("scan_interval_min") is not None:
                 flat_config["journaler_scan_interval_min"] = j["scan_interval_min"]
             if j.get("briefing_enabled") is not None:
@@ -472,6 +526,19 @@ class Settings(BaseSettings):
                 flat_config["journaler_min_p"] = j["min_p"]
             if j.get("repetition_penalty") is not None:
                 flat_config["journaler_repetition_penalty"] = j["repetition_penalty"]
+            if j.get("load_max_context_fraction") is not None:
+                flat_config["journaler_load_max_context_fraction"] = j["load_max_context_fraction"]
+            if j.get("load_max_chars_absolute") is not None:
+                flat_config["journaler_load_max_chars_absolute"] = j["load_max_chars_absolute"]
+            if j.get("load_min_chars") is not None:
+                flat_config["journaler_load_min_chars"] = j["load_min_chars"]
+            if j.get("load_slack_tokens") is not None:
+                flat_config["journaler_load_slack_tokens"] = j["load_slack_tokens"]
+
+        if "templates" in config:
+            tpl = config["templates"]
+            if tpl.get("dir"):
+                flat_config["templates_dir"] = Path(tpl["dir"]).expanduser()
 
         if "corpus" in config:
             corpus = config["corpus"]

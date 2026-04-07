@@ -71,6 +71,10 @@ class JournalerMLXBackendAdapter:
     def __init__(self, journaler_backend: ConversationalMLXBackend) -> None:
         self._backend = journaler_backend
 
+    def set_backend(self, journaler_backend: ConversationalMLXBackend) -> None:
+        """Point at a new resident MLX backend (e.g. after Journaler ``/model``)."""
+        self._backend = journaler_backend
+
     def complete(self, system: str, user_message: str, max_tokens: int) -> str:
         messages = [
             {"role": "system", "content": system},
@@ -155,15 +159,19 @@ class AgentDelegator:
         self._default_backend = default_backend.lower()
         self._anthropic_worker = anthropic_worker
 
-        adapter = JournalerMLXBackendAdapter(mlx_backend)
+        self._mlx_adapter = JournalerMLXBackendAdapter(mlx_backend)
         self._mlx_worker = AgentWorker(
-            backend=adapter,
+            backend=self._mlx_adapter,
             prompts_dir=prompts_dir,
             output_dir=output_dir,
         )
 
         resolved_skills = skills_dir or _default_skills_dir()
         self._skills = _load_skills(resolved_skills)
+
+    def set_mlx_backend(self, backend: ConversationalMLXBackend) -> None:
+        """Sync the MLX delegator adapter with a newly loaded Journaler backend."""
+        self._mlx_adapter.set_backend(backend)
 
     # ------------------------------------------------------------------
     # Public API

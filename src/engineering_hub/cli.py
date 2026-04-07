@@ -15,7 +15,18 @@ from rich.table import Table
 from engineering_hub.config.loader import find_config_file
 from engineering_hub.config.settings import Settings
 from engineering_hub.journaler.constants import DEFAULT_JOURNALER_MLX_MODEL_ID
-from engineering_hub.journaler.engine import SUPPORTED_EXTENSIONS, ConversationEngine, _is_model_cached
+from engineering_hub.journaler.engine import (
+    SUPPORTED_EXTENSIONS,
+    ConversationEngine,
+    _is_model_cached,
+)
+from engineering_hub.journaler.model_profiles import (
+    JournalerChatModelContext,
+    build_journaler_mlx_backend,
+    ensure_spec_model_path,
+    journaler_slash_model_command,
+    resolve_journaler_model_spec,
+)
 from engineering_hub.orchestration.orchestrator import Orchestrator
 
 console = Console()
@@ -417,10 +428,12 @@ def _handle_chat_slash_command(
     engine: ConversationEngine,
     chat_console: Console,
     org_roam_dir: Path | None = None,
+    journaler_model_ctx: object | None = None,
 ) -> None:
     """Intercept and execute a /slash command from the journaler chat loop.
 
     Recognised commands:
+      /model                     Show or switch HF model (profile or path).
       /load <path> [-r]          Load a file or directory into context.
       /files                     List all currently loaded files.
       /files clear               Remove all loaded files from the context.
@@ -432,19 +445,38 @@ def _handle_chat_slash_command(
       /task <description>        Add a TODO to today's journal.
       /done <fragment>           Mark a matching TODO as done in today's journal.
       /note <heading> :: <text>  Append text under a heading in today's journal.
+      /open [today|clear|<path>|<title>]  Set session org-roam target for /edit.
+      /edit <heading> :: <text>  Append under a heading in the /open target.
       /exit, /quit               Leave the chat (same as bare exit, quit, or :q).
+      /model                     Show model, or switch profile / path (see /help).
       /help                      Show available slash commands.
     """
     from engineering_hub.journaler.context_manager import ClearStrategy
     from engineering_hub.journaler.org_writer import (
         add_todo_to_journal,
         append_to_heading,
+        assert_org_path_under_roam,
         find_org_by_title,
         mark_done_in_journal,
     )
-
     parts = raw.split()
     cmd = parts[0].lower()
+
+    if cmd == "/model":
+        if journaler_model_ctx is None:
+            chat_console.print(
+                "[yellow]/model requires internal context; if you see this, file a bug.[/yellow]"
+            )
+            return
+        msg = journaler_slash_model_command(
+            raw,
+            settings=journaler_model_ctx.settings,
+            model_ctx=journaler_model_ctx,
+            engine=engine,
+            delegator=None,
+        )
+        chat_console.print(f"[green]{escape(msg)}[/green]")
+        return
 
     if cmd in ("/exit", "/quit"):
         raise JournalerChatExit()
@@ -461,6 +493,12 @@ def _handle_chat_slash_command(
             "  [cyan]/task <description>[/cyan]          Add a TODO to today's journal\n"
             "  [cyan]/done <fragment>[/cyan]             Mark a matching TODO as done\n"
             "  [cyan]/note <heading> :: <text>[/cyan]   Append text under a heading in today's journal\n"
+            "  [cyan]/open[/cyan]                       Show current /edit target\n"
+            "  [cyan]/open clear[/cyan]                  Clear /edit target\n"
+            "  [cyan]/open today[/cyan]                  Target today's daily journal\n"
+            "  [cyan]/open <path>[/cyan]                  Target a .org file under org-roam\n"
+            "  [cyan]/open <title fragment>[/cyan]        Target unique #+title: match\n"
+            "  [cyan]/edit <heading> :: <text>[/cyan]   Append under a heading in /open target\n"
             "  [cyan]/find <title fragment>[/cyan]       Search org-roam files by title\n"
         ) if org_roam_dir else ""
 
@@ -468,6 +506,9 @@ def _handle_chat_slash_command(
             "\n[bold cyan]Slash commands:[/bold cyan]\n"
             "  [cyan]/load <path> [-r][/cyan]          Load a file or directory into context\n"
             "                                 (-r / --recursive scans subdirectories)\n"
+            "  [cyan]/model[/cyan]                     Show active MLX model / profile\n"
+            "  [cyan]/model <profile>[/cyan]           Switch to a named journaler.models profile\n"
+            "  [cyan]/model path <id-or-path>[/cyan]   Load a Hugging Face id or local path\n"
             "  [cyan]/files[/cyan]                     List loaded files\n"
             "  [cyan]/files clear[/cyan]               Remove all loaded files from context\n"
             "  [cyan]/clear[/cyan]                     Clear conversation history (keeps context snapshot)\n"
@@ -523,6 +564,7 @@ def _handle_chat_slash_command(
 
     if cmd == "/budget":
         engine.budget.history_tokens = engine.history.total_tokens
+        engine._sync_loaded_files_budget()
         b = engine.budget
         table = Table(title="Token Budget")
         table.add_column("Component", style="cyan")
@@ -530,6 +572,8 @@ def _handle_chat_slash_command(
         table.add_row("Context window", f"{b.window_size:,}")
         table.add_row("System prompt", f"{b.system_prompt_tokens:,}")
         table.add_row("Context snapshot", f"{b.context_snapshot_tokens:,}")
+        table.add_row("Loaded files", f"{b.loaded_files_tokens:,}")
+        table.add_row("Corpus injection", f"{b.corpus_injection_tokens:,}")
         table.add_row("Conversation history", f"{b.history_tokens:,}")
         table.add_row("Reserved for generation", f"{b.reserved_for_generation:,}")
         table.add_row("─" * 20, "─" * 10)
@@ -647,6 +691,97 @@ def _handle_chat_slash_command(
         chat_console.print(f"[{color}]{escape(msg)}[/{color}]")
         return
 
+    if cmd == "/open":
+        rest = raw[len("/open"):].strip()
+        if not rest:
+            t = engine.get_roam_edit_target()
+            if t:
+                chat_console.print(f"[cyan]Current edit target:[/cyan] {t}")
+            else:
+                chat_console.print(
+                    "[dim]No edit target set. Use /open today, a .org path under org-roam, "
+                    "or a unique title fragment.[/dim]"
+                )
+            return
+        if rest.lower() == "clear":
+            engine.set_roam_edit_target(None)
+            chat_console.print("[green]Edit target cleared.[/green]")
+            return
+        if org_roam_dir is None:
+            chat_console.print(
+                "[yellow]/open requires org-roam dir (start with journaler chat / config)[/yellow]"
+            )
+            return
+        if rest.lower() == "today":
+            if journal_dir is None:
+                chat_console.print(
+                    "[yellow]/open today requires org-roam dir (start with journaler chat)[/yellow]"
+                )
+                return
+            from engineering_hub.journaler.org_writer import (
+                _create_journal_file,
+                _today_journal_path,
+            )
+
+            today_path = _today_journal_path(journal_dir)
+            _create_journal_file(today_path)
+            engine.set_roam_edit_target(today_path)
+            chat_console.print(f"[green]Opened today's journal for /edit:[/green] {today_path}")
+            return
+        path_candidate = Path(rest).expanduser()
+        is_path_like = path_candidate.suffix.lower() == ".org" or path_candidate.is_file()
+        if is_path_like:
+            ok_path, res = assert_org_path_under_roam(path_candidate, org_roam_dir)
+            if not ok_path:
+                chat_console.print(f"[red]{escape(str(res))}[/red]")
+                return
+            if isinstance(res, Path):
+                engine.set_roam_edit_target(res)
+            chat_console.print(f"[green]Opened for /edit:[/green] {res}")
+            return
+        fragment = rest
+        ok_find, matches = find_org_by_title(org_roam_dir, fragment)
+        if not ok_find:
+            chat_console.print(f"[red]Could not search: {org_roam_dir}[/red]")
+            return
+        if not matches:
+            chat_console.print(f"[dim]No org files found matching title '{fragment}'.[/dim]")
+            return
+        if len(matches) > 1:
+            chat_console.print(
+                f"[yellow]{len(matches)} files match '{fragment}'; narrow the title or use a path:[/yellow]"
+            )
+            for i, p in enumerate(matches, start=1):
+                chat_console.print(f"  [cyan]{i}.[/cyan] {p}")
+            chat_console.print()
+            return
+        engine.set_roam_edit_target(matches[0])
+        chat_console.print(f"[green]Opened for /edit:[/green] {matches[0]}")
+        return
+
+    if cmd == "/edit":
+        target = engine.get_roam_edit_target()
+        if target is None:
+            chat_console.print(
+                "[yellow]No edit target. Use /open (today, path, or unique title) first.[/yellow]\n"
+                "[dim]Usage: /edit <heading> :: <text>[/dim]"
+            )
+            return
+        rest = raw[len("/edit"):].strip()
+        if " :: " not in rest:
+            chat_console.print("[yellow]Usage: /edit <heading> :: <text>[/yellow]")
+            return
+        heading, _, text = rest.partition(" :: ")
+        heading = heading.strip()
+        text = text.strip()
+        if not heading or not text:
+            chat_console.print("[yellow]Usage: /edit <heading> :: <text>[/yellow]")
+            return
+        ok, msg = append_to_heading(target, heading, text, create_heading_if_missing=True)
+        color = "green" if ok else "red"
+        chat_console.print(f"[{color}]{escape(msg)}[/{color}]")
+        return
+
     chat_console.print(
         f"[yellow]Unknown command '{cmd}'. Type /help for available commands.[/yellow]"
     )
@@ -658,23 +793,36 @@ def cmd_journaler(args: argparse.Namespace) -> int:
     if sub is None:
         console.print(
             "[yellow]Usage: engineering-hub journaler"
-            " {start|chat|briefing|status|scan|clear|download}[/yellow]"
+            " {start|chat|briefing|export|status|scan|clear|download}[/yellow]"
         )
         return 1
 
     settings = load_settings(args.config)
-    model_path = settings.resolved_journaler_model_path
 
     needs_model = sub in ("start", "chat") or (
         sub == "briefing" and not getattr(args, "latest", False)
-    )
-    if not model_path:
-        model_path = DEFAULT_JOURNALER_MLX_MODEL_ID
-        if needs_model:
-            console.print(
-                "[dim]No [cyan]journaler.model_path[/cyan] or [cyan]mlx.model_path[/cyan] in config; "
-                f"using default Hugging Face id [cyan]{model_path}[/cyan].[/dim]"
-            )
+    ) or (sub == "export" and getattr(args, "summarize", False))
+
+    try:
+        spec = resolve_journaler_model_spec(
+            settings,
+            cli_model=getattr(args, "journaler_model", None),
+            cli_profile=getattr(args, "journaler_profile", None),
+        )
+    except ValueError as exc:
+        console.print(f"[red]Error:[/red] {exc}")
+        return 1
+
+    had_empty_path = not (spec.model_path or "").strip()
+    spec = ensure_spec_model_path(spec, DEFAULT_JOURNALER_MLX_MODEL_ID)
+    model_path = spec.model_path
+
+    if had_empty_path and needs_model:
+        console.print(
+            "[dim]No [cyan]journaler.model_path[/cyan], [cyan]mlx.model_path[/cyan], or "
+            "[cyan]journaler.models[/cyan] model_path in config; "
+            f"using default Hugging Face id [cyan]{model_path}[/cyan].[/dim]"
+        )
 
     if needs_model and not _is_model_cached(model_path):
         console.print(
@@ -684,6 +832,7 @@ def cmd_journaler(args: argparse.Namespace) -> int:
             "  download automatically now (may take several minutes on a slow connection)."
         )
 
+    from engineering_hub.corpus_service_factory import build_corpus_service_from_settings
     from engineering_hub.journaler.context import JournalContext
     from engineering_hub.journaler.daemon import JournalerConfig, generate_briefing_now, run_daemon
 
@@ -701,8 +850,10 @@ def cmd_journaler(args: argparse.Namespace) -> int:
         except Exception as exc:
             console.print(f"[yellow]Warning:[/yellow] Memory service unavailable: {exc}")
 
+    corpus_service = build_corpus_service_from_settings(settings)
+
     config = JournalerConfig(
-        model_path=model_path,
+        model_path=spec.model_path,
         org_roam_dir=settings.org_journal_dir.parent,
         workspace_dir=settings.workspace_dir,
         state_dir=settings.journaler_state_dir,
@@ -716,12 +867,20 @@ def cmd_journaler(args: argparse.Namespace) -> int:
         slack_enabled=settings.journaler_slack_enabled,
         slack_webhook_url=settings.journaler_slack_webhook_url,
         max_conversation_history=settings.journaler_max_conversation_history,
-        max_tokens=settings.journaler_max_tokens,
-        temp=settings.journaler_temp,
-        top_p=settings.journaler_top_p,
-        min_p=settings.journaler_min_p,
-        repetition_penalty=settings.journaler_repetition_penalty,
+        max_tokens=spec.max_tokens,
+        model_context_window=spec.model_context_window,
+        temp=spec.temp,
+        top_p=spec.top_p,
+        min_p=spec.min_p,
+        repetition_penalty=spec.repetition_penalty,
+        enable_thinking=spec.enable_thinking,
+        mlx_backend=spec.mlx_backend,
         memory_service=memory_service,
+        corpus_service=corpus_service,
+        load_max_context_fraction=settings.journaler_load_max_context_fraction,
+        load_max_chars_absolute=settings.journaler_load_max_chars_absolute,
+        load_min_chars=settings.journaler_load_min_chars,
+        load_slack_tokens=settings.journaler_load_slack_tokens,
     )
 
     if sub == "start":
@@ -734,7 +893,7 @@ def cmd_journaler(args: argparse.Namespace) -> int:
         if config.chat_enabled:
             console.print(f"  Chat: http://{config.chat_host}:{config.chat_port}")
         try:
-            run_daemon(config)
+            run_daemon(config, settings)
         except KeyboardInterrupt:
             console.print("\n[yellow]Journaler stopped.[/yellow]")
         except Exception as exc:
@@ -743,17 +902,13 @@ def cmd_journaler(args: argparse.Namespace) -> int:
         return 0
 
     elif sub == "chat":
-        from engineering_hub.journaler.engine import ConversationalMLXBackend, ConversationEngine
+        from engineering_hub.journaler.chat_repl import configure_chat_readline, prompt_line
+        from engineering_hub.journaler.engine import ConversationEngine
         from engineering_hub.journaler.prompts import format_system_prompt, load_system_prompt
 
+        chat_model_ctx = JournalerChatModelContext(settings, spec)
         console.print("[bold]Loading Journaler model for interactive chat...[/bold]")
-        backend = ConversationalMLXBackend(
-            model_path=config.model_path,
-            temp=config.temp,
-            top_p=config.top_p,
-            min_p=config.min_p,
-            repetition_penalty=config.repetition_penalty,
-        )
+        backend = build_journaler_mlx_backend(chat_model_ctx.spec)
         ctx = JournalContext(
             org_roam_dir=config.org_roam_dir,
             workspace_dir=config.workspace_dir,
@@ -778,18 +933,34 @@ def cmd_journaler(args: argparse.Namespace) -> int:
             max_tokens=config.max_tokens,
             pressure_config=config.get_pressure_config(),
             model_context_window=config.model_context_window,
+            corpus_service=config.corpus_service,
+            load_file_budget=config.get_load_file_budget(),
         )
 
+        configure_chat_readline(
+            config.state_dir,
+            conversation_jsonl=config.state_dir / "conversation.jsonl",
+        )
+
+        transcript_path = config.state_dir / "conversation.jsonl"
+        max_hist = config.max_conversation_history
         console.print(
-            "[green]Journaler ready. Type your questions (Ctrl-C, /exit, or exit to leave).[/green]\n"
-            "[dim]Tip: /load <path> to inject a file, /task <desc> to add a TODO, /help for all commands.[/dim]\n"
-            "[dim]Context: /status, /budget, /topic — Clear: /clear, /clear --summarize, /clear --hard[/dim]\n"
+            "[green]Journaler ready. "
+            "Type your questions (Ctrl-C, /exit, or exit to leave).[/green]\n"
+            "[dim]Tip: /model to switch HF profile or path; /load <path> for files; "
+            "/help for commands.[/dim]\n"
+            "[dim]Context: /status, /budget, /topic — "
+            "Clear: /clear, /clear --summarize, /clear --hard[/dim]\n"
+            "[dim]Input: Up/Down recall previous lines (saved under .journaler). "
+            f"Full transcript: {transcript_path}. "
+            f"Longer model memory: raise journaler.max_conversation_history "
+            f"(now {max_hist}).[/dim]\n"
         )
         log = logging.getLogger(__name__)
         try:
             while True:
                 try:
-                    user_input = input("You: ").strip()
+                    user_input = prompt_line("You: ")
                 except (KeyboardInterrupt, EOFError):
                     raise
                 if not user_input:
@@ -799,7 +970,11 @@ def cmd_journaler(args: argparse.Namespace) -> int:
                 if user_input.startswith("/"):
                     try:
                         _handle_chat_slash_command(
-                            user_input, engine, console, org_roam_dir=config.org_roam_dir
+                            user_input,
+                            engine,
+                            console,
+                            org_roam_dir=config.org_roam_dir,
+                            journaler_model_ctx=chat_model_ctx,
                         )
                     except JournalerChatExit:
                         break
@@ -896,13 +1071,7 @@ def cmd_journaler(args: argparse.Namespace) -> int:
 
         if strategy == ClearStrategy.SUMMARIZE:
             console.print("[bold]Loading model to compress history before clearing...[/bold]")
-            backend = ConversationalMLXBackend(
-                model_path=config.model_path,
-                temp=config.temp,
-                top_p=config.top_p,
-                min_p=config.min_p,
-                repetition_penalty=config.repetition_penalty,
-            )
+            backend = build_journaler_mlx_backend(spec)
         else:
             backend = None  # type: ignore[assignment]
 
@@ -917,6 +1086,7 @@ def cmd_journaler(args: argparse.Namespace) -> int:
                 max_tokens=config.max_tokens,
                 pressure_config=config.get_pressure_config(),
                 model_context_window=config.model_context_window,
+                load_file_budget=config.get_load_file_budget(),
             )
             msg = engine.clear(strategy)
         else:
@@ -976,7 +1146,316 @@ def cmd_journaler(args: argparse.Namespace) -> int:
             return 1
         return 0
 
+    elif sub == "export":
+        from engineering_hub.journaler.conversation_export import (
+            build_summarize_prompt,
+            load_transcript,
+            postprocess_model_org,
+            render_raw_org,
+            transcript_to_plain_text,
+        )
+        from engineering_hub.journaler.engine import ConversationEngine
+        from engineering_hub.journaler.org_writer import (
+            append_to_heading,
+            create_org_node,
+            find_org_by_title,
+        )
+
+        note_path_str = getattr(args, "note", None)
+        find_title = getattr(args, "find_title", None)
+        new_node_title = getattr(args, "new_node", None)
+        summarize = getattr(args, "summarize", False)
+        heading = (getattr(args, "heading", None) or "Journaler export").strip() or "Journaler export"
+        jsonl_override = getattr(args, "jsonl", None)
+        output_path = getattr(args, "output", None)
+        export_format = getattr(args, "export_format", None) or "raw"
+
+        if note_path_str and find_title:
+            console.print("[red]Error:[/red] Use either --note or --find-title, not both.")
+            return 1
+        if new_node_title and (note_path_str or find_title):
+            console.print(
+                "[red]Error:[/red] --new-node cannot be combined with --note or --find-title."
+            )
+            return 1
+
+        jsonl_path = (
+            Path(jsonl_override).expanduser().resolve()
+            if jsonl_override
+            else settings.journaler_state_dir / "conversation.jsonl"
+        )
+
+        if not jsonl_path.is_file():
+            console.print(f"[yellow]No transcript at {jsonl_path}[/yellow]")
+            return 0
+
+        turns = load_transcript(jsonl_path)
+        if not turns:
+            console.print("[dim]Transcript is empty; nothing to export.[/dim]")
+            return 0
+
+        if summarize:
+            console.print("[bold]Loading model for summarized export...[/bold]")
+            backend = build_journaler_mlx_backend(spec)
+            engine = ConversationEngine(
+                backend=backend,
+                system_prompt="You format chat transcripts into Emacs org mode.",
+                log_dir=config.state_dir,
+                max_tokens=config.max_tokens,
+                pressure_config=config.get_pressure_config(),
+                model_context_window=config.model_context_window,
+                corpus_service=config.corpus_service,
+                load_file_budget=config.get_load_file_budget(),
+            )
+            prompt = build_summarize_prompt(transcript_to_plain_text(turns))
+            cap = min(1200, config.max_tokens)
+            raw_out = engine._raw_complete(prompt, cap)
+            body = postprocess_model_org(raw_out)
+        else:
+            if export_format != "raw":
+                console.print(f"[red]Error:[/red] Unknown export format {export_format!r}.")
+                return 1
+            body = render_raw_org(turns)
+
+        target_note_resolved: Path | None = None
+        if find_title:
+            ok, matches = find_org_by_title(config.org_roam_dir, find_title)
+            if not ok:
+                console.print(
+                    f"[red]Error:[/red] Could not search org-roam in {config.org_roam_dir}"
+                )
+                return 1
+            if len(matches) == 0:
+                console.print(
+                    f"[yellow]No note with #+title containing {find_title!r}[/yellow]"
+                )
+                return 1
+            if len(matches) > 1:
+                console.print(
+                    f"[red]Error:[/red] Title fragment {find_title!r} matched multiple notes:"
+                )
+                for p in matches:
+                    console.print(f"  {p}")
+                return 1
+            target_note_resolved = matches[0]
+
+        if note_path_str:
+            target_note_resolved = Path(note_path_str).expanduser().resolve()
+
+        wrote_file = False
+        if new_node_title:
+            ok, msg = create_org_node(config.org_roam_dir, new_node_title, body=body)
+            if ok:
+                console.print(f"[green]{escape(msg)}[/green]")
+            else:
+                console.print(f"[red]{escape(msg)}[/red]")
+                return 1
+            wrote_file = True
+        elif target_note_resolved is not None:
+            ok, msg = append_to_heading(
+                target_note_resolved,
+                heading,
+                body,
+                create_heading_if_missing=True,
+            )
+            color = "green" if ok else "red"
+            console.print(f"[{color}]{escape(msg)}[/{color}]")
+            if not ok:
+                return 1
+            wrote_file = True
+
+        if output_path:
+            outp = Path(output_path).expanduser().resolve()
+            outp.parent.mkdir(parents=True, exist_ok=True)
+            outp.write_text(body, encoding="utf-8")
+            console.print(f"[dim]Wrote {outp}[/dim]")
+            wrote_file = True
+
+        if not wrote_file:
+            sys.stdout.write(body)
+
+        return 0
+
     console.print("[yellow]Unknown journaler command.[/yellow]")
+    return 1
+
+
+def cmd_template(args: argparse.Namespace) -> int:
+    """Template analysis, listing, and report drafting commands."""
+    sub = getattr(args, "template_command", None)
+    if sub is None:
+        console.print(
+            "[yellow]Usage: engineering-hub template {analyze|list|draft}[/yellow]"
+        )
+        return 1
+
+    settings = load_settings(args.config)
+
+    if sub == "analyze":
+        from engineering_hub.templates.analyzer import TemplateAnalyzer
+
+        docx_dir = Path(args.docx_dir).expanduser().resolve()
+        if not docx_dir.is_dir():
+            console.print(f"[red]Error:[/red] Directory not found: {docx_dir}")
+            return 1
+
+        output_dir = settings.resolved_templates_dir / args.name.lower().replace(" ", "-")
+        console.print(f"[bold]Analyzing .docx files in: {docx_dir}[/bold]")
+
+        try:
+            analyzer = TemplateAnalyzer(docx_dir, name=args.name)
+            skeleton = analyzer.analyze(output_dir)
+        except FileNotFoundError as exc:
+            console.print(f"[red]Error:[/red] {exc}")
+            return 1
+        except Exception as exc:
+            console.print(f"[red]Error:[/red] Analysis failed: {exc}")
+            return 1
+
+        console.print(f"[bold green]Template analysis complete![/bold green]")
+        console.print(f"  Name: {skeleton.name}")
+        console.print(f"  Source docs: {skeleton.source_doc_count}")
+        console.print(f"  Sections: {len(skeleton.sections)}")
+        console.print(f"  Table patterns: {len(skeleton.table_patterns)}")
+        console.print(f"  Styles: {len(skeleton.styles)}")
+        console.print(f"  Output: {output_dir}")
+        return 0
+
+    elif sub == "list":
+        templates_dir = settings.resolved_templates_dir
+        if not templates_dir.exists():
+            console.print("[dim]No templates directory found.[/dim]")
+            console.print(f"  Expected at: {templates_dir}")
+            console.print(
+                "  Run [bold cyan]engineering-hub template analyze <dir>[/bold cyan] to create one."
+            )
+            return 0
+
+        from engineering_hub.templates.models import ReportSkeleton
+
+        skeletons_found = 0
+        table = Table(title="Available Report Templates")
+        table.add_column("Name", style="cyan")
+        table.add_column("Source Docs", justify="right")
+        table.add_column("Sections", justify="right")
+        table.add_column("Tables", justify="right")
+        table.add_column("Path", style="dim")
+
+        for skeleton_file in sorted(templates_dir.rglob("skeleton.json")):
+            try:
+                sk = ReportSkeleton.load(skeleton_file)
+                table.add_row(
+                    sk.name,
+                    str(sk.source_doc_count),
+                    str(len(sk.sections)),
+                    str(len(sk.table_patterns)),
+                    str(skeleton_file.parent.relative_to(templates_dir)),
+                )
+                skeletons_found += 1
+            except Exception as exc:
+                console.print(f"[yellow]Warning:[/yellow] Could not load {skeleton_file}: {exc}")
+
+        if skeletons_found:
+            console.print(table)
+        else:
+            console.print("[dim]No template skeletons found.[/dim]")
+            console.print(
+                "  Run [bold cyan]engineering-hub template analyze <dir>[/bold cyan] to create one."
+            )
+        return 0
+
+    elif sub == "draft":
+        from engineering_hub.templates.assembler import ReportAssembler
+        from engineering_hub.templates.models import ReportSkeleton
+        from engineering_hub.templates.org_context import parse_org_note
+
+        skeleton_name = args.skeleton.lower().replace(" ", "-")
+        skeleton_path = settings.resolved_templates_dir / skeleton_name / "skeleton.json"
+        if not skeleton_path.exists():
+            console.print(f"[red]Error:[/red] Skeleton not found: {skeleton_path}")
+            console.print("  Run [bold cyan]engineering-hub template list[/bold cyan] to see available templates.")
+            return 1
+
+        skeleton = ReportSkeleton.load(skeleton_path)
+
+        project_note = Path(args.project_note).expanduser().resolve()
+        if not project_note.exists():
+            console.print(f"[red]Error:[/red] Project note not found: {project_note}")
+            return 1
+
+        console.print(f"[bold]Drafting report from template: {skeleton.name}[/bold]")
+        console.print(f"  Project note: {project_note}")
+
+        context = parse_org_note(project_note)
+        context.metadata["template_skeleton_block"] = skeleton.format_for_agent()
+        context.metadata["template_reference_docx"] = skeleton.reference_docx_path
+
+        from engineering_hub.context.formatters import ContextFormatter
+        from engineering_hub.core.constants import AgentType
+
+        formatted_context = ContextFormatter.format(context, AgentType.TECHNICAL_WRITER)
+
+        if err := _validate_llm_settings(settings):
+            return err
+
+        from engineering_hub.agents.backends import create_backend
+        from engineering_hub.agents.worker import AgentWorker
+        from engineering_hub.core.models import ParsedTask
+
+        backend = create_backend(settings)
+        worker = AgentWorker(
+            backend=backend,
+            prompts_dir=settings.prompts_dir,
+            output_dir=settings.output_dir,
+        )
+
+        task = ParsedTask(
+            agent="technical-writer",
+            status="PENDING",
+            project_id=context.project.id or None,
+            description=f"Draft {skeleton.name} report for {context.project.title}",
+            start_line=0,
+            end_line=0,
+            raw_block="",
+        )
+
+        console.print("[bold]Running technical writer agent...[/bold]")
+        try:
+            result = worker.execute(task, formatted_context)
+        except Exception as exc:
+            console.print(f"[red]Error:[/red] Agent execution failed: {exc}")
+            return 1
+
+        if not result.success:
+            console.print(f"[red]Error:[/red] {result.error_message}")
+            return 1
+
+        md_output = result.agent_response or ""
+        console.print(f"[green]Markdown draft generated ({len(md_output)} chars)[/green]")
+
+        if args.output:
+            output_path = Path(args.output).expanduser()
+        else:
+            output_path = settings.output_dir / "docs" / f"{skeleton_name}-draft.docx"
+
+        if output_path.suffix.lower() == ".docx":
+            assembler = ReportAssembler(skeleton)
+            assembler.assemble(md_output, output_path)
+            console.print("[bold green]Report assembled![/bold green]")
+            console.print(f"  Output: {output_path}")
+
+            md_path = output_path.with_suffix(".md")
+            md_path.write_text(md_output, encoding="utf-8")
+            console.print(f"  Markdown: {md_path}")
+        else:
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            output_path.write_text(md_output, encoding="utf-8")
+            console.print("[bold green]Draft saved![/bold green]")
+            console.print(f"  Output: {output_path}")
+
+        return 0
+
+    console.print("[yellow]Unknown template command.[/yellow]")
     return 1
 
 
@@ -1184,9 +1663,68 @@ def main() -> int:
         help="Override output file path (default: outputs/reviews/weekly-YYYY-WNN.md)",
     )
 
+    # template command
+    template_parser = subparsers.add_parser(
+        "template", help="Report template analysis and drafting"
+    )
+    template_sub = template_parser.add_subparsers(dest="template_command")
+
+    analyze_p = template_sub.add_parser(
+        "analyze",
+        help="Analyze a directory of .docx files and produce a report skeleton",
+    )
+    analyze_p.add_argument(
+        "docx_dir",
+        help="Directory containing .docx report files to analyze",
+    )
+    analyze_p.add_argument(
+        "--name",
+        default="Report",
+        metavar="NAME",
+        help="Name for the template (default: Report)",
+    )
+
+    template_sub.add_parser("list", help="List available report template skeletons")
+
+    draft_p = template_sub.add_parser(
+        "draft",
+        help="Draft a report using a template skeleton and org-roam project note",
+    )
+    draft_p.add_argument(
+        "skeleton",
+        help="Template skeleton name (as shown by 'template list')",
+    )
+    draft_p.add_argument(
+        "--project-note",
+        required=True,
+        metavar="ORG_FILE",
+        help="Path to an org-roam note with project context",
+    )
+    draft_p.add_argument(
+        "--output",
+        type=str,
+        default=None,
+        metavar="PATH",
+        help="Output file path (.docx for assembled report, .md for markdown only)",
+    )
+
     # journaler command
     journaler_parser = subparsers.add_parser(
         "journaler", help="Journaler ambient listener daemon"
+    )
+    journaler_parser.add_argument(
+        "--profile",
+        dest="journaler_profile",
+        default=None,
+        metavar="NAME",
+        help="Use named journaler.models profile (overrides journaler.model_profile)",
+    )
+    journaler_parser.add_argument(
+        "--model",
+        dest="journaler_model",
+        default=None,
+        metavar="ID_OR_PATH",
+        help="Hugging Face model id or local path (highest precedence)",
     )
     journaler_sub = journaler_parser.add_subparsers(dest="journaler_command")
     journaler_sub.add_parser("start", help="Start the Journaler daemon")
@@ -1215,6 +1753,68 @@ def main() -> int:
         "--summarize",
         action="store_true",
         help="Compress history into a summary before clearing (requires model load)",
+    )
+
+    export_p = journaler_sub.add_parser(
+        "export",
+        help="Export chat transcript from conversation.jsonl to org (-o, --note, or --new-node)",
+    )
+    export_p.add_argument(
+        "--jsonl",
+        type=str,
+        default=None,
+        metavar="PATH",
+        help="Transcript JSONL (default: workspace .journaler/conversation.jsonl)",
+    )
+    export_p.add_argument(
+        "--format",
+        dest="export_format",
+        choices=["raw"],
+        default="raw",
+        help="Export format (default: raw per-turn org)",
+    )
+    export_p.add_argument(
+        "--summarize",
+        action="store_true",
+        help="Use MLX to emit * Summary and * Open TODOs org sections (loads model)",
+    )
+    export_p.add_argument(
+        "-o",
+        "--output",
+        type=str,
+        default=None,
+        metavar="PATH",
+        help="Write export body to this file",
+    )
+    export_p.add_argument(
+        "--note",
+        type=str,
+        default=None,
+        metavar="PATH",
+        help="Append export under --heading in this existing .org file",
+    )
+    export_p.add_argument(
+        "--heading",
+        type=str,
+        default="Journaler export",
+        metavar="TEXT",
+        help="Org heading for --note append (default: Journaler export)",
+    )
+    export_p.add_argument(
+        "--find-title",
+        dest="find_title",
+        type=str,
+        default=None,
+        metavar="FRAGMENT",
+        help="Resolve single org-roam note by #+title substring (cf. org_journal_dir parent)",
+    )
+    export_p.add_argument(
+        "--new-node",
+        dest="new_node",
+        type=str,
+        default=None,
+        metavar="TITLE",
+        help="Create a new org-roam node with this #+title and export as body",
     )
 
     # load command
@@ -1271,6 +1871,7 @@ def main() -> int:
         "run-once": cmd_run_once,
         "init": cmd_init,
         "mcp-server": cmd_mcp_server,
+        "template": cmd_template,
         "journaler": cmd_journaler,
         "load": cmd_load,
         "memory": cmd_memory,

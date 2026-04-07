@@ -14,6 +14,7 @@ from engineering_hub.config.settings import Settings
 from engineering_hub.context.manager import ContextManager
 from engineering_hub.core.constants import TaskStatus, is_ingest_task
 from engineering_hub.core.models import ParsedTask, TaskResult
+from engineering_hub.corpus_service_factory import build_corpus_service_from_settings
 from engineering_hub.django.client import DjangoClient
 from engineering_hub.memory.service import MemoryService
 from engineering_hub.notes.manager import SharedNotesManager
@@ -79,6 +80,8 @@ class Orchestrator:
         # Memory service (standalone, no Django dependency)
         self.memory_service: Optional[MemoryService] = self._init_memory_service()
 
+        corpus_service = build_corpus_service_from_settings(self.settings)
+
         # Context manager
         self.context_manager = ContextManager(
             django_client=self.django_client,
@@ -88,6 +91,7 @@ class Orchestrator:
             inputs_dir=self.settings.resolved_inputs_dir,
             memory_service=self.memory_service,
             history_notes_manager=self._history_notes_manager,
+            corpus_service=corpus_service,
         )
 
         # Agent worker (provider chosen by llm_provider setting)

@@ -7,6 +7,7 @@ without raising.
 Supported operations
 --------------------
 - ``append_to_heading``     — add body text under a named heading
+- ``assert_org_path_under_roam`` — verify a path is a writable ``.org`` under roam root
 - ``add_todo_to_journal``   — insert a ``- [ ]`` item in today's daily journal
 - ``mark_done_in_journal``  — flip a matching ``- [ ]`` to ``- [X]``
 - ``create_org_node``       — create a new org-roam node with UUID and frontmatter
@@ -98,6 +99,34 @@ def _create_journal_file(path: Path) -> None:
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
+
+
+def assert_org_path_under_roam(
+    path: Path,
+    org_roam_dir: Path,
+) -> tuple[bool, Path | str]:
+    """Verify *path* is an existing ``.org`` file under *org_roam_dir*.
+
+    Both paths are expanded and resolved. Used by journaler ``/open`` so
+    edits cannot escape the roam tree.
+
+    Returns:
+        ``(True, resolved_path)`` on success, or ``(False, error_message)``.
+    """
+    roam_root = org_roam_dir.expanduser().resolve()
+    candidate = path.expanduser().resolve()
+    if not candidate.exists():
+        return False, f"File not found: {candidate}"
+    if not candidate.is_file():
+        return False, f"Not a file: {candidate}"
+    if candidate.suffix.lower() != ".org":
+        return False, f"Not an org file: {candidate.name}"
+    try:
+        if not candidate.is_relative_to(roam_root):
+            return False, f"Path must be under org-roam root {roam_root}"
+    except ValueError:
+        return False, f"Path must be under org-roam root {roam_root}"
+    return True, candidate
 
 
 def append_to_heading(

@@ -94,6 +94,8 @@ You can tell the user about these commands; the user types them directly:
   /task <description>          Add a TODO to today's journal under "Overnight Agent Tasks"
   /done <fragment>             Mark a matching TODO as done (adds CLOSED timestamp)
   /note <heading> :: <text>   Append text under a heading in today's journal
+  /open [today|clear|<path>|<title>]   Set the current org-roam note for /edit (path must be under roam)
+  /edit <heading> :: <text>   Append under a heading in the file opened with /open
   /find <title fragment>       Search org-roam files by #+title:
   /load <path> [-r]            Load a file or directory into the current context
   /files                       List loaded files

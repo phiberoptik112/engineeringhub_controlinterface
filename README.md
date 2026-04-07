@@ -18,11 +18,12 @@ They coexist cleanly: the Orchestrator processes explicit tasks while the Journa
 - **Django Integration**: Pulls project context, standards, and files from the consultingmanager API
 - **File Watching**: Monitors workspace for changes and automatically dispatches agent tasks
 - **Local MLX Models**: Run agents on Apple Silicon via `mlx-lm` with HuggingFace model IDs
-- **Journaler Daemon**: Always-on ambient listener with morning briefings, HTTP chat, and Slack integration
+- **Journaler Daemon**: Always-on ambient listener with morning briefings, HTTP chat, and Slack integration — optional **model profiles**, Qwen3 **thinking mode**, CLI `--profile` / `--model`, and **`/model`** to switch checkpoints without losing chat history
 - **Agent Delegation**: Journaler chat can delegate tasks directly to any named agent personality (`/agent research ...`, `/agent technical-writer ...`) and receive results inline — backed by the local MLX model or Claude API, selectable per-command
 - **Skills System**: Extensible `skills/` directory of YAML files defines each agent personality's capabilities; drop a new `.yaml` to add a delegation skill without code changes
 - **Context Management**: Token-aware conversation history with automatic compression, topic-shift archival, end-of-day reset, and manual `/clear` controls — keeps the local model coherent across a full workday
-- **Org-Roam Write Skill**: Journaler chat can write properly-formatted org-roam files — add TODOs, mark tasks done, append notes, create new nodes — via slash commands
+- **Org-Roam Write Skill**: Journaler chat can write properly-formatted org-roam files — add TODOs, mark tasks done, append notes to today's journal (`/note`), set a session target on any roam note (`/open`), append under a heading there (`/edit`), search by title (`/find`), and create new nodes — via slash commands
+- **Journaler Export**: CLI `journaler export` reads the persisted chat transcript (`conversation.jsonl`) and writes org-roam-friendly output — raw per-turn org, optional MLX **summary + open TODOs**, append to a note (`--note` / `--find-title`), or create a new roam node (`--new-node`)
 - **Context File Loading**: Inject files or directories into the Journaler's live context (`/load`) or the persistent memory store (`engineering-hub load`)
 - **Vector Memory**: Local semantic memory (memory.db) with Ollama embeddings for context retrieval
 
@@ -110,7 +111,23 @@ engineering-hub journaler clear --summarize
 
 # Full reset: clear conversation + wipe scan state
 engineering-hub journaler clear --hard
+
+# Export chat transcript to org (default: stdout; source: .journaler/conversation.jsonl)
+engineering-hub journaler export
+engineering-hub journaler export -o ~/org-roam/exports/chat.org
+engineering-hub journaler export --jsonl .journaler/conversation.jsonl --note ~/org-roam/20260212-project.org
+engineering-hub journaler export --find-title "Phase B" --heading "Journaler capture"
+engineering-hub journaler export --new-node "Chat export 2026-04-06"
+engineering-hub journaler export --summarize --note ~/org-roam/my-note.org   # loads MLX; emits * Summary and * Open TODOs
+
+# Pick a named profile or HF id (applies to start, chat, briefing, download, export --summarize)
+engineering-hub journaler --profile reasoning chat
+engineering-hub journaler --model mlx-community/Qwen3-30B-A3B-Instruct-2507-4bit start
 ```
+
+`journaler download` uses the same resolution rules as the other subcommands, so run it with `--profile` / `--model` if you want to prefetch a non-default checkpoint.
+
+`journaler export --summarize` loads the Journaler MLX model once (same `--profile` / `--model` flags as other journaler commands). Raw export does not load a model.
 
 ### 6. Load Files into Context
 
@@ -122,10 +139,12 @@ engineering-hub journaler clear --hard
 /load path/to/dir/ -r           Load recursively
 /files                          List currently loaded files (with sizes)
 /files clear                    Remove all loaded files from context
+/open today                    Set /edit target to today's journal (or /open <path>, /open <title>)
+/edit Section :: body text     Append under a heading in the file opened with /open
 /help                           Show all slash commands
 ```
 
-Supported extensions: `.md`, `.txt`, `.org`, `.py`, `.yaml`, `.yml`, `.json`, `.tex`, `.csv`, `.toml`, `.rst`. Files over 50,000 chars are truncated with a notice. Loaded files appear in the model's system prompt on every turn and are cleared when the session ends.
+Supported extensions: `.md`, `.txt`, `.org`, `.py`, `.yaml`, `.yml`, `.json`, `.tex`, `.csv`, `.toml`, `.rst`. Each `/load` is capped from your `journaler.model_context_window`, current conversation/history usage, and optional `journaler.load_*` keys in config (documented under **Journaler → Configuration** below). Oversized files are truncated with a notice. Directory loads share one remaining budget across files (recomputed after each file). Loaded files appear in the model's system prompt on every turn, count toward `/budget` and context pressure, and are cleared when the session ends.
 
 **From the command line** — persist files into the long-term memory store for semantic search:
 
@@ -227,15 +246,59 @@ journaler:
     inactivity_clear_minutes: 120  # auto-clear after 2h of silence
     capture_daily_to_memory: false # write daily summaries to memory.db
     reserved_for_generation: 2000  # tokens held back for model output
+
+  # Optional — slash /load size limits (see config.example.yaml for defaults)
+  # load_max_context_fraction: 0.40   # fraction of remaining context per file chunk
+  # load_max_chars_absolute: 200000
+  # load_min_chars: 1024
+  # load_slack_tokens: 256
 ```
 
-`model_path` is optional: if omitted, the Journaler falls back to `mlx.model_path` (the orchestrator MLX path), then to a built-in default (`mlx-community/Qwen3-30B-A3B-Instruct-2507-4bit`).
+`model_path` is optional: if omitted, the Journaler falls back to `mlx.model_path` (the orchestrator MLX path), then to a built-in default (`mlx-community/gemma-4-31b-it-8bit`). Use `journaler download` after changing paths.
+
+#### Model profiles and thinking mode
+
+You can define **named profiles** under `journaler.models` and select one with `journaler.model_profile`. Each profile sets `model_path`, optional `model_context_window`, sampling (`temp`, `top_p`, …), `mlx_backend` (`auto`, `mlx-lm`, or `mlx-vlm`), and **`enable_thinking`** for Qwen3-style chat templates (`null` = omit the argument for models like Gemma; `true` / `false` toggles reasoning blocks on supported tokenizers).
+
+**Resolution order** (same for daemon, interactive chat, and `journaler download`):
+
+1. CLI `--model <hf-id-or-local-path>` (highest priority)
+2. CLI `--profile <name>`
+3. `journaler.model_profile` when `journaler.models` is non-empty
+4. Legacy: `journaler.model_path` → `mlx.model_path` → built-in default
+
+If you only set `journaler.model_path` (no `models:` map), behavior matches the single-model setup above.
+
+Example:
+
+```yaml
+journaler:
+  model_profile: "default"
+  models:
+    default:
+      model_path: "mlx-community/gemma-4-31b-it-8bit"
+      model_context_window: 131072
+      enable_thinking: null
+    reasoning:
+      model_path: "mlx-community/Qwen3-30B-A3B-Instruct-2507-4bit"
+      model_context_window: 32768
+      temp: 0.6
+      top_p: 0.95
+      enable_thinking: true
+```
+
+Switching models at runtime (without restarting):
+
+- **Interactive chat:** `/model` (status), `/model reasoning` (named profile), `/model path <hf-id-or-path>` (one-off path).
+- **HTTP chat (daemon):** send the same text as the JSON `message`, e.g. `{"message": "/model reasoning"}`. The delegator’s local MLX backend stays in sync so `/agent --backend mlx` uses the newly loaded weights.
+
+Reloading a model loads weights again (seconds to tens of seconds, large RAM use). Conversation history is kept.
 
 #### Recommended models
 
 | Model | Type | Weights | RAM required | Notes |
 | --- | --- | --- | --- | --- |
-| `mlx-community/Qwen3-30B-A3B-Instruct-2507-4bit` | MoE Instruct | ~17GB | ~32GB | **Default.** Fastest, lowest RAM; Instruct-tuned for structured briefings |
+| `mlx-community/Qwen3-30B-A3B-Instruct-2507-4bit` | MoE Instruct | ~17GB | ~32GB | Fast, low RAM; good default *choice* on 32GB machines; supports `enable_thinking` in profiles |
 | `mlx-community/Qwen2.5-32B-Instruct-4bit` | Dense Instruct | ~19GB | ~40GB | Stronger instruction following; good for 64GB+ machines |
 | `mlx-community/Qwen3-32B-4bit` | Dense | ~19GB | ~40GB | Highest quality in the 32B family; choose on 64–128GB machines |
 
@@ -274,6 +337,11 @@ curl http://localhost:18790/briefing
 
 # List available agent delegation skills
 curl http://localhost:18790/skills
+
+# Switch to another configured profile (same syntax as interactive /model)
+curl -X POST http://localhost:18790/chat \
+  -H "Content-Type: application/json" \
+  -d '{"message": "/model reasoning"}'
 ```
 
 ### Daemon Management (macOS)
@@ -324,6 +392,14 @@ While in `engineering-hub journaler chat`, any input starting with `/` is handle
 | `/budget` | Show full token budget breakdown (system prompt, snapshot, history, available) |
 | `/topic` | Show the currently detected conversation topic |
 
+**Model switching** (requires `journaler.models` in config for profile names)
+
+| Command | Description |
+| --- | --- |
+| `/model` | Show active model path, profile name, context window, `enable_thinking`, and `mlx_backend` |
+| `/model <profile>` | Load the named profile from `journaler.models` (keeps chat history) |
+| `/model path <id-or-path>` | Load a Hugging Face id or local MLX snapshot path |
+
 **File loading**
 
 | Command | Description |
@@ -347,6 +423,12 @@ While in `engineering-hub journaler chat`, any input starting with `/` is handle
 | `/task <description>` | Add `- [ ] <description>` to today's journal under `* Overnight Agent Tasks` |
 | `/done <fragment>` | Mark the first matching `- [ ]` item as `- [X]` with a `CLOSED:` timestamp |
 | `/note <heading> :: <text>` | Append text under a heading in today's journal (creates the heading if absent) |
+| `/open` | Print the current `/edit` target path, if any |
+| `/open clear` | Clear the session edit target |
+| `/open today` | Set the edit target to today's daily journal (creates the file if missing) |
+| `/open <path>` | Set target to an existing `.org` file; path must resolve under the configured org-roam directory |
+| `/open <title fragment>` | Set target when exactly one file matches `#+title:` (substring, case-insensitive); otherwise list matches for disambiguation |
+| `/edit <heading> :: <text>` | Append text under a heading in the note opened with `/open` (same ` :: ` delimiter as `/note`) |
 | `/find <title fragment>` | Search all org-roam files for a case-insensitive `#+title:` match; prints matching paths |
 
 **General**
@@ -355,7 +437,7 @@ While in `engineering-hub journaler chat`, any input starting with `/` is handle
 | --- | --- |
 | `/help` | Show the full list of available slash commands |
 
-Tasks added with `/task` use the `- [ ] @agent:` format understood by the Orchestrator, so they will be picked up and dispatched automatically. `/agent` tasks run immediately and return their output in the current chat turn. Loaded files are appended to the system prompt as fenced blocks and persist for the life of the chat session only.
+Tasks added with `/task` use the `- [ ] @agent:` format understood by the Orchestrator, so they will be picked up and dispatched automatically. `/agent` tasks run immediately and return their output in the current chat turn. `/open` and `/edit` apply only in **`journaler chat`** (the interactive CLI); they are not available on the Journaler HTTP `/chat` endpoint. Loaded files are appended to the system prompt as fenced blocks and persist for the life of the chat session only.
 
 To persist files for long-term retrieval across sessions, use `engineering-hub load` instead (see [Load Files into Context](#6-load-files-into-context)).
 
@@ -447,7 +529,7 @@ The Journaler writes to `<workspace_dir>/.journaler/`:
 └── daily_summaries/     # End-of-day conversation summaries (YYYY-MM-DD.md)
 ```
 
-`conversation.jsonl` is append-only and serves as the permanent audit trail. Archived and compressed turns are written here even after the in-memory history is cleared, so any day's conversation can be reconstructed from the log.
+`conversation.jsonl` is append-only and serves as the permanent audit trail. Archived and compressed turns are written here even after the in-memory history is cleared, so any day's conversation can be reconstructed from the log. Use **`engineering-hub journaler export`** to turn this file into org-mode: by default a deterministic **raw** transcript (headings plus `#+begin_src text` blocks per turn); with **`--summarize`**, a single model pass adds **`* Summary`** and **`* Open TODOs`** (`- [ ]` items). Target an existing file with **`--note`** or **`--find-title`** (substring match on `#+title:` under `org_journal_dir`'s parent), or **`--new-node`** to create a new org-roam node under that roam directory. Override the transcript path with **`--jsonl`**. See **`engineering-hub journaler export --help`** for all flags.
 
 ## Orchestrator: Task-Driven Agents
 
@@ -509,7 +591,9 @@ See [config/config.example.yaml](config/config.example.yaml) for all available o
 - `workspace.dir` - Base workspace directory
 - `mlx.model_path` - HuggingFace model ID for local MLX inference
 - `journaler.*` - Journaler daemon settings (model, scan interval, briefing, chat, Slack)
-- `journaler.model_context_window` - Model's actual context window in tokens (default: 32768)
+- `journaler.model_profile` - Name of the active entry in `journaler.models` (when the map is non-empty)
+- `journaler.models` - Optional map of named MLX profiles (`model_path`, `model_context_window`, sampling, `mlx_backend`, `enable_thinking`)
+- `journaler.model_context_window` - Context window for pressure math when not using per-profile values (default: 32768)
 - `journaler.agent_backend` - Backend for `/agent` delegation: `"auto"` (default), `"claude"`, or `"mlx"`
 - `journaler.anthropic_api_key` - Optional per-journaler Anthropic key (falls back to `anthropic.api_key` if unset)
 - `journaler.skills_dir` - Path to skills YAML directory (default: `skills/` at repo root)

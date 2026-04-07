@@ -10,16 +10,25 @@ from __future__ import annotations
 import logging
 import signal
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import schedule
 
+from engineering_hub.config.settings import Settings
 from engineering_hub.journaler.context import JournalContext
 from engineering_hub.journaler.context_manager import PressureConfig
-from engineering_hub.journaler.engine import ConversationalMLXBackend, ConversationEngine
+from engineering_hub.journaler.engine import (
+    ConversationalMLXBackend,
+    ConversationEngine,
+    LoadFileBudgetConfig,
+)
+from engineering_hub.journaler.model_profiles import (
+    JournalerChatModelContext,
+    spec_from_journaler_config,
+)
 from engineering_hub.journaler.prompts import (
     build_skills_block,
     build_workspace_layout,
@@ -74,9 +83,22 @@ class JournalerConfig:
     min_p: float = 0.05
     repetition_penalty: float = 1.1
 
+    # MLX load / Qwen3 chat template (None = omit enable_thinking kwarg)
+    enable_thinking: bool | None = None
+    mlx_backend: str = "auto"
+
     watch_dirs: list[Path] | None = None
 
     memory_service: MemoryService | None = None
+
+    # Optional PDF reference corpus (libraryfiles-corpus); used for per-turn RAG in chat.
+    corpus_service: Any | None = None
+
+    # Slash /load: context-aware size limits (see LoadFileBudgetConfig in engine.py)
+    load_max_context_fraction: float = 0.40
+    load_max_chars_absolute: int = 200_000
+    load_min_chars: int = 1024
+    load_slack_tokens: int = 256
 
     # Agent delegation settings
     # anthropic_api_key: Anthropic API key for Claude-backed agent delegation.
@@ -100,9 +122,22 @@ class JournalerConfig:
             max_history_turns=self.max_conversation_history,
         )
 
+    def get_load_file_budget(self) -> LoadFileBudgetConfig:
+        """Build slash-command /load caps from this config."""
+        return LoadFileBudgetConfig(
+            max_context_fraction=self.load_max_context_fraction,
+            max_chars_absolute=self.load_max_chars_absolute,
+            min_chars=self.load_min_chars,
+            slack_tokens=self.load_slack_tokens,
+        )
 
-def run_daemon(config: JournalerConfig) -> None:
-    """Main daemon entry point. Blocks until SIGINT/SIGTERM."""
+
+def run_daemon(config: JournalerConfig, settings: Settings | None = None) -> None:
+    """Main daemon entry point. Blocks until SIGINT/SIGTERM.
+
+    *settings* is used for ``/model`` profile resolution over HTTP; if omitted,
+    profile switching falls back to path-only overrides.
+    """
     start_time = datetime.now()
 
     # Ensure state directory exists
@@ -131,6 +166,8 @@ def run_daemon(config: JournalerConfig) -> None:
         top_p=config.top_p,
         min_p=config.min_p,
         repetition_penalty=config.repetition_penalty,
+        backend=config.mlx_backend,
+        enable_thinking=config.enable_thinking,
     )
 
     # Init conversation engine with context management
@@ -144,6 +181,8 @@ def run_daemon(config: JournalerConfig) -> None:
         max_tokens=config.max_tokens,
         pressure_config=pressure_cfg,
         model_context_window=config.model_context_window,
+        corpus_service=config.corpus_service,
+        load_file_budget=config.get_load_file_budget(),
     )
 
     # Do initial scan
@@ -203,6 +242,12 @@ def run_daemon(config: JournalerConfig) -> None:
         logger.info("Slack integration enabled")
 
     chat_server: ChatServer | None = None
+    runtime_model: JournalerChatModelContext | None = None
+    if settings is not None:
+        runtime_model = JournalerChatModelContext(
+            settings, spec_from_journaler_config(config)
+        )
+
     if config.chat_enabled:
         from engineering_hub.journaler.chat_server import ChatServer
 
@@ -213,6 +258,7 @@ def run_daemon(config: JournalerConfig) -> None:
             port=config.chat_port,
             start_time=start_time,
             delegator=delegator,
+            model_context=runtime_model,
         )
 
     # Schedule recurring tasks
@@ -312,6 +358,8 @@ def generate_briefing_now(
             top_p=config.top_p,
             min_p=config.min_p,
             repetition_penalty=config.repetition_penalty,
+            backend=config.mlx_backend,
+            enable_thinking=config.enable_thinking,
         )
         engine = ConversationEngine(
             backend=backend,
@@ -320,6 +368,8 @@ def generate_briefing_now(
             max_tokens=config.max_tokens,
             pressure_config=config.get_pressure_config(),
             model_context_window=config.model_context_window,
+            corpus_service=config.corpus_service,
+            load_file_budget=config.get_load_file_budget(),
         )
 
     briefing = engine.generate_briefing(briefing_context, prompt)

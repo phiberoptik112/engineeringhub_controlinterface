@@ -38,6 +38,10 @@ class ContextFormatter:
         if corpus_block:
             base += "\n\n---\n\n" + corpus_block
 
+        template_block = context.metadata.get("template_skeleton_block", "")
+        if template_block:
+            base += "\n\n---\n\n" + template_block
+
         return base
 
     @classmethod

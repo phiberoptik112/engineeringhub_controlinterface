@@ -9,9 +9,11 @@ Endpoints:
     GET  /briefing — latest morning briefing as markdown text
 
 Slash commands (parsed before reaching the LLM):
+    /model [path] <...>
+        Show active model, switch named profile, or load a HF id/path (daemon).
     /agent <type> <description> [--project <id>] [--backend mlx|claude]
         Delegate a task to a named agent and return the result inline.
-        Falls back to writing to the journal if no delegator is configured.
+    Falls back to writing to the journal if no delegator is configured.
     /skills
         List available agent delegation skills.
 """
@@ -32,6 +34,9 @@ if TYPE_CHECKING:
     from engineering_hub.journaler.context import JournalContext
     from engineering_hub.journaler.delegator import AgentDelegator
     from engineering_hub.journaler.engine import ConversationEngine
+    from engineering_hub.journaler.model_profiles import JournalerChatModelContext
+
+from engineering_hub.journaler.model_profiles import journaler_slash_model_command
 
 logger = logging.getLogger(__name__)
 
@@ -55,6 +60,7 @@ class ChatServer:
         port: int = 18790,
         start_time: datetime | None = None,
         delegator: AgentDelegator | None = None,
+        model_context: JournalerChatModelContext | None = None,
     ) -> None:
         self.engine = engine
         self.context = context
@@ -62,12 +68,19 @@ class ChatServer:
         self.port = port
         self.start_time = start_time or datetime.now()
         self.delegator = delegator
+        self.model_context = model_context
         self._server: ThreadingHTTPServer | None = None
         self._thread: threading.Thread | None = None
 
     def start_background(self) -> None:
         """Start the HTTP server in a daemon thread."""
-        handler = _make_handler(self.engine, self.context, self.start_time, self.delegator)
+        handler = _make_handler(
+            self.engine,
+            self.context,
+            self.start_time,
+            self.delegator,
+            self.model_context,
+        )
         self._server = ThreadingHTTPServer((self.host, self.port), handler)
         self._thread = threading.Thread(
             target=self._server.serve_forever,
@@ -88,6 +101,7 @@ def _make_handler(
     context: JournalContext,
     start_time: datetime,
     delegator: AgentDelegator | None = None,
+    model_context: JournalerChatModelContext | None = None,
 ) -> type[BaseHTTPRequestHandler]:
     """Create a request handler class with access to the engine and context."""
 
@@ -124,11 +138,25 @@ def _make_handler(
                 t0 = time.monotonic()
 
                 # Route slash commands before they reach the LLM.
-                if message.lower().startswith("/agent "):
+                mlow = message.lower()
+                if mlow.startswith("/model"):
+                    if model_context is None:
+                        response = (
+                            "Model context is not available on this server instance."
+                        )
+                    else:
+                        response = journaler_slash_model_command(
+                            message,
+                            settings=model_context.settings,
+                            model_ctx=model_context,
+                            engine=engine,
+                            delegator=delegator,
+                        )
+                elif mlow.startswith("/agent "):
                     response = _handle_agent_command(
                         message, delegator, context
                     )
-                elif message.lower() == "/skills":
+                elif mlow == "/skills":
                     response = _handle_skills_command(delegator)
                 else:
                     response = engine.chat(message)

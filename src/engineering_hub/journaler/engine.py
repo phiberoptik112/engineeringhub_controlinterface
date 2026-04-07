@@ -10,8 +10,13 @@ from __future__ import annotations
 
 import json
 import logging
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from corpus.service import CorpusService
 
 from engineering_hub.core.exceptions import LLMBackendError
 from engineering_hub.journaler.context_manager import (
@@ -31,6 +36,31 @@ SUPPORTED_EXTENSIONS: frozenset[str] = frozenset(
 )
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class LoadFileBudgetConfig:
+    """How much of the remaining context window may be used per `/load` operation.
+
+    Caps are expressed using the same ``len(text) // 3`` heuristic as
+    :func:`~engineering_hub.journaler.context_manager.estimate_tokens`.
+    """
+
+    max_context_fraction: float = 0.40
+    max_chars_absolute: int = 200_000
+    min_chars: int = 1024
+    slack_tokens: int = 256
+
+    def __post_init__(self) -> None:
+        f = self.max_context_fraction
+        if not 0.0 < f <= 1.0:
+            raise ValueError("max_context_fraction must be in (0, 1]")
+        if self.max_chars_absolute < 1:
+            raise ValueError("max_chars_absolute must be >= 1")
+        if self.min_chars < 0:
+            raise ValueError("min_chars must be >= 0")
+        if self.slack_tokens < 0:
+            raise ValueError("slack_tokens must be >= 0")
 
 
 def _is_model_cached(model_id: str) -> bool:
@@ -114,12 +144,14 @@ class ConversationalMLXBackend:
         repetition_penalty: float = 1.1,
         repetition_context_size: int = 20,
         backend: str = "auto",
+        enable_thinking: bool | None = None,
     ) -> None:
         self._temp = temp
         self._top_p = top_p
         self._min_p = min_p
         self._repetition_penalty = repetition_penalty
         self._repetition_context_size = repetition_context_size
+        self._enable_thinking = enable_thinking
 
         resolved = str(Path(model_path).expanduser())
         load_path = resolved if Path(resolved).is_dir() else model_path
@@ -194,6 +226,21 @@ class ConversationalMLXBackend:
             ) from exc
         logger.info(f"Journaler model loaded (mlx-vlm): {model_path}")
 
+    def _apply_chat_template_safe(self, messages: list[dict[str, str]]) -> str:
+        """Build prompt via tokenizer chat template; pass enable_thinking when supported."""
+        tokenizer = self._tokenizer
+        kwargs: dict[str, Any] = {
+            "tokenize": False,
+            "add_generation_prompt": True,
+        }
+        if self._enable_thinking is not None:
+            kwargs["enable_thinking"] = self._enable_thinking
+        try:
+            return tokenizer.apply_chat_template(messages, **kwargs)  # type: ignore[no-any-return]
+        except TypeError:
+            kwargs.pop("enable_thinking", None)
+            return tokenizer.apply_chat_template(messages, **kwargs)  # type: ignore[no-any-return]
+
     # ------------------------------------------------------------------
     # Public interface
     # ------------------------------------------------------------------
@@ -208,9 +255,7 @@ class ConversationalMLXBackend:
         Returns:
             The model's response text.
         """
-        prompt = self._tokenizer.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True
-        )
+        prompt = self._apply_chat_template_safe(messages)
 
         if self._is_vlm:
             return self._chat_vlm(prompt, max_tokens)
@@ -284,14 +329,18 @@ class ConversationEngine:
         max_tokens: int = 4000,
         pressure_config: PressureConfig | None = None,
         model_context_window: int = 32768,
+        corpus_service: CorpusService | None = None,
+        load_file_budget: LoadFileBudgetConfig | None = None,
     ) -> None:
         self._backend = backend
         self._system_prompt = system_prompt
         self._context_block = ""
+        self._corpus_service = corpus_service
         self._loaded_files: dict[str, str] = {}
         self._max_tokens = max_tokens
         self._log_dir = log_dir
         self._log_file = log_dir / "conversation.jsonl"
+        self._load_file_budget = load_file_budget or LoadFileBudgetConfig()
 
         cfg = pressure_config or PressureConfig(
             max_history_turns=max_history,
@@ -307,6 +356,8 @@ class ConversationEngine:
             system_prompt_tokens=estimate_tokens(system_prompt),
             context_snapshot_tokens=0,
             history_tokens=0,
+            loaded_files_tokens=0,
+            corpus_injection_tokens=0,
             reserved_for_generation=cfg.reserved_for_generation,
         )
         self.compressor = ContextCompressor(
@@ -322,6 +373,33 @@ class ConversationEngine:
             config=cfg,
         )
         self._pressure_config = cfg
+        self._roam_edit_target: Path | None = None
+
+    def get_roam_edit_target(self) -> Path | None:
+        """Session target for ``/edit`` (set via ``/open`` in journaler chat)."""
+        return self._roam_edit_target
+
+    def set_roam_edit_target(self, path: Path | None) -> None:
+        """Set or clear the org-roam file ``/edit`` appends to."""
+        if path is None:
+            self._roam_edit_target = None
+        else:
+            self._roam_edit_target = path.expanduser().resolve()
+
+    def replace_backend(
+        self,
+        backend: ConversationalMLXBackend,
+        *,
+        model_context_window: int | None = None,
+        max_tokens: int | None = None,
+    ) -> None:
+        """Swap the MLX backend (e.g. after ``/model``) while keeping conversation history."""
+        self._backend = backend
+        if max_tokens is not None:
+            self._max_tokens = max_tokens
+        if model_context_window is not None:
+            self._pressure_config.model_context_window = model_context_window
+            self.budget.window_size = model_context_window
 
     def update_context(self, context_block: str) -> None:
         """Replace the rolling context section of the system prompt."""
@@ -335,10 +413,29 @@ class ConversationEngine:
         the message array, calls the model, runs post-call topic tracking,
         and flushes archived turns to conversation.jsonl.
         """
+        self.budget.corpus_injection_tokens = 0
+        self.budget.history_tokens = self.history.total_tokens
+        self._sync_loaded_files_budget()
+
+        extra_suffix: str | None = None
+        cs = self._corpus_service
+        if cs is not None and cs.is_available() and message.strip():
+            try:
+                results = cs.search(message)
+                if results:
+                    extra_suffix = cs.format_for_context(results)
+            except Exception as exc:
+                logger.warning("Journaler corpus RAG failed (non-fatal): %s", exc)
+
+        if extra_suffix:
+            self.budget.corpus_injection_tokens = estimate_tokens(extra_suffix)
+        else:
+            self.budget.corpus_injection_tokens = 0
+
         # Pre-call: check pressure, compress/trim if necessary
         pre_actions = self.pressure_manager.pre_call_check()
 
-        messages = self._build_messages()
+        messages = self._build_messages(extra_system_suffix=extra_suffix)
         messages.append({"role": "user", "content": message})
 
         response = self._backend.chat(messages, self._max_tokens)
@@ -368,6 +465,7 @@ class ConversationEngine:
             action_text = "\n".join(all_actions)
             response = f"{action_text}\n\n{response}"
 
+        self.budget.corpus_injection_tokens = 0
         return response
 
     def clear(self, strategy: ClearStrategy) -> str:
@@ -383,6 +481,7 @@ class ConversationEngine:
     def get_status(self) -> dict:
         """Return current context management state for display / /status command."""
         self.budget.history_tokens = self.history.total_tokens
+        self._sync_loaded_files_budget()
         return {
             "context_window": self.budget.window_size,
             "utilization": f"{self.budget.utilization:.0%}",
@@ -391,6 +490,8 @@ class ConversationEngine:
             "history_tokens": self.history.total_tokens,
             "context_snapshot_tokens": self.budget.context_snapshot_tokens,
             "system_prompt_tokens": self.budget.system_prompt_tokens,
+            "loaded_files_tokens": self.budget.loaded_files_tokens,
+            "corpus_injection_tokens": self.budget.corpus_injection_tokens,
             "available_tokens": self.budget.available,
             "compressions_today": self.compressor.compression_count,
             "current_topic": self.topic_tracker.current_topic,
@@ -429,17 +530,53 @@ class ConversationEngine:
     # File loading
     # ------------------------------------------------------------------
 
+    def _loaded_files_section(self) -> str:
+        """Markdown block for ``## Loaded Files`` (must match ``_build_messages``)."""
+        if not self._loaded_files:
+            return ""
+        blocks = ["\n\n## Loaded Files\n"]
+        for label, content in self._loaded_files.items():
+            blocks.append(f"### {label}\n```\n{content}\n```")
+        return "\n".join(blocks)
+
+    def _sync_loaded_files_budget(self) -> None:
+        self.budget.loaded_files_tokens = estimate_tokens(self._loaded_files_section())
+
+    def _dynamic_max_chars_for_next_load(self) -> int:
+        """Characters allowed for the next file chunk from remaining context budget."""
+        self.budget.history_tokens = self.history.total_tokens
+        self._sync_loaded_files_budget()
+        bf = self._load_file_budget
+        tokens_avail = (
+            self.budget.window_size
+            - self.budget.system_prompt_tokens
+            - self.budget.context_snapshot_tokens
+            - self.budget.history_tokens
+            - self.budget.loaded_files_tokens
+            - self.budget.corpus_injection_tokens
+            - self.budget.reserved_for_generation
+            - bf.slack_tokens
+        )
+        if tokens_avail <= 0:
+            return 0
+        alloc_tokens = max(1, int(tokens_avail * bf.max_context_fraction))
+        char_cap = min(bf.max_chars_absolute, alloc_tokens * 3)
+        if char_cap > 0 and char_cap < bf.min_chars:
+            char_cap = min(bf.min_chars, tokens_avail * 3, bf.max_chars_absolute)
+        return max(0, char_cap)
+
     def load_file(
         self,
         path: Path,
-        max_chars: int = 50_000,
+        max_chars: int | None = None,
         extensions: frozenset[str] = SUPPORTED_EXTENSIONS,
     ) -> tuple[bool, str]:
         """Read a single file and add its content to the loaded-files block.
 
         Args:
             path: Absolute or relative path to the file.
-            max_chars: Maximum characters to read (content is truncated with a notice).
+            max_chars: Maximum characters to read; ``None`` uses a cap derived from
+                ``model_context_window`` and current loaded/history usage.
             extensions: Allowed file extensions. Pass ``frozenset()`` to skip the check.
 
         Returns:
@@ -459,6 +596,16 @@ class ConversationEngine:
                 f"Supported: {', '.join(sorted(extensions))}"
             )
 
+        if max_chars is None:
+            max_chars = self._dynamic_max_chars_for_next_load()
+            if max_chars <= 0:
+                return (
+                    False,
+                    "No context budget remaining for loaded files "
+                    f"(window {self.budget.window_size:,} tokens). "
+                    "Try /files clear, /clear, or a larger journaler.model_context_window.",
+                )
+
         try:
             content = path.read_text(encoding="utf-8", errors="replace")
         except OSError as exc:
@@ -471,11 +618,12 @@ class ConversationEngine:
 
         label = path.name
         self._loaded_files[label] = content
+        self._sync_loaded_files_budget()
 
         size_kb = len(content) / 1024
         msg = f"Loaded '{label}' ({size_kb:.1f} KB)"
         if truncated:
-            msg += f" [truncated to {max_chars:,} chars]"
+            msg += f" [truncated to {max_chars:,} chars (context-aware cap)]"
         return True, msg
 
     def load_directory(
@@ -483,7 +631,7 @@ class ConversationEngine:
         path: Path,
         extensions: frozenset[str] = SUPPORTED_EXTENSIONS,
         recursive: bool = False,
-        max_chars_per_file: int = 50_000,
+        max_chars_per_file: int | None = None,
     ) -> tuple[bool, str]:
         """Load all supported files from a directory into the loaded-files block.
 
@@ -491,7 +639,8 @@ class ConversationEngine:
             path: Directory to scan.
             extensions: File extensions to include.
             recursive: If True, scan subdirectories as well.
-            max_chars_per_file: Per-file character cap.
+            max_chars_per_file: Per-file character cap; ``None`` uses a shared
+                dynamic budget recomputed after each file.
 
         Returns:
             ``(ok, summary_message)``.
@@ -517,7 +666,21 @@ class ConversationEngine:
         loaded: list[str] = []
         skipped: list[str] = []
         for file_path in sorted(candidates):
-            ok, msg = self.load_file(file_path, max_chars=max_chars_per_file, extensions=frozenset())
+            cap = (
+                max_chars_per_file
+                if max_chars_per_file is not None
+                else self._dynamic_max_chars_for_next_load()
+            )
+            if cap <= 0:
+                skipped.append(
+                    f"{file_path.name}: no context budget remaining for further loads"
+                )
+                continue
+            ok, msg = self.load_file(
+                file_path,
+                max_chars=cap,
+                extensions=frozenset(),
+            )
             if ok:
                 loaded.append(file_path.name)
             else:
@@ -533,6 +696,7 @@ class ConversationEngine:
     def clear_loaded_files(self) -> None:
         """Remove all loaded files from the context."""
         self._loaded_files.clear()
+        self._sync_loaded_files_budget()
 
     def list_loaded_files(self) -> list[tuple[str, int]]:
         """Return a list of (filename, char_count) tuples for all loaded files."""
@@ -547,17 +711,18 @@ class ConversationEngine:
         messages = [{"role": "user", "content": prompt}]
         return self._backend.chat(messages, max_tokens)
 
-    def _build_messages(self) -> list[dict[str, str]]:
+    def _build_messages(
+        self, extra_system_suffix: str | None = None
+    ) -> list[dict[str, str]]:
         """Build the system + history message list for the model (without current user turn)."""
         system_content = self._system_prompt
         if self._context_block:
             system_content += f"\n\n{self._context_block}"
 
-        if self._loaded_files:
-            blocks = ["\n\n## Loaded Files\n"]
-            for label, content in self._loaded_files.items():
-                blocks.append(f"### {label}\n```\n{content}\n```")
-            system_content += "\n".join(blocks)
+        system_content += self._loaded_files_section()
+
+        if extra_system_suffix:
+            system_content += f"\n\n{extra_system_suffix}"
 
         messages: list[dict[str, str]] = [
             {"role": "system", "content": system_content}

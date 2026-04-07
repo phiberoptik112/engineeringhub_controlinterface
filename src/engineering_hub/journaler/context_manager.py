@@ -54,6 +54,8 @@ class TokenBudget:
     system_prompt_tokens: int
     context_snapshot_tokens: int
     history_tokens: int
+    loaded_files_tokens: int = 0
+    corpus_injection_tokens: int = 0
     reserved_for_generation: int = 2000
 
     @property
@@ -62,6 +64,8 @@ class TokenBudget:
             self.system_prompt_tokens
             + self.context_snapshot_tokens
             + self.history_tokens
+            + self.loaded_files_tokens
+            + self.corpus_injection_tokens
         )
 
     @property
