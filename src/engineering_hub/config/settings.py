@@ -287,6 +287,18 @@ class Settings(BaseSettings):
         ge=0,
         description="Extra tokens subtracted from headroom when sizing /load (safety margin)",
     )
+    journaler_agent_backend: str = Field(
+        default="auto",
+        description='Journaler /agent delegation: "auto", "claude", or "mlx"',
+    )
+    journaler_skills_dir: Path | None = Field(
+        default=None,
+        description="Directory of skill YAML files for Journaler agent delegation",
+    )
+    journaler_anthropic_api_key: SecretStr | None = Field(
+        default=None,
+        description="Optional Anthropic key for Journaler /agent; falls back to anthropic_api_key",
+    )
 
     # Report template settings
     templates_dir: Path | None = Field(
@@ -366,6 +378,14 @@ class Settings(BaseSettings):
         if j:
             return j
         return (self.mlx_model_path or "").strip()
+
+    def journaler_delegation_api_key(self) -> str:
+        """API key for Claude-backed Journaler /agent (journaler override, else global)."""
+        if self.journaler_anthropic_api_key is not None:
+            v = self.journaler_anthropic_api_key.get_secret_value()
+            if v:
+                return v
+        return self.anthropic_api_key.get_secret_value()
 
     @property
     def prompts_dir(self) -> Path:
@@ -534,6 +554,13 @@ class Settings(BaseSettings):
                 flat_config["journaler_load_min_chars"] = j["load_min_chars"]
             if j.get("load_slack_tokens") is not None:
                 flat_config["journaler_load_slack_tokens"] = j["load_slack_tokens"]
+            if j.get("agent_backend"):
+                flat_config["journaler_agent_backend"] = j["agent_backend"]
+            if j.get("skills_dir"):
+                flat_config["journaler_skills_dir"] = Path(j["skills_dir"]).expanduser()
+            j_anthropic = j.get("anthropic_api_key")
+            if j_anthropic:
+                flat_config["journaler_anthropic_api_key"] = SecretStr(str(j_anthropic))
 
         if "templates" in config:
             tpl = config["templates"]

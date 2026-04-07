@@ -37,6 +37,55 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+
+def build_delegator(
+    mlx_backend: ConversationalMLXBackend,
+    *,
+    anthropic_api_key: str = "",
+    skills_dir: Path | None = None,
+    default_backend: str = "auto",
+    output_dir: Path | None = None,
+    prompts_dir: Path | None = None,
+) -> AgentDelegator | None:
+    """Construct an :class:`AgentDelegator` or return ``None`` if setup fails.
+
+    Shared by the Journaler daemon and interactive ``journaler chat`` so both
+    inject the same skills/persona metadata into the system prompt.
+    """
+    if output_dir is None:
+        output_dir = Path.cwd() / "outputs"
+    try:
+        from engineering_hub.agents.worker import AgentWorker
+
+        anthropic_worker = None
+        key = (anthropic_api_key or "").strip()
+        if key:
+            anthropic_worker = AgentWorker.from_anthropic(
+                api_key=key,
+                prompts_dir=prompts_dir,
+                output_dir=output_dir,
+            )
+            logger.info("Claude API worker initialized for agent delegation")
+
+        delegator = AgentDelegator(
+            mlx_backend=mlx_backend,
+            anthropic_worker=anthropic_worker,
+            skills_dir=skills_dir,
+            default_backend=default_backend,
+            prompts_dir=prompts_dir,
+            output_dir=output_dir,
+        )
+        logger.info(
+            "AgentDelegator ready (default backend: %s, skills: %s)",
+            default_backend,
+            len(delegator.list_skills()),
+        )
+        return delegator
+    except Exception as exc:
+        logger.warning("AgentDelegator init failed — delegation unavailable: %s", exc)
+        return None
+
+
 # Canonical agent type names accepted in /agent commands
 _AGENT_ALIASES: dict[str, str] = {
     "research": "research",

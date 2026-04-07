@@ -429,6 +429,8 @@ def _handle_chat_slash_command(
     chat_console: Console,
     org_roam_dir: Path | None = None,
     journaler_model_ctx: object | None = None,
+    journal_ctx: object | None = None,
+    delegator: object | None = None,
 ) -> None:
     """Intercept and execute a /slash command from the journaler chat loop.
 
@@ -448,6 +450,7 @@ def _handle_chat_slash_command(
       /open [today|clear|<path>|<title>]  Set session org-roam target for /edit.
       /edit <heading> :: <text>  Append under a heading in the /open target.
       /exit, /quit               Leave the chat (same as bare exit, quit, or :q).
+      /agent … /skills           Delegate to agent personalities (when delegator is configured).
       /model                     Show model, or switch profile / path (see /help).
       /help                      Show available slash commands.
     """
@@ -473,7 +476,7 @@ def _handle_chat_slash_command(
             settings=journaler_model_ctx.settings,
             model_ctx=journaler_model_ctx,
             engine=engine,
-            delegator=None,
+            delegator=delegator,
         )
         chat_console.print(f"[green]{escape(msg)}[/green]")
         return
@@ -486,6 +489,25 @@ def _handle_chat_slash_command(
     if org_roam_dir is not None:
         candidate = org_roam_dir / "journal"
         journal_dir = candidate if candidate.exists() else org_roam_dir
+
+    if cmd == "/skills":
+        from engineering_hub.journaler.chat_server import _handle_skills_command
+
+        msg = _handle_skills_command(delegator)
+        chat_console.print(f"[green]{escape(msg)}[/green]")
+        return
+
+    if cmd == "/agent":
+        if journal_ctx is None:
+            chat_console.print(
+                "[yellow]/agent requires journal context; start from a configured workspace.[/yellow]"
+            )
+            return
+        from engineering_hub.journaler.chat_server import _handle_agent_command
+
+        msg = _handle_agent_command(raw, delegator, journal_ctx)
+        chat_console.print(f"[green]{escape(msg)}[/green]")
+        return
 
     if cmd == "/help":
         write_cmds = (
@@ -517,6 +539,8 @@ def _handle_chat_slash_command(
             "  [cyan]/status[/cyan]                    Show context pressure and token usage\n"
             "  [cyan]/budget[/cyan]                    Show token budget breakdown\n"
             "  [cyan]/topic[/cyan]                     Show currently detected conversation topic\n"
+            "  [cyan]/agent <type> <desc>[/cyan]      Delegate to a named agent (see README)\n"
+            "  [cyan]/skills[/cyan]                    List agent delegation skills / personas\n"
             + write_cmds +
             "  [cyan]/exit[/cyan], [cyan]/quit[/cyan]          Leave chat (or type exit, quit, :q)\n"
             "  [cyan]/help[/cyan]                      Show this help\n"
@@ -881,6 +905,9 @@ def cmd_journaler(args: argparse.Namespace) -> int:
         load_max_chars_absolute=settings.journaler_load_max_chars_absolute,
         load_min_chars=settings.journaler_load_min_chars,
         load_slack_tokens=settings.journaler_load_slack_tokens,
+        anthropic_api_key=settings.journaler_delegation_api_key(),
+        agent_backend=settings.journaler_agent_backend,
+        skills_dir=settings.journaler_skills_dir,
     )
 
     if sub == "start":
@@ -903,8 +930,14 @@ def cmd_journaler(args: argparse.Namespace) -> int:
 
     elif sub == "chat":
         from engineering_hub.journaler.chat_repl import configure_chat_readline, prompt_line
+        from engineering_hub.journaler.delegator import build_delegator
         from engineering_hub.journaler.engine import ConversationEngine
-        from engineering_hub.journaler.prompts import format_system_prompt, load_system_prompt
+        from engineering_hub.journaler.prompts import (
+            build_skills_block,
+            build_workspace_layout,
+            format_system_prompt,
+            load_system_prompt,
+        )
 
         chat_model_ctx = JournalerChatModelContext(settings, spec)
         console.print("[bold]Loading Journaler model for interactive chat...[/bold]")
@@ -918,7 +951,6 @@ def cmd_journaler(args: argparse.Namespace) -> int:
         ctx.scan()
 
         system_template = load_system_prompt(config.state_dir)
-        from engineering_hub.journaler.prompts import build_workspace_layout
         workspace_map = build_workspace_layout(config.org_roam_dir, config.workspace_dir)
         system_prompt = format_system_prompt(
             system_template,
@@ -937,6 +969,18 @@ def cmd_journaler(args: argparse.Namespace) -> int:
             load_file_budget=config.get_load_file_budget(),
         )
 
+        delegator = build_delegator(
+            backend,
+            anthropic_api_key=config.anthropic_api_key,
+            skills_dir=config.skills_dir,
+            default_backend=config.agent_backend,
+            output_dir=config.workspace_dir / "outputs",
+        )
+        if delegator is not None:
+            skills_text = build_skills_block(delegator)
+            if skills_text:
+                engine._system_prompt = engine._system_prompt.rstrip() + "\n\n" + skills_text
+
         configure_chat_readline(
             config.state_dir,
             conversation_jsonl=config.state_dir / "conversation.jsonl",
@@ -947,8 +991,8 @@ def cmd_journaler(args: argparse.Namespace) -> int:
         console.print(
             "[green]Journaler ready. "
             "Type your questions (Ctrl-C, /exit, or exit to leave).[/green]\n"
-            "[dim]Tip: /model to switch HF profile or path; /load <path> for files; "
-            "/help for commands.[/dim]\n"
+            "[dim]Tip: /agent and /skills for agent personas; /model to switch profile; "
+            "/load for files; /help for commands.[/dim]\n"
             "[dim]Context: /status, /budget, /topic — "
             "Clear: /clear, /clear --summarize, /clear --hard[/dim]\n"
             "[dim]Input: Up/Down recall previous lines (saved under .journaler). "
@@ -975,6 +1019,8 @@ def cmd_journaler(args: argparse.Namespace) -> int:
                             console,
                             org_roam_dir=config.org_roam_dir,
                             journaler_model_ctx=chat_model_ctx,
+                            journal_ctx=ctx,
+                            delegator=delegator,
                         )
                     except JournalerChatExit:
                         break

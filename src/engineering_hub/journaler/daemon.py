@@ -40,7 +40,6 @@ from engineering_hub.journaler.prompts import (
 
 if TYPE_CHECKING:
     from engineering_hub.journaler.chat_server import ChatServer
-    from engineering_hub.journaler.delegator import AgentDelegator
     from engineering_hub.journaler.slack import SlackPoster
     from engineering_hub.memory.service import MemoryService
 
@@ -198,40 +197,20 @@ def run_daemon(config: JournalerConfig, settings: Settings | None = None) -> Non
     )
 
     # Init agent delegator (bridges Journaler chat → AgentWorker)
-    delegator: AgentDelegator | None = None
-    try:
-        from engineering_hub.agents.worker import AgentWorker
-        from engineering_hub.journaler.delegator import AgentDelegator
+    from engineering_hub.journaler.delegator import build_delegator
 
-        anthropic_worker = None
-        if config.anthropic_api_key:
-            anthropic_worker = AgentWorker.from_anthropic(
-                api_key=config.anthropic_api_key,
-                prompts_dir=None,
-                output_dir=config.workspace_dir / "outputs",
-            )
-            logger.info("Claude API worker initialized for agent delegation")
-
-        delegator = AgentDelegator(
-            mlx_backend=backend,
-            anthropic_worker=anthropic_worker,
-            skills_dir=config.skills_dir,
-            default_backend=config.agent_backend,
-            output_dir=config.workspace_dir / "outputs",
-        )
-        logger.info(
-            f"AgentDelegator ready (default backend: {config.agent_backend}, "
-            f"skills: {len(delegator.list_skills())})"
-        )
-
-        # Inject skills block into system prompt when delegation is available
-        skills_block = build_skills_block(delegator)
-        if skills_block:
-            engine._system_prompt = engine._system_prompt.rstrip() + "\n\n" + skills_block
-
-    except Exception as exc:
-        logger.warning(f"AgentDelegator init failed — delegation unavailable: {exc}")
-        delegator = None
+    delegator = build_delegator(
+        backend,
+        anthropic_api_key=config.anthropic_api_key,
+        skills_dir=config.skills_dir,
+        default_backend=config.agent_backend,
+        output_dir=config.workspace_dir / "outputs",
+    )
+    skills_suffix = ""
+    if delegator is not None:
+        skills_suffix = build_skills_block(delegator)
+        if skills_suffix:
+            engine._system_prompt = engine._system_prompt.rstrip() + "\n\n" + skills_suffix
 
     # Init optional components
     slack: SlackPoster | None = None
@@ -268,6 +247,7 @@ def run_daemon(config: JournalerConfig, settings: Settings | None = None) -> Non
         engine=engine,
         system_template=system_template,
         workspace_map=workspace_map,
+        skills_suffix=skills_suffix,
     )
 
     if config.briefing_enabled:
@@ -397,14 +377,18 @@ def _tick(
     engine: ConversationEngine,
     system_template: str,
     workspace_map: str = "",
+    skills_suffix: str = "",
 ) -> None:
     """10-minute scan cycle."""
     snapshot = context.scan()
     current_context = context.get_current_context()
     engine.update_context(current_context)
-    engine._system_prompt = format_system_prompt(
+    prompt = format_system_prompt(
         system_template, current_context, workspace_map=workspace_map
     )
+    if skills_suffix:
+        prompt = prompt.rstrip() + "\n\n" + skills_suffix
+    engine._system_prompt = prompt
 
     if snapshot.has_significant_changes:
         logger.info(f"Significant changes detected: {snapshot.change_summary}")

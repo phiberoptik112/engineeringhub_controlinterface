@@ -7,7 +7,7 @@ A persistent, agent-first workspace enabling collaboration between engineers and
 Engineering Hub provides two complementary modes of AI collaboration:
 
 1. **Orchestrator** (task-driven) -- watches your org-roam journal for `@agent:` task lines, dispatches work to specialized agents via Claude API or local MLX models, and writes results back to the workspace.
-2. **Journaler** (ambient) -- a persistent daemon that runs a local ~32B model via MLX, continuously monitors your org-roam workspace, delivers morning briefings, and responds to ad-hoc questions through an HTTP chat endpoint.
+2. **Journaler** (ambient) -- a persistent daemon that runs a local ~32B model via MLX, continuously monitors your org-roam workspace, delivers morning briefings, and responds to ad-hoc questions through **`engineering-hub journaler chat`** (interactive) and an **HTTP** chat endpoint when the daemon is running.
 
 They coexist cleanly: the Orchestrator processes explicit tasks while the Journaler maintains ambient awareness. The Journaler can read the full org-roam workspace, write back to daily journals, create org-roam nodes via slash commands, and — now — **delegate tasks directly to any agent personality inline** using the `/agent` command, with a choice of local MLX or Claude API execution.
 
@@ -19,7 +19,7 @@ They coexist cleanly: the Orchestrator processes explicit tasks while the Journa
 - **File Watching**: Monitors workspace for changes and automatically dispatches agent tasks
 - **Local MLX Models**: Run agents on Apple Silicon via `mlx-lm` with HuggingFace model IDs
 - **Journaler Daemon**: Always-on ambient listener with morning briefings, HTTP chat, and Slack integration — optional **model profiles**, Qwen3 **thinking mode**, CLI `--profile` / `--model`, and **`/model`** to switch checkpoints without losing chat history
-- **Agent Delegation**: Journaler chat can delegate tasks directly to any named agent personality (`/agent research ...`, `/agent technical-writer ...`) and receive results inline — backed by the local MLX model or Claude API, selectable per-command
+- **Agent Delegation**: **`journaler chat`** and the daemon’s HTTP `/chat` both use the same setup: an **AgentDelegator**, YAML **skills** summaries injected into the system prompt (personas, when-to-use hints, examples), and **`/agent`** / **`/skills`** slash commands — execution is local MLX or Claude API, selectable per-command via `journaler.agent_backend` and `--backend`
 - **Skills System**: Extensible `skills/` directory of YAML files defines each agent personality's capabilities; drop a new `.yaml` to add a delegation skill without code changes
 - **Context Management**: Token-aware conversation history with automatic compression, topic-shift archival, end-of-day reset, and manual `/clear` controls — keeps the local model coherent across a full workday
 - **Org-Roam Write Skill**: Journaler chat can write properly-formatted org-roam files — add TODOs, mark tasks done, append notes to today's journal (`/note`), set a session target on any roam note (`/open`), append under a heading there (`/edit`), search by title (`/find`), and create new nodes — via slash commands
@@ -139,8 +139,10 @@ engineering-hub journaler --model mlx-community/Qwen3-30B-A3B-Instruct-2507-4bit
 /load path/to/dir/ -r           Load recursively
 /files                          List currently loaded files (with sizes)
 /files clear                    Remove all loaded files from context
-/open today                    Set /edit target to today's journal (or /open <path>, /open <title>)
-/edit Section :: body text     Append under a heading in the file opened with /open
+/agent technical-writer ...     Delegate inline (see Agent Delegation below)
+/skills                         List delegation skills / personas from skills/*.yaml
+/open today                     Set /edit target to today's journal (or /open <path>, /open <title>)
+/edit Section :: body text      Append under a heading in the file opened with /open
 /help                           Show all slash commands
 ```
 
@@ -205,7 +207,9 @@ The Journaler is a persistent daemon that runs a local ~32B model on Apple Silic
 - **Extracts** headings, TODO/DONE items, timestamps, and `@agent:` tasks from `.org` files
 - **Reads** recent agent outputs from `memory.db` via `MemoryService.browse_recent()`
 - **Compresses** everything into a rolling context snapshot (~4000 tokens)
-- **Knows** the workspace layout and org-roam format conventions — injected into the system prompt at startup so the model can reason about file locations and produce valid org syntax
+- **Knows** the workspace layout and org-roam format conventions — injected into the system prompt when the conversation engine starts so the model can reason about file locations and produce valid org syntax
+- **Loads agent personas** from `skills/*.yaml`: a concise **skills block** (display name, description, when-to-use, example `/agent` lines) is appended to the system prompt for **both** `journaler start` and **`journaler chat`**. On the daemon, each scheduled org-roam scan refreshes the rolling context snapshot **and re-attaches** that skills block so personas are not dropped mid-run
+- **Uses** `journaler.agent_backend`, optional `journaler.skills_dir`, and optional `journaler.anthropic_api_key` (else `anthropic.api_key` / `ENGINEERING_HUB_ANTHROPIC_API_KEY`) for delegation — same resolution for daemon and interactive chat
 - **Generates** a morning briefing at a configurable time (default 7:00 AM)
 - **Responds** to ad-hoc questions via an HTTP chat endpoint on `localhost:18790`
 - **Writes** to daily journals and org-roam nodes via slash commands in the interactive chat session
@@ -231,10 +235,10 @@ journaler:
   max_conversation_history: 20
   max_tokens: 4000
 
-  # Agent delegation — enables the /agent slash command in Journaler chat
+  # Agent delegation — applies to BOTH `journaler start` and `journaler chat`
   agent_backend: "auto"   # "auto" | "claude" | "mlx" (see Agent Delegation below)
-  # anthropic_api_key: "" # or set ENGINEERING_HUB_ANTHROPIC_API_KEY env var
-  # skills_dir: "~/org-roam/engineering-hub/skills"  # default: skills/ at repo root
+  # anthropic_api_key: "" # optional Journaler-only override; else top-level anthropic.api_key / ENGINEERING_HUB_ANTHROPIC_API_KEY
+  # skills_dir: "~/org-roam/engineering-hub/skills"  # default: skills/ at repo root (resolved from YAML)
 
   # Context management (all values below are defaults — omit to use defaults)
   context_management:
@@ -437,7 +441,7 @@ While in `engineering-hub journaler chat`, any input starting with `/` is handle
 | --- | --- |
 | `/help` | Show the full list of available slash commands |
 
-Tasks added with `/task` use the `- [ ] @agent:` format understood by the Orchestrator, so they will be picked up and dispatched automatically. `/agent` tasks run immediately and return their output in the current chat turn. `/open` and `/edit` apply only in **`journaler chat`** (the interactive CLI); they are not available on the Journaler HTTP `/chat` endpoint. Loaded files are appended to the system prompt as fenced blocks and persist for the life of the chat session only.
+Tasks added with `/task` use the `- [ ] @agent:` format understood by the Orchestrator, so they will be picked up and dispatched automatically. `/agent` tasks run immediately and return their output in the current chat turn. **`/model`** in interactive chat reloads the MLX weights but **keeps the delegator’s adapter in sync**, so `/agent --backend mlx` continues to use the active checkpoint (same behavior as HTTP `/chat`). `/open` and `/edit` apply only in **`journaler chat`** (the interactive CLI); they are not available on the Journaler HTTP `/chat` endpoint. Loaded files are appended to the system prompt as fenced blocks and persist for the life of the chat session only.
 
 To persist files for long-term retrieval across sessions, use `engineering-hub load` instead (see [Load Files into Context](#6-load-files-into-context)).
 
@@ -457,9 +461,11 @@ The Journaler can delegate tasks directly to any named agent personality and ret
 | `<description>` | Free-text task description |
 | `--project <id>` | Optional Django project ID for context enrichment |
 | `--backend mlx` | Use the local MLX model (reuses the Journaler's loaded model — no extra RAM) |
-| `--backend claude` | Use the Claude API (requires `anthropic_api_key` in config) |
+| `--backend claude` | Use the Claude API (requires `journaler.anthropic_api_key` or global `anthropic.api_key` / env) |
 
 The default backend is controlled by `journaler.agent_backend` in config (`"auto"` prefers Claude when a key is present, otherwise falls back to MLX). The `--backend` flag overrides this per-command.
+
+For **draft reports, protocols, executive summaries, and other client-facing Markdown deliverables**, use the **`technical-writer`** persona. The default Journaler system prompt and workspace layout tell the ambient model to suggest practical routes: immediate **`/agent technical-writer …`**, queue **`/task`** / journal lines with `@technical-writer:`, optional **`--project <id>`** for Django context, and **`/skills`** for full persona text. Delegated technical-writer runs use `prompts/technical-writer.txt`; saved artifacts often land under **`outputs/docs/`**.
 
 **Examples:**
 
@@ -476,13 +482,13 @@ If no live backend is configured, the command falls back to writing the task to 
 
 | Mode | Description |
 | --- | --- |
-| `"auto"` (default) | Claude API if `anthropic_api_key` is set, otherwise local MLX |
+| `"auto"` (default) | Claude API if `journaler.anthropic_api_key` or top-level `anthropic.api_key` (or env) is set, otherwise local MLX |
 | `"claude"` | Always Claude API — errors if no key is configured |
 | `"mlx"` | Always the local model — the Journaler's already-loaded MLX model is reused via a thin adapter, so no second model is loaded and no extra RAM is consumed |
 
 #### The `/skills` command
 
-Type `/skills` in the chat (or `GET http://localhost:18790/skills`) to list all available delegation skills with descriptions and example invocations.
+In **`journaler chat`**, type `/skills`. With the daemon, use `GET http://localhost:18790/skills` or send a chat message **`/skills`** over `POST /chat`. Each path lists loaded skills with descriptions and example invocations.
 
 #### Skills system
 
@@ -503,16 +509,19 @@ invocation_examples:
   - "/agent research ASTM E336-17a vs E336-21 material differences"
 ```
 
-To add a new delegation capability, drop a new `.yaml` file into `skills/` — no code changes needed. The Journaler loads all skill files at startup and injects a summary into its system prompt so the model knows what it can delegate and how.
+To add a new delegation capability, drop a new `.yaml` file into `skills/` — no code changes needed. The Journaler loads all skill files when the **ConversationEngine** starts (**daemon** or **interactive `journaler chat`**) and injects a summary into the system prompt (including **when_to_use** hints) so the ambient model knows what it can delegate and how. **Custom** `.journaler/system_prompt.txt` overrides the default template; copy the `{context_snapshot}` placeholder and any delegation guidance you still want if you maintain your own file.
 
 ### Org-Roam Write Skill
 
-The Journaler's system prompt is enriched at startup with a `## Workspace Layout` block that tells the model:
+The Journaler's system prompt is enriched when the engine starts with a `## Workspace Layout` block that tells the model:
 
 - The absolute paths of `org_roam_dir`, `workspace_dir`, and the daily journal directory
 - Org-roam format conventions: `:PROPERTIES:/:ID:/END:` drawer, `#+title:`, `#+filetags:`, heading levels, `TODO`/`DONE` keywords, active (`<…>`) and inactive (`[…]`) timestamp formats, `CLOSED:` annotation
 - The `@agent:` task syntax the Orchestrator picks up
+- A **Draft reports (Markdown)** note: routing long-form prose to **`technical-writer`**, Markdown output, and typical **`outputs/docs/`** placement
 - All available slash commands
+
+Unless you override `system_prompt.txt`, the base Journaler role also asks the model to **propose concrete tasking paths** (inline `/agent`, journal `/task`, project id) when the user is heading toward written deliverables.
 
 This means the model can suggest correctly-formatted org content in its responses, and the user can immediately write it with the corresponding slash command. The write functions (`org_writer.py`) enforce consistent formatting — UUID `:ID:` properties, `YYYYMMDDHHMMSS-slug.org` filenames, proper `CLOSED:` timestamps — regardless of what the model outputs.
 
@@ -586,7 +595,7 @@ See [config/config.example.yaml](config/config.example.yaml) for all available o
 - `llm_provider` - `"anthropic"` (cloud API) or `"mlx"` (local Apple Silicon)
 - `django.api_url` - Django consultingmanager API endpoint
 - `django.api_token` - API authentication token
-- `anthropic.api_key` - Anthropic API key for Claude (used by the Orchestrator and Journaler `/agent --backend claude`)
+- `anthropic.api_key` - Anthropic API key for Claude (Orchestrator; Journaler `/agent --backend claude` also accepts optional `journaler.anthropic_api_key` first)
 - `anthropic.model` - Claude model to use (default: claude-sonnet-4-5-20250929)
 - `workspace.dir` - Base workspace directory
 - `mlx.model_path` - HuggingFace model ID for local MLX inference
@@ -594,9 +603,9 @@ See [config/config.example.yaml](config/config.example.yaml) for all available o
 - `journaler.model_profile` - Name of the active entry in `journaler.models` (when the map is non-empty)
 - `journaler.models` - Optional map of named MLX profiles (`model_path`, `model_context_window`, sampling, `mlx_backend`, `enable_thinking`)
 - `journaler.model_context_window` - Context window for pressure math when not using per-profile values (default: 32768)
-- `journaler.agent_backend` - Backend for `/agent` delegation: `"auto"` (default), `"claude"`, or `"mlx"`
-- `journaler.anthropic_api_key` - Optional per-journaler Anthropic key (falls back to `anthropic.api_key` if unset)
-- `journaler.skills_dir` - Path to skills YAML directory (default: `skills/` at repo root)
+- `journaler.agent_backend` - Backend for `/agent` delegation: `"auto"` (default), `"claude"`, or `"mlx"` (used by **`journaler start`** and **`journaler chat`**)
+- `journaler.anthropic_api_key` - Optional per-journaler Anthropic key (falls back to `anthropic.api_key` / env if unset; same scope as `agent_backend`)
+- `journaler.skills_dir` - Path to skills YAML directory (default: `skills/` at repo root; loaded into the system prompt for daemon and interactive chat)
 - `journaler.context_management.*` - Token pressure thresholds, compression triggers, EOD reset time, topic-shift behavior
 - `memory.*` - Vector memory settings (enabled, search_k, threshold)
 - `ollama.*` - Ollama embedding model settings
