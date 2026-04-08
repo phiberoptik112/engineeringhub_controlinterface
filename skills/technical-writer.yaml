@@ -1,0 +1,45 @@
+name: technical-writer
+display_name: Technical Writer Agent
+agent_type: technical-writer
+
+description: |
+  Produces clear, professionally formatted technical documents for consulting deliverables —
+  test protocols, field reports, executive summaries, and design specifications. Calibrates
+  language to the client's technical sophistication level. All standards references include
+  edition years. Never fabricates test data; uses [INSERT: description] placeholders for
+  missing quantitative content.
+
+when_to_use:
+  - User needs a draft report, protocol, or specification written
+  - User wants a document structured for client delivery
+  - User has raw findings or notes and needs them turned into a deliverable
+  - User needs an executive summary or technical summary document
+  - User asks to draft any section of a test report or design document
+
+invocation_examples:
+  - "/agent technical-writer draft executive summary for project 25 noise assessment"
+  - "/agent technical-writer write field test protocol for ASTM E336 measurement"
+  - "/agent technical-writer produce design specification for STC-50 partition assembly --project 18"
+  - "/agent technical-writer draft report introduction for impact noise study"
+
+parameters:
+  project_id:
+    description: Django project ID for context enrichment (optional)
+    required: false
+  description:
+    description: The document type and subject to produce
+    required: true
+
+output:
+  format: markdown
+  structure:
+    - Document header (title, project, client, date, version)
+    - Executive Summary
+    - Introduction / Scope
+    - Methodology
+    - Results / Findings
+    - Discussion / Analysis
+    - Conclusions and Recommendations
+    - References
+    - Appendices
+  output_dir: docs

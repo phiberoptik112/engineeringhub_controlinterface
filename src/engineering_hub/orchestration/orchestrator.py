@@ -8,11 +8,14 @@ from pathlib import Path
 from typing import Optional
 
 from engineering_hub.actions.file_ingest import FileIngestAction
+from engineering_hub.agents.backends import create_backend
 from engineering_hub.agents.worker import AgentWorker
 from engineering_hub.config.settings import Settings
+from engineering_hub.container.router import TaskRouter
 from engineering_hub.context.manager import ContextManager
 from engineering_hub.core.constants import TaskStatus, is_ingest_task
 from engineering_hub.core.models import ParsedTask, TaskResult
+from engineering_hub.corpus_service_factory import build_corpus_service_from_settings
 from engineering_hub.django.client import DjangoClient
 from engineering_hub.memory.service import MemoryService
 from engineering_hub.notes.manager import SharedNotesManager
@@ -71,12 +74,14 @@ class Orchestrator:
         # Django client
         self.django_client = DjangoClient(
             api_url=self.settings.django_api_url,
-            api_token=self.settings.django_api_token,
+            api_token=self.settings.django_api_token.get_secret_value(),
             cache_ttl=self.settings.django_cache_ttl,
         )
 
         # Memory service (standalone, no Django dependency)
         self.memory_service: Optional[MemoryService] = self._init_memory_service()
+
+        corpus_service = build_corpus_service_from_settings(self.settings)
 
         # Context manager
         self.context_manager = ContextManager(
@@ -87,16 +92,20 @@ class Orchestrator:
             inputs_dir=self.settings.resolved_inputs_dir,
             memory_service=self.memory_service,
             history_notes_manager=self._history_notes_manager,
+            corpus_service=corpus_service,
         )
 
-        # Agent worker
+        # Agent worker (provider chosen by llm_provider setting)
+        backend = create_backend(self.settings)
         self.agent_worker = AgentWorker(
-            api_key=self.settings.anthropic_api_key,
-            model=self.settings.anthropic_model,
+            backend=backend,
             prompts_dir=self.settings.prompts_dir,
             output_dir=self.settings.output_dir,
             max_tokens=self.settings.max_tokens,
         )
+
+        # Task router (local or Docker container execution)
+        self.task_router = TaskRouter(self.settings, self.agent_worker)
 
         # Task dispatcher
         self.dispatcher = TaskDispatcher(
@@ -157,8 +166,8 @@ class Orchestrator:
         # Build context for the task
         context = self.context_manager.format_for_agent(task)
 
-        # Execute with agent
-        result = self.agent_worker.execute(task, context)
+        # Execute via router (local or Docker container)
+        result = self.task_router.execute(task, context)
 
         if result.success:
             self._capture_task_result(task, result)
@@ -167,17 +176,37 @@ class Orchestrator:
         return result
 
     def _execute_ingest(self, task: ParsedTask) -> TaskResult:
-        """Execute file ingest action for a task."""
+        """Execute file ingest action for a task, then chunk + embed into memory."""
         result = self._ingest_action.execute_from_description(
             description=task.description,
             project_id=task.project_id,
         )
+
+        if result.success and self.memory_service and self.settings.chunk_enabled:
+            self._embed_ingest_chunks(result.converted_docs, task.project_id)
+
         return TaskResult(
             task=task,
             success=result.success,
             output_path=result.manifest_path,
             error_message=result.error_message,
         )
+
+    def _embed_ingest_chunks(
+        self,
+        converted_docs: dict,
+        project_id: int | None,
+    ) -> None:
+        """Chunk converted documents and embed into memory."""
+        from engineering_hub.memory.chunker import chunk_document
+
+        for filename, (markdown, docling_doc) in converted_docs.items():
+            try:
+                chunks = chunk_document(markdown, filename, docling_doc)
+                if chunks:
+                    self.memory_service.capture_document(chunks, project_id=project_id)  # type: ignore[union-attr]
+            except Exception as exc:
+                logger.warning(f"Failed to chunk/embed {filename} (non-fatal): {exc}")
 
     def _init_memory_service(self) -> Optional[MemoryService]:
         """Initialise memory service. Returns None if disabled or on error."""
@@ -476,9 +505,14 @@ class Orchestrator:
             "notes_file": str(self.settings.notes_file),
             "output_dir": str(self.settings.output_dir),
             "memory_enabled": self.memory_service is not None,
+            "docker_enabled": self.task_router.is_containerised,
         }
 
         if self.memory_service is not None:
             status["memory_stats"] = self.memory_service.get_stats()
+
+        docker_info = self.task_router.docker_status()
+        if docker_info:
+            status["docker"] = docker_info
 
         return status

@@ -31,6 +31,14 @@ class AgentExecutionError(HubError):
         self.agent_type = agent_type
 
 
+class LLMBackendError(HubError):
+    """Provider-agnostic error raised by LLM backends (Anthropic, MLX, etc.)."""
+
+    def __init__(self, message: str, provider: str | None = None) -> None:
+        super().__init__(message)
+        self.provider = provider
+
+
 class ConfigurationError(HubError):
     """Error in configuration."""
 

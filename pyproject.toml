@@ -17,12 +17,26 @@ dependencies = [
     "pypdf>=4.0.0",
     "python-docx>=1.0.0",
     "requests>=2.31.0",
+    "schedule>=1.2.0",
     "watchdog>=3.0.0",
     "rich>=13.0.0",
     "fastmcp>=2.0.0",
 ]
 
 [project.optional-dependencies]
+mlx = [
+    "mlx-lm>=0.31",
+    "mlx-vlm>=0.4.3",
+]
+docling = [
+    "docling>=2.60",
+    "docling-core[chunking]",
+]
+docling-ocrmac = [
+    "docling>=2.60",
+    "docling-core[chunking]",
+    "docling[ocrmac]",
+]
 dev = [
     "pytest>=7.4.0",
     "pytest-cov>=4.1.0",

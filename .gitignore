@@ -74,3 +74,5 @@ Thumbs.db
 outputs/
 *.log
 config.local.yaml
+config.yaml
+config/config.yaml

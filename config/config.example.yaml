@@ -1,6 +1,13 @@
 # Engineering Hub Configuration
 # Copy this file to your workspace as config.yaml and fill in values
 
+# ── LLM provider ─────────────────────────────────────────────────
+# Choose which backend agents use for text generation:
+#   "anthropic" — Claude API (default, requires api_key)
+#   "mlx"       — Local Apple Silicon inference via mlx-lm
+#   "ollama"    — Local/networked Ollama server (works in Docker containers)
+llm_provider: "anthropic"
+
 django:
   # Django consultingmanager API URL
   api_url: "http://localhost:8000/api"
@@ -90,13 +97,45 @@ roam:
 staging:
   manifest_name: "manifest.json"
 
-# ── Local embeddings ──────────────────────────────────────────────
+# ── MLX local model (Apple Silicon) ───────────────────────────────
+# Used when llm_provider is "mlx". Install with: pip install 'engineering-hub[mlx]'
+# Gemma 4 is a Vision-Language Model (VLM) — the engine auto-detects this and
+# uses mlx-vlm instead of mlx-lm transparently.
+# mlx:
+#   # HuggingFace model ID — resolved from the HF cache automatically:
+#   model_path: "mlx-community/gemma-4-31b-it-8bit"
+#
+#   # Or point directly at a local cache snapshot directory:
+#   # model_path: "~/.cache/huggingface/hub/models--mlx-community--gemma-4-31b-it-8bit/snapshots/<hash>"
+#
+#   # Sampling parameters (defaults shown)
+#   temp: 0.7
+#   top_p: 0.9
+#   min_p: 0.05
+#   repetition_penalty: 1.1
+#   max_tokens: 4096
+
+# ── Ollama (local embeddings + optional chat generation) ─────────
+# The same Ollama instance serves both embedding and chat generation.
+# Chat generation is used when llm_provider is "ollama" (above).
 ollama:
   host: "http://localhost:11434"
-  # Pull the model once before first use:
+
+  # Pull embedding model once before first use:
   #   ollama pull nomic-embed-text     (274MB, 768-dim, fast)
   #   ollama pull mxbai-embed-large    (670MB, 1024-dim, higher quality)
   embed_model: "nomic-embed-text"
+
+  # Chat generation model (required when llm_provider: "ollama").
+  # Pull before first use: ollama pull llama3.1:8b
+  # chat_model: "llama3.1:8b"
+
+  # HTTP timeout for chat requests (longer than embedding, seconds)
+  # chat_timeout: 120
+
+  # Sampling parameters (defaults shown)
+  # temp: 0.7
+  # top_p: 0.9
 
 # ── Memory settings ───────────────────────────────────────────────
 memory:
@@ -104,14 +143,190 @@ memory:
   search_k: 5         # memories injected per agent task
   threshold: 0.35     # cosine similarity floor (0.0-1.0)
 
+# ── PDF reference corpus (libraryfiles-corpus) ───────────────────
+# Install in the same venv: pip install -e /path/to/libraryfiles_corpus
+# Uses ollama.host / ollama.embed_model above for query-time embeddings.
+#
+# corpus:
+#   enabled: false
+#   db_path: "~/dev/libraryfiles_corpus/corpus.db"
+#   search_k: 5
+#   threshold: 0.40
+
+# ── Document ingest chunking ─────────────────────────────────────
+# When files are ingested (PDF/DOCX), they are chunked and embedded
+# into memory for semantic search. Requires the docling extra:
+#   pip install 'engineering-hub[docling]'
+# Falls back to pypdf/python-docx when docling is not installed.
+chunking:
+  enabled: true
+  max_tokens: 512     # per chunk, aligned with nomic-embed-text context
+
+# ── Docker container execution ───────────────────────────────────
+# Run agent tasks in isolated Docker containers instead of locally.
+# MLX tasks always stay on the host (requires Apple Silicon Metal).
+# Anthropic and Ollama tasks can be routed to containers.
+#
+# Quick start:
+#   docker compose up -d                                  # start Ollama service
+#   docker compose exec ollama ollama pull llama3.1:8b    # pull model
+#   engineering-hub docker build                          # build task image
+#   engineering-hub start --docker                        # run with containers
+#
+# docker:
+#   enabled: false
+#   task_image: "engineering-hub-task:latest"
+#   network: "engineering-hub-net"
+#   cpu_limit: 2.0          # CPU cores per task container
+#   memory_limit: "2g"      # Memory per task container
+#   task_timeout: 300        # Seconds before killing a task container
+#   max_concurrent: 3        # Max parallel task containers
+#   # Ollama URL as seen from inside containers (Docker Compose service name)
+#   ollama_host: "http://ollama:11434"
+
+# ── Journaler daemon (always-on ambient listener) ────────────────
+# The Journaler runs a local ~32B model, continuously monitors your
+# org-roam workspace, delivers morning briefings, and responds to
+# ad-hoc questions via HTTP chat.  Requires: pip install 'engineering-hub[mlx]'
+#
+# journaler:
+#   enabled: true
+#
+#   # HuggingFace model ID for the local MLX model.
+#   # Optional: if omitted, Journaler falls back to mlx.model_path then to a built-in default.
+#   # Pre-download before first use: engineering-hub journaler download
+#   #
+#   # Recommended options (Apple Silicon):
+#   #
+#   #   mlx-community/gemma-4-31b-it-8bit  ← default
+#   #     Gemma 4 31B instruction-tuned, 8-bit quantized (~34GB on disk, ~34GB RAM).
+#   #     VLM architecture — uses mlx-vlm automatically. 128K context window.
+#   #     Best overall quality for briefings, chat, and agentic delegation.
+#   #     Requires 64GB+ unified RAM for comfortable operation.
+#   #
+#   #   mlx-community/gemma-4-31b-it-4bit
+#   #     Same model at 4-bit (~17GB). Fits in 32GB with reduced fidelity.
+#   #
+#   #   mlx-community/Qwen3-30B-A3B-Instruct-2507-4bit
+#   #     MoE (~3B active params), fastest, lowest RAM (~32GB). Text-only (mlx-lm).
+#   #
+#   model_path: "mlx-community/gemma-4-31b-it-8bit"
+#
+#   # Named profiles (optional). When ``models`` is non-empty, ``model_profile``
+#   # selects which entry to use. Override on the CLI:
+#   #   engineering-hub journaler --profile reasoning chat
+#   #   engineering-hub journaler --model mlx-community/other-id start
+#   # In chat (CLI or HTTP): /model , /model reasoning , /model path <hf-id>
+#   #
+#   # model_profile: "default"
+#   # models:
+#   #   default:
+#   #     model_path: "mlx-community/gemma-4-31b-it-8bit"
+#   #     model_context_window: 131072
+#   #     mlx_backend: auto          # auto | mlx-lm | mlx-vlm
+#   #     enable_thinking: null       # null = omit (Gemma); true/false for Qwen3 templates
+#   #   reasoning:
+#   #     model_path: "mlx-community/Qwen3-30B-A3B-Instruct-2507-4bit"
+#   #     model_context_window: 32768
+#   #     temp: 0.6
+#   #     top_p: 0.95
+#   #     enable_thinking: true
+#
+#   # The model's actual context window in tokens.
+#   # Used by the context pressure manager to calculate utilization.
+#   # Gemma 4 31B: 131072  |  Qwen3-30B-A3B: 32768  |  Qwen2.5-32B: 32768
+#   model_context_window: 131072
+#
+#   # Scan interval for org-roam directory (minutes)
+#   scan_interval_min: 10
+#
+#   # Morning briefing schedule
+#   briefing_enabled: true
+#   briefing_time: "07:00"       # local time (HH:MM)
+#
+#   # HTTP chat endpoint
+#   chat_enabled: true
+#   chat_host: "127.0.0.1"
+#   chat_port: 18790
+#
+#   # Slack webhook (outbound only — post briefings and alerts)
+#   slack_enabled: false
+#   slack_webhook_url: ""        # or set JOURNALER_SLACK_WEBHOOK env var
+#
+#   # Conversation settings
+#   max_conversation_history: 20 # turns kept in memory
+#   max_tokens: 4096
+#
+#   # Sampling parameters (defaults shown)
+#   temp: 0.7
+#   top_p: 0.9
+#   min_p: 0.05
+#   repetition_penalty: 1.1
+#
+#   # Slash /load: how much of the *remaining* context (after system, snapshot,
+#   # history, reserved output, slack) may go to each file chunk. Uses the same
+#   # len//3 token estimate as the pressure manager.
+#   # load_max_context_fraction: 0.40   # (0, 1]; fraction of remaining tokens
+#   # load_max_chars_absolute: 200000  # hard cap per file
+#   # load_min_chars: 1024            # aim for at least this many chars when headroom allows
+#   # load_slack_tokens: 256          # extra margin subtracted from headroom
+#
+#   # ── Context management ─────────────────────────────────────────
+#   # Controls how the daemon manages its finite context window over
+#   # a full workday of conversation.  All values below are defaults.
+#   context_management:
+#     # Fraction of context window used before compression triggers (0.0–1.0)
+#     compress_at: 0.70
+#     # Fraction at which emergency trim fires if compression isn't enough
+#     emergency_trim_at: 0.90
+#     # Automatically archive old topic context when conversation topic shifts
+#     auto_clear_on_topic_shift: true
+#     # Prepend a bracketed note when the engine takes an automatic action
+#     notify_user_on_action: true
+#     # Time (HH:MM local) to run the end-of-day conversation clear
+#     end_of_day_time: "00:00"
+#     # Auto-clear conversation after N minutes of inactivity
+#     inactivity_clear_minutes: 120
+#     # Write daily conversation summaries to memory.db (requires memory.enabled)
+#     capture_daily_to_memory: false
+#     # Tokens reserved for model output (held back from utilization calc)
+#     reserved_for_generation: 4096
+#     # Override model_context_window here if different from the top-level setting
+#     # model_context_window: 32768
+#     # Rolling window limits (also controlled by max_conversation_history above)
+#     # max_history_turns: 20
+#     # max_history_tokens: 10000
+#
+#   # ── Agent delegation ──────────────────────────────────────────
+#   # The Journaler can delegate tasks inline to named agent personalities
+#   # (research, technical-writer, standards-checker, technical-reviewer)
+#   # using the /agent slash command in chat.
+#
+#   # Backend used when the Journaler delegates to an agent personality.
+#   #   "auto"   — Claude API if anthropic.api_key is present, else local MLX (default)
+#   #   "claude" — always use Claude API (requires anthropic.api_key to be set)
+#   #   "mlx"    — always use local model (reuses Journaler's loaded model, no extra RAM)
+#   # Can be overridden per-command with --backend mlx|claude in the /agent command.
+#   agent_backend: "auto"
+#
+#   # Path to skills YAML directory. Each .yaml file defines one agent delegation skill.
+#   # Drop a new .yaml here to add a delegation capability without code changes.
+#   # Default: skills/ directory at the repo root (alongside prompts/).
+#   # skills_dir: "~/org-roam/engineering-hub/skills"
+#
+#   # Anthropic API key for Claude-backed delegation.
+#   # If omitted, delegation always uses the local MLX model.
+#   # Falls back to ENGINEERING_HUB_ANTHROPIC_API_KEY environment variable if set.
+#   # anthropic_api_key: ""
+
 # Agent configurations (optional - defaults are provided)
 # agents:
 #   research:
 #     enabled: true
-#     max_tokens: 4000
+#     max_tokens: 4096
 #   technical-writer:
 #     enabled: true
-#     max_tokens: 4000
+#     max_tokens: 4096
 #   standards-checker:
 #     enabled: true
-#     max_tokens: 4000
+#     max_tokens: 4096

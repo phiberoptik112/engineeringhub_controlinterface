@@ -2,6 +2,26 @@
 # Engineering Hub Control Interface - Environment Initialization
 # Source this file to activate the virtual environment and set up the shell
 # Usage: source init.sh
+#
+# ./init.sh does NOT work: activation runs in a subprocess and your shell never gets PATH.
+
+_init_sourced=0
+if [ -n "${ZSH_VERSION:-}" ]; then
+    case ${ZSH_EVAL_CONTEXT:-} in *:file) _init_sourced=1 ;; esac
+elif [ -n "${BASH_VERSION:-}" ]; then
+    [[ "${BASH_SOURCE[0]}" != "${0}" ]] && _init_sourced=1
+fi
+if [ "$_init_sourced" -eq 0 ]; then
+    _here="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
+    printf '%s\n' \
+        "init.sh must be sourced (not run with ./init.sh)." \
+        "Otherwise the virtualenv is only active inside the script, and \`engineering-hub\` stays off PATH." \
+        "" \
+        "  source \"${_here}/init.sh\"" \
+        "  # or: . \"${_here}/init.sh\"" >&2
+    exit 1
+fi
+unset _init_sourced
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 

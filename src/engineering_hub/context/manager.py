@@ -22,6 +22,13 @@ from engineering_hub.notes.manager import SharedNotesManager
 
 if TYPE_CHECKING:
     from engineering_hub.memory.service import MemoryService
+    from engineering_hub.templates.models import ReportSkeleton
+
+# Optional corpus service (from libraryfiles_corpus package)
+try:
+    from corpus.service import CorpusService
+except ImportError:
+    CorpusService = None  # type: ignore
 
 logger = logging.getLogger(__name__)
 
@@ -38,6 +45,8 @@ class ContextManager:
         inputs_dir: Path | None = None,
         memory_service: MemoryService | None = None,
         history_notes_manager: SharedNotesManager | None = None,
+        corpus_service: "CorpusService | None" = None,
+        template_skeleton: "ReportSkeleton | None" = None,
     ) -> None:
         """Initialize context manager.
 
@@ -52,6 +61,9 @@ class ContextManager:
             history_notes_manager: Optional separate manager with a longer lookback
                 for enriching agent context with historical completed tasks. Falls
                 back to notes_manager if not provided.
+            corpus_service: Optional corpus service for PDF reference corpus context
+            template_skeleton: Optional report template skeleton for the technical
+                writer agent to follow when drafting reports.
         """
         self.django_client = django_client
         self.notes_manager = notes_manager
@@ -62,6 +74,8 @@ class ContextManager:
             Path(inputs_dir) if inputs_dir else self.workspace_dir / "inputs"
         )
         self.memory_service = memory_service
+        self.corpus_service = corpus_service
+        self.template_skeleton = template_skeleton
         self._file_ingest = FileIngestAction(output_dir=self.output_dir)
 
     def build_context(self, task: ParsedTask) -> ProjectContext:
@@ -125,6 +139,12 @@ class ContextManager:
 
             # Enrich with semantic memory from past tasks
             context = self._enrich_with_memory(context, task)
+
+            # Enrich with PDF reference corpus
+            context = self._enrich_with_corpus(context, task)
+
+            # Enrich with report template skeleton (technical writer)
+            context = self._enrich_with_template(context, task)
 
             return context
 
@@ -313,6 +333,81 @@ class ContextManager:
                 f"for: {task.description[:50]}"
             )
 
+        return context
+
+    def _enrich_with_corpus(
+        self,
+        context: ProjectContext,
+        task: ParsedTask,
+    ) -> ProjectContext:
+        """
+        Query the PDF reference corpus with the task description and inject
+        matching chunks into context.metadata for formatters to include.
+
+        Runs after _enrich_with_memory() so both blocks appear in context.
+        Corpus results are kept separate from memory results in metadata.
+        """
+        if self.corpus_service is None:
+            return context
+
+        query = task.description
+        if task.context:
+            query = f"{task.description}. {task.context}"
+
+        try:
+            results = self.corpus_service.search(query=query)
+        except Exception as e:
+            logger.warning(f"Corpus search failed (non-fatal): {e}")
+            return context
+
+        if results:
+            context.metadata["corpus_results"] = [
+                {
+                    "content": r.content,
+                    "source_file": r.source_file,
+                    "page_num": r.page_num,
+                    "section": r.section,
+                    "doc_type": r.doc_type,
+                    "similarity": r.similarity,
+                }
+                for r in results
+            ]
+            context.metadata["corpus_context_block"] = (
+                self.corpus_service.format_for_context(results)
+            )
+            logger.debug(
+                f"Injected {len(results)} corpus results "
+                f"for: {task.description[:50]}"
+            )
+
+        return context
+
+    def _enrich_with_template(
+        self,
+        context: ProjectContext,
+        task: ParsedTask,
+    ) -> ProjectContext:
+        """Inject the report template skeleton into context metadata.
+
+        Only applies to technical-writer tasks when a skeleton is loaded.
+        """
+        if self.template_skeleton is None:
+            return context
+        if task.agent_type != AgentType.TECHNICAL_WRITER:
+            return context
+
+        context.metadata["template_skeleton_block"] = (
+            self.template_skeleton.format_for_agent()
+        )
+        context.metadata["template_reference_docx"] = (
+            self.template_skeleton.reference_docx_path
+        )
+        logger.debug(
+            "Injected template skeleton '%s' (%d sections) for: %s",
+            self.template_skeleton.name,
+            len(self.template_skeleton.sections),
+            task.description[:50],
+        )
         return context
 
     def format_for_agent(self, task: ParsedTask) -> str:

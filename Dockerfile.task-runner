@@ -1,0 +1,35 @@
+# Slim image for ephemeral per-task agent containers.
+# No MLX (Apple Silicon only) — supports Anthropic and Ollama backends.
+#
+# Build:
+#   docker build -f Dockerfile.task-runner -t engineering-hub-task:latest .
+#
+# Run (example):
+#   docker run --rm \
+#     -v /tmp/payload:/task:ro -v /tmp/output:/output \
+#     -e ANTHROPIC_API_KEY=sk-... \
+#     --network engineering-hub-net \
+#     engineering-hub-task:latest
+
+FROM python:3.11-slim AS base
+
+LABEL maintainer="Engineering Hub"
+LABEL description="Ephemeral agent task runner"
+LABEL engineering-hub-task="true"
+
+RUN groupadd -r hubuser && useradd -r -g hubuser -d /home/hubuser -s /sbin/nologin hubuser
+
+WORKDIR /app
+
+COPY pyproject.toml ./
+COPY src/ ./src/
+COPY prompts/ ./prompts/
+
+RUN pip install --no-cache-dir -e . \
+    && rm -rf /root/.cache/pip
+
+RUN mkdir -p /task /output && chown hubuser:hubuser /output
+
+USER hubuser
+
+ENTRYPOINT ["python", "-m", "engineering_hub.container.task_runner"]
