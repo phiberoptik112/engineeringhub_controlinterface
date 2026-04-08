@@ -11,6 +11,7 @@ from engineering_hub.actions.file_ingest import FileIngestAction
 from engineering_hub.agents.backends import create_backend
 from engineering_hub.agents.worker import AgentWorker
 from engineering_hub.config.settings import Settings
+from engineering_hub.container.router import TaskRouter
 from engineering_hub.context.manager import ContextManager
 from engineering_hub.core.constants import TaskStatus, is_ingest_task
 from engineering_hub.core.models import ParsedTask, TaskResult
@@ -103,6 +104,9 @@ class Orchestrator:
             max_tokens=self.settings.max_tokens,
         )
 
+        # Task router (local or Docker container execution)
+        self.task_router = TaskRouter(self.settings, self.agent_worker)
+
         # Task dispatcher
         self.dispatcher = TaskDispatcher(
             notes_manager=self.notes_manager,
@@ -162,8 +166,8 @@ class Orchestrator:
         # Build context for the task
         context = self.context_manager.format_for_agent(task)
 
-        # Execute with agent
-        result = self.agent_worker.execute(task, context)
+        # Execute via router (local or Docker container)
+        result = self.task_router.execute(task, context)
 
         if result.success:
             self._capture_task_result(task, result)
@@ -501,9 +505,14 @@ class Orchestrator:
             "notes_file": str(self.settings.notes_file),
             "output_dir": str(self.settings.output_dir),
             "memory_enabled": self.memory_service is not None,
+            "docker_enabled": self.task_router.is_containerised,
         }
 
         if self.memory_service is not None:
             status["memory_stats"] = self.memory_service.get_stats()
+
+        docker_info = self.task_router.docker_status()
+        if docker_info:
+            status["docker"] = docker_info
 
         return status

@@ -1,0 +1,39 @@
+# Engineering Hub — Docker Compose
+#
+# Provides the Ollama service for container-compatible local model inference
+# and defines the shared network that ephemeral task containers join.
+#
+# Usage:
+#   docker compose up -d              # start Ollama
+#   docker compose exec ollama ollama pull llama3.1:8b   # pull a model
+#   engineering-hub docker status      # verify connectivity
+#
+# Task containers are spawned by the host-side DockerExecutor (not Compose)
+# and join the hub-net network automatically.
+
+services:
+  ollama:
+    image: ollama/ollama:latest
+    container_name: engineering-hub-ollama
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama-data:/root/.ollama
+    networks:
+      - hub-net
+    restart: unless-stopped
+    # Uncomment for NVIDIA GPU passthrough on Linux:
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: all
+    #           capabilities: [gpu]
+
+networks:
+  hub-net:
+    name: engineering-hub-net
+
+volumes:
+  ollama-data:

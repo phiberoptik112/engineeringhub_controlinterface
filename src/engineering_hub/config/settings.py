@@ -126,7 +126,8 @@ class Settings(BaseSettings):
     # LLM provider selection
     llm_provider: str = Field(
         default="anthropic",
-        description="LLM backend: 'anthropic' (cloud API) or 'mlx' (local Apple Silicon)",
+        description="LLM backend: 'anthropic' (cloud API), 'mlx' (local Apple Silicon), "
+        "or 'ollama' (local/networked Ollama server)",
     )
 
     # MLX local model settings (used when llm_provider == "mlx")
@@ -151,18 +152,69 @@ class Settings(BaseSettings):
         description="Repetition penalty for MLX generation",
     )
     mlx_max_tokens: int = Field(
-        default=4000,
+        default=4096,
         description="Default max tokens for MLX generation",
     )
 
-    # Ollama settings (local embeddings)
+    # Ollama settings (local embeddings + optional chat generation)
     ollama_host: str = Field(
         default="http://localhost:11434",
-        description="Ollama server URL for local embeddings",
+        description="Ollama server URL for embeddings and chat generation",
     )
     ollama_embed_model: str = Field(
         default="nomic-embed-text",
         description="Model to use for embeddings. Pull with: ollama pull nomic-embed-text",
+    )
+    ollama_chat_model: str = Field(
+        default="",
+        description="Ollama model for chat generation (e.g. 'llama3.1:8b'). "
+        "Required when llm_provider is 'ollama'.",
+    )
+    ollama_chat_timeout: int = Field(
+        default=120,
+        description="HTTP timeout in seconds for Ollama chat requests",
+    )
+    ollama_temp: float = Field(
+        default=0.7,
+        description="Sampling temperature for Ollama generation",
+    )
+    ollama_top_p: float = Field(
+        default=0.9,
+        description="Top-p (nucleus) sampling for Ollama generation",
+    )
+
+    # Docker container execution settings
+    docker_enabled: bool = Field(
+        default=False,
+        description="Run agent tasks in Docker containers (Anthropic/Ollama only; MLX stays on host)",
+    )
+    docker_task_image: str = Field(
+        default="engineering-hub-task:latest",
+        description="Docker image for ephemeral task containers",
+    )
+    docker_network: str = Field(
+        default="engineering-hub-net",
+        description="Docker network for task containers to reach Ollama / APIs",
+    )
+    docker_cpu_limit: float = Field(
+        default=2.0,
+        description="CPU cores allocated per task container",
+    )
+    docker_memory_limit: str = Field(
+        default="2g",
+        description="Memory limit per task container (Docker format, e.g. '2g', '512m')",
+    )
+    docker_task_timeout: int = Field(
+        default=300,
+        description="Seconds before force-stopping a task container",
+    )
+    docker_max_concurrent: int = Field(
+        default=3,
+        description="Maximum parallel task containers",
+    )
+    docker_ollama_host: str = Field(
+        default="http://ollama:11434",
+        description="Ollama URL as seen from inside task containers (Docker service name)",
     )
 
     # Memory settings
@@ -247,7 +299,7 @@ class Settings(BaseSettings):
         description="Number of conversation turns to keep in memory",
     )
     journaler_max_tokens: int = Field(
-        default=4000,
+        default=4096,
         description="Max tokens for Journaler model responses",
     )
     journaler_temp: float = Field(
@@ -471,6 +523,33 @@ class Settings(BaseSettings):
                 flat_config["ollama_host"] = ollama["host"]
             if ollama.get("embed_model"):
                 flat_config["ollama_embed_model"] = ollama["embed_model"]
+            if ollama.get("chat_model"):
+                flat_config["ollama_chat_model"] = ollama["chat_model"]
+            if ollama.get("chat_timeout") is not None:
+                flat_config["ollama_chat_timeout"] = ollama["chat_timeout"]
+            if ollama.get("temp") is not None:
+                flat_config["ollama_temp"] = ollama["temp"]
+            if ollama.get("top_p") is not None:
+                flat_config["ollama_top_p"] = ollama["top_p"]
+
+        if "docker" in config:
+            docker = config["docker"]
+            if docker.get("enabled") is not None:
+                flat_config["docker_enabled"] = docker["enabled"]
+            if docker.get("task_image"):
+                flat_config["docker_task_image"] = docker["task_image"]
+            if docker.get("network"):
+                flat_config["docker_network"] = docker["network"]
+            if docker.get("cpu_limit") is not None:
+                flat_config["docker_cpu_limit"] = docker["cpu_limit"]
+            if docker.get("memory_limit"):
+                flat_config["docker_memory_limit"] = docker["memory_limit"]
+            if docker.get("task_timeout") is not None:
+                flat_config["docker_task_timeout"] = docker["task_timeout"]
+            if docker.get("max_concurrent") is not None:
+                flat_config["docker_max_concurrent"] = docker["max_concurrent"]
+            if docker.get("ollama_host"):
+                flat_config["docker_ollama_host"] = docker["ollama_host"]
 
         if "llm_provider" in config:
             flat_config["llm_provider"] = config["llm_provider"]

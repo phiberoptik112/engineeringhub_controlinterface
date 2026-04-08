@@ -80,6 +80,7 @@ def test_load_directory_shares_budget(tmp_path: Path) -> None:
         "x",
         log_dir,
         max_history=2,
+        max_tokens=256,
         model_context_window=2500,
         load_file_budget=budget,
     )
@@ -100,7 +101,9 @@ def test_clear_loaded_files_resets_budget(tmp_path: Path) -> None:
     backend = MagicMock()
     log_dir = tmp_path / "log"
     log_dir.mkdir()
-    engine = ConversationEngine(backend, "s", log_dir, model_context_window=4096)
+    engine = ConversationEngine(
+        backend, "s", log_dir, model_context_window=4096, max_tokens=512
+    )
     p = tmp_path / "f.md"
     p.write_text("hello", encoding="utf-8")
     engine.load_file(p, extensions=frozenset({".md"}))

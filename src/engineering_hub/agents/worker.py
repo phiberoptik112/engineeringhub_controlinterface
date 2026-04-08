@@ -21,7 +21,7 @@ class AgentWorker:
         backend: LLMBackend,
         prompts_dir: Path | None = None,
         output_dir: Path | None = None,
-        max_tokens: int = 4000,
+        max_tokens: int = 4096,
     ) -> None:
         self._backend = backend
         self.max_tokens = max_tokens
@@ -37,7 +37,7 @@ class AgentWorker:
         model: str = "claude-sonnet-4-5-20250929",
         prompts_dir: Path | None = None,
         output_dir: Path | None = None,
-        max_tokens: int = 4000,
+        max_tokens: int = 4096,
     ) -> "AgentWorker":
         """Convenience constructor that creates an AnthropicBackend internally."""
         backend = AnthropicBackend(api_key=api_key, model=model)

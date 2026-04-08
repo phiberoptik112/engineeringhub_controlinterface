@@ -5,6 +5,7 @@
 # Choose which backend agents use for text generation:
 #   "anthropic" — Claude API (default, requires api_key)
 #   "mlx"       — Local Apple Silicon inference via mlx-lm
+#   "ollama"    — Local/networked Ollama server (works in Docker containers)
 llm_provider: "anthropic"
 
 django:
@@ -112,15 +113,29 @@ staging:
 #   top_p: 0.9
 #   min_p: 0.05
 #   repetition_penalty: 1.1
-#   max_tokens: 4000
+#   max_tokens: 4096
 
-# ── Local embeddings ──────────────────────────────────────────────
+# ── Ollama (local embeddings + optional chat generation) ─────────
+# The same Ollama instance serves both embedding and chat generation.
+# Chat generation is used when llm_provider is "ollama" (above).
 ollama:
   host: "http://localhost:11434"
-  # Pull the model once before first use:
+
+  # Pull embedding model once before first use:
   #   ollama pull nomic-embed-text     (274MB, 768-dim, fast)
   #   ollama pull mxbai-embed-large    (670MB, 1024-dim, higher quality)
   embed_model: "nomic-embed-text"
+
+  # Chat generation model (required when llm_provider: "ollama").
+  # Pull before first use: ollama pull llama3.1:8b
+  # chat_model: "llama3.1:8b"
+
+  # HTTP timeout for chat requests (longer than embedding, seconds)
+  # chat_timeout: 120
+
+  # Sampling parameters (defaults shown)
+  # temp: 0.7
+  # top_p: 0.9
 
 # ── Memory settings ───────────────────────────────────────────────
 memory:
@@ -146,6 +161,28 @@ memory:
 chunking:
   enabled: true
   max_tokens: 512     # per chunk, aligned with nomic-embed-text context
+
+# ── Docker container execution ───────────────────────────────────
+# Run agent tasks in isolated Docker containers instead of locally.
+# MLX tasks always stay on the host (requires Apple Silicon Metal).
+# Anthropic and Ollama tasks can be routed to containers.
+#
+# Quick start:
+#   docker compose up -d                                  # start Ollama service
+#   docker compose exec ollama ollama pull llama3.1:8b    # pull model
+#   engineering-hub docker build                          # build task image
+#   engineering-hub start --docker                        # run with containers
+#
+# docker:
+#   enabled: false
+#   task_image: "engineering-hub-task:latest"
+#   network: "engineering-hub-net"
+#   cpu_limit: 2.0          # CPU cores per task container
+#   memory_limit: "2g"      # Memory per task container
+#   task_timeout: 300        # Seconds before killing a task container
+#   max_concurrent: 3        # Max parallel task containers
+#   # Ollama URL as seen from inside containers (Docker Compose service name)
+#   ollama_host: "http://ollama:11434"
 
 # ── Journaler daemon (always-on ambient listener) ────────────────
 # The Journaler runs a local ~32B model, continuously monitors your
@@ -218,7 +255,7 @@ chunking:
 #
 #   # Conversation settings
 #   max_conversation_history: 20 # turns kept in memory
-#   max_tokens: 4000
+#   max_tokens: 4096
 #
 #   # Sampling parameters (defaults shown)
 #   temp: 0.7
@@ -253,7 +290,7 @@ chunking:
 #     # Write daily conversation summaries to memory.db (requires memory.enabled)
 #     capture_daily_to_memory: false
 #     # Tokens reserved for model output (held back from utilization calc)
-#     reserved_for_generation: 2000
+#     reserved_for_generation: 4096
 #     # Override model_context_window here if different from the top-level setting
 #     # model_context_window: 32768
 #     # Rolling window limits (also controlled by max_conversation_history above)
@@ -286,10 +323,10 @@ chunking:
 # agents:
 #   research:
 #     enabled: true
-#     max_tokens: 4000
+#     max_tokens: 4096
 #   technical-writer:
 #     enabled: true
-#     max_tokens: 4000
+#     max_tokens: 4096
 #   standards-checker:
 #     enabled: true
-#     max_tokens: 4000
+#     max_tokens: 4096

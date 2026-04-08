@@ -30,7 +30,7 @@ class JournalerModelSpec:
 
     model_path: str
     model_context_window: int = 32768
-    max_tokens: int = 4000
+    max_tokens: int = 4096
     temp: float = 0.7
     top_p: float = 0.9
     min_p: float = 0.05

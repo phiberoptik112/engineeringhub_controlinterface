@@ -70,7 +70,7 @@ class JournalerConfig:
     max_context_tokens: int = 4000
     max_briefing_tokens: int = 8000
     max_conversation_history: int = 20
-    max_tokens: int = 4000
+    max_tokens: int = 4096
 
     # Context management
     model_context_window: int = 32768

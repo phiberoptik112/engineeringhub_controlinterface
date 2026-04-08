@@ -2,6 +2,7 @@
 
 import argparse
 import logging
+import shlex
 import sys
 from datetime import date
 from pathlib import Path
@@ -34,6 +35,256 @@ console = Console()
 
 class JournalerChatExit(Exception):
     """Raised to leave the interactive journaler chat loop (e.g. /exit)."""
+
+
+class _ExportSlashHelp(Exception):
+    """Print /export usage in chat (not an error)."""
+
+
+def _export_slash_usage() -> str:
+    return (
+        "/export — same as `engineering-hub journaler export` (transcript → org).\n\n"
+        "Examples:\n"
+        "  /export\n"
+        "  /export --summarize\n"
+        "  /export -o ~/org-roam/exports/chat.org\n"
+        "  /export --note ~/org-roam/note.org --heading \"Journaler capture\"\n"
+        "  /export --find-title \"Phase B\" --heading \"Journaler capture\"\n"
+        "  /export --new-node \"Chat export 2026-04-07\"\n\n"
+        "Flags:\n"
+        "  --jsonl PATH    transcript (default: .journaler/conversation.jsonl)\n"
+        "  --summarize     MLX: * Summary + * Open TODOs (loads model)\n"
+        "  -o, --output    write org body to file\n"
+        "  --note PATH     append under --heading\n"
+        "  --heading TEXT  (default: Journaler export)\n"
+        "  --find-title    match single #+title: under org-roam\n"
+        "  --new-node      create roam node with this title\n"
+        "  --help          this text\n"
+    )
+
+
+def _parse_slash_export_args(raw: str) -> argparse.Namespace:
+    """Parse `/export ...` using shell-like quoting (see :func:`shlex.split`)."""
+    try:
+        tokens = shlex.split(raw, posix=True)
+    except ValueError as exc:
+        raise ValueError(str(exc)) from exc
+    if not tokens or tokens[0] != "/export":
+        raise ValueError("expected /export")
+    if len(tokens) == 2 and tokens[1] in ("--help", "-h", "help"):
+        raise _ExportSlashHelp()
+    ns = argparse.Namespace(
+        jsonl=None,
+        summarize=False,
+        export_format="raw",
+        output=None,
+        note=None,
+        heading="Journaler export",
+        find_title=None,
+        new_node=None,
+    )
+    i = 1
+    while i < len(tokens):
+        t = tokens[i]
+        if t == "--summarize":
+            ns.summarize = True
+            i += 1
+        elif t == "--format":
+            i += 1
+            if i >= len(tokens):
+                raise ValueError("--format requires a value")
+            if tokens[i] != "raw":
+                raise ValueError("only --format raw is supported")
+            ns.export_format = "raw"
+            i += 1
+        elif t == "--jsonl":
+            i += 1
+            if i >= len(tokens):
+                raise ValueError("--jsonl requires a path")
+            ns.jsonl = tokens[i]
+            i += 1
+        elif t in ("-o", "--output"):
+            i += 1
+            if i >= len(tokens):
+                raise ValueError(f"{t} requires a path")
+            ns.output = tokens[i]
+            i += 1
+        elif t == "--note":
+            i += 1
+            if i >= len(tokens):
+                raise ValueError("--note requires a path")
+            ns.note = tokens[i]
+            i += 1
+        elif t == "--heading":
+            i += 1
+            if i >= len(tokens):
+                raise ValueError("--heading requires text")
+            ns.heading = tokens[i]
+            i += 1
+        elif t == "--find-title":
+            i += 1
+            if i >= len(tokens):
+                raise ValueError("--find-title requires a fragment")
+            ns.find_title = tokens[i]
+            i += 1
+        elif t == "--new-node":
+            i += 1
+            if i >= len(tokens):
+                raise ValueError("--new-node requires a title")
+            ns.new_node = tokens[i]
+            i += 1
+        else:
+            raise ValueError(
+                f"unknown argument {t!r} — type `/export --help` for usage"
+            )
+    return ns
+
+
+def _execute_journaler_export(
+    args: argparse.Namespace,
+    *,
+    settings: Settings,
+    config: object,
+    spec: object,
+    log: Console,
+    body_to_stdout: bool,
+) -> int:
+    """Shared implementation for `journaler export` CLI and `/export` in chat.
+
+    When *body_to_stdout* is False, the export body is printed with Rich markup
+    escaped (interactive chat). When True, raw body is written to sys.stdout
+    if no file/note/new-node target consumed it.
+    """
+    from engineering_hub.journaler.conversation_export import (
+        build_summarize_prompt,
+        load_transcript,
+        postprocess_model_org,
+        render_raw_org,
+        transcript_to_plain_text,
+    )
+    from engineering_hub.journaler.engine import ConversationEngine
+    from engineering_hub.journaler.org_writer import (
+        append_to_heading,
+        create_org_node,
+        find_org_by_title,
+    )
+
+    note_path_str = getattr(args, "note", None)
+    find_title = getattr(args, "find_title", None)
+    new_node_title = getattr(args, "new_node", None)
+    summarize = getattr(args, "summarize", False)
+    heading = (getattr(args, "heading", None) or "Journaler export").strip() or "Journaler export"
+    jsonl_override = getattr(args, "jsonl", None)
+    output_path = getattr(args, "output", None)
+    export_format = getattr(args, "export_format", None) or "raw"
+
+    if note_path_str and find_title:
+        log.print("[red]Error:[/red] Use either --note or --find-title, not both.")
+        return 1
+    if new_node_title and (note_path_str or find_title):
+        log.print(
+            "[red]Error:[/red] --new-node cannot be combined with --note or --find-title."
+        )
+        return 1
+
+    state_dir = settings.journaler_state_dir
+    jsonl_path = (
+        Path(jsonl_override).expanduser().resolve()
+        if jsonl_override
+        else state_dir / "conversation.jsonl"
+    )
+
+    if not jsonl_path.is_file():
+        log.print(f"[yellow]No transcript at {jsonl_path}[/yellow]")
+        return 0
+
+    turns = load_transcript(jsonl_path)
+    if not turns:
+        log.print("[dim]Transcript is empty; nothing to export.[/dim]")
+        return 0
+
+    org_roam_dir = settings.org_journal_dir.parent
+
+    if summarize:
+        log.print("[bold]Loading model for summarized export...[/bold]")
+        backend = build_journaler_mlx_backend(spec)
+        engine = ConversationEngine(
+            backend=backend,
+            system_prompt="You format chat transcripts into Emacs org mode.",
+            log_dir=state_dir,
+            max_tokens=getattr(spec, "max_tokens", 4096),
+            pressure_config=config.get_pressure_config(),
+            model_context_window=getattr(spec, "model_context_window", 32768),
+            corpus_service=getattr(config, "corpus_service", None),
+            load_file_budget=config.get_load_file_budget(),
+        )
+        prompt = build_summarize_prompt(transcript_to_plain_text(turns))
+        cap = min(1200, getattr(spec, "max_tokens", 4096))
+        raw_out = engine._raw_complete(prompt, cap)
+        body = postprocess_model_org(raw_out)
+    else:
+        if export_format != "raw":
+            log.print(f"[red]Error:[/red] Unknown export format {export_format!r}.")
+            return 1
+        body = render_raw_org(turns)
+
+    target_note_resolved: Path | None = None
+    if find_title:
+        ok, matches = find_org_by_title(org_roam_dir, find_title)
+        if not ok:
+            log.print(f"[red]Error:[/red] Could not search org-roam in {org_roam_dir}")
+            return 1
+        if len(matches) == 0:
+            log.print(f"[yellow]No note with #+title containing {find_title!r}[/yellow]")
+            return 1
+        if len(matches) > 1:
+            log.print(
+                f"[red]Error:[/red] Title fragment {find_title!r} matched multiple notes:"
+            )
+            for p in matches:
+                log.print(f"  {p}")
+            return 1
+        target_note_resolved = matches[0]
+
+    if note_path_str:
+        target_note_resolved = Path(note_path_str).expanduser().resolve()
+
+    wrote_file = False
+    if new_node_title:
+        ok, msg = create_org_node(org_roam_dir, new_node_title, body=body)
+        if ok:
+            log.print(f"[green]{escape(msg)}[/green]")
+        else:
+            log.print(f"[red]{escape(msg)}[/red]")
+            return 1
+        wrote_file = True
+    elif target_note_resolved is not None:
+        ok, msg = append_to_heading(
+            target_note_resolved,
+            heading,
+            body,
+            create_heading_if_missing=True,
+        )
+        color = "green" if ok else "red"
+        log.print(f"[{color}]{escape(msg)}[/{color}]")
+        if not ok:
+            return 1
+        wrote_file = True
+
+    if output_path:
+        outp = Path(output_path).expanduser().resolve()
+        outp.parent.mkdir(parents=True, exist_ok=True)
+        outp.write_text(body, encoding="utf-8")
+        log.print(f"[dim]Wrote {outp}[/dim]")
+        wrote_file = True
+
+    if not wrote_file:
+        if body_to_stdout:
+            sys.stdout.write(body)
+        else:
+            log.print(escape(body))
+
+    return 0
 
 
 def setup_logging(verbose: bool = False) -> None:
@@ -74,12 +325,30 @@ def _validate_llm_settings(settings: Settings) -> int | None:
             "Set mlx.model_path in config or ENGINEERING_HUB_MLX_MODEL_PATH."
         )
         return 1
+    if provider == "ollama" and not settings.ollama_chat_model:
+        console.print(
+            "[red]Error:[/red] Ollama chat model not set. "
+            "Set ollama.chat_model in config (e.g. 'llama3.1:8b')."
+        )
+        return 1
     return None
+
+
+def _apply_cli_overrides(settings: Settings, args: argparse.Namespace) -> Settings:
+    """Apply CLI flag overrides (--docker, --llm-provider) to settings."""
+    overrides: dict = {}
+    if getattr(args, "docker", None) is not None:
+        overrides["docker_enabled"] = args.docker
+    if getattr(args, "llm_provider_override", None):
+        overrides["llm_provider"] = args.llm_provider_override
+    if not overrides:
+        return settings
+    return settings.model_copy(update=overrides)
 
 
 def cmd_start(args: argparse.Namespace) -> int:
     """Start the orchestrator."""
-    settings = load_settings(args.config)
+    settings = _apply_cli_overrides(load_settings(args.config), args)
 
     if err := _validate_llm_settings(settings):
         return err
@@ -109,8 +378,13 @@ def cmd_start(args: argparse.Namespace) -> int:
     console.print(f"  Provider: {provider}")
     if provider == "mlx":
         console.print(f"  MLX Model: {settings.mlx_model_path}")
+    elif provider == "ollama":
+        console.print(f"  Ollama Model: {settings.ollama_chat_model}")
+        console.print(f"  Ollama Host: {settings.ollama_host}")
     else:
         console.print(f"  Model: {settings.anthropic_model}")
+    if settings.docker_enabled:
+        console.print(f"  Docker: enabled (image={settings.docker_task_image})")
     console.print(f"  Notes: {settings.notes_file}")
     console.print(f"  Outputs: {settings.output_dir}")
 
@@ -194,7 +468,7 @@ def cmd_status(args: argparse.Namespace) -> int:
 
 def cmd_run_once(args: argparse.Namespace) -> int:
     """Run once to process all pending tasks, then exit."""
-    settings = load_settings(args.config)
+    settings = _apply_cli_overrides(load_settings(args.config), args)
 
     if err := _validate_llm_settings(settings):
         return err
@@ -269,7 +543,7 @@ django:
 anthropic:
   # api_key: "your-key-here"  # Or set ENGINEERING_HUB_ANTHROPIC_API_KEY
   model: "claude-sonnet-4-5-20250929"
-  max_tokens: 4000
+  max_tokens: 4096
 
 workspace:
   dir: "{workspace}"
@@ -431,6 +705,9 @@ def _handle_chat_slash_command(
     journaler_model_ctx: object | None = None,
     journal_ctx: object | None = None,
     delegator: object | None = None,
+    export_settings: Settings | None = None,
+    export_config: object | None = None,
+    export_spec: object | None = None,
 ) -> None:
     """Intercept and execute a /slash command from the journaler chat loop.
 
@@ -451,6 +728,7 @@ def _handle_chat_slash_command(
       /edit <heading> :: <text>  Append under a heading in the /open target.
       /exit, /quit               Leave the chat (same as bare exit, quit, or :q).
       /agent … /skills           Delegate to agent personalities (when delegator is configured).
+      /export …                  Export conversation.jsonl to org (same flags as journaler export).
       /model                     Show model, or switch profile / path (see /help).
       /help                      Show available slash commands.
     """
@@ -509,6 +787,30 @@ def _handle_chat_slash_command(
         chat_console.print(f"[green]{escape(msg)}[/green]")
         return
 
+    if cmd == "/export":
+        if export_settings is None or export_config is None or export_spec is None:
+            chat_console.print(
+                "[yellow]/export requires workspace config; if you see this, file a bug.[/yellow]"
+            )
+            return
+        try:
+            ex_args = _parse_slash_export_args(raw)
+        except _ExportSlashHelp:
+            chat_console.print(_export_slash_usage())
+            return
+        except ValueError as exc:
+            chat_console.print(f"[red]{escape(str(exc))}[/red]")
+            return
+        _execute_journaler_export(
+            ex_args,
+            settings=export_settings,
+            config=export_config,
+            spec=export_spec,
+            log=chat_console,
+            body_to_stdout=False,
+        )
+        return
+
     if cmd == "/help":
         write_cmds = (
             "\n  [bold]File operations (requires org-roam dir):[/bold]\n"
@@ -541,6 +843,7 @@ def _handle_chat_slash_command(
             "  [cyan]/topic[/cyan]                     Show currently detected conversation topic\n"
             "  [cyan]/agent <type> <desc>[/cyan]      Delegate to a named agent (see README)\n"
             "  [cyan]/skills[/cyan]                    List agent delegation skills / personas\n"
+            "  [cyan]/export[/cyan]                    Export transcript (`/export --help`)\n"
             + write_cmds +
             "  [cyan]/exit[/cyan], [cyan]/quit[/cyan]          Leave chat (or type exit, quit, :q)\n"
             "  [cyan]/help[/cyan]                      Show this help\n"
@@ -1021,6 +1324,9 @@ def cmd_journaler(args: argparse.Namespace) -> int:
                             journaler_model_ctx=chat_model_ctx,
                             journal_ctx=ctx,
                             delegator=delegator,
+                            export_settings=settings,
+                            export_config=config,
+                            export_spec=spec,
                         )
                     except JournalerChatExit:
                         break
@@ -1193,134 +1499,14 @@ def cmd_journaler(args: argparse.Namespace) -> int:
         return 0
 
     elif sub == "export":
-        from engineering_hub.journaler.conversation_export import (
-            build_summarize_prompt,
-            load_transcript,
-            postprocess_model_org,
-            render_raw_org,
-            transcript_to_plain_text,
+        return _execute_journaler_export(
+            args,
+            settings=settings,
+            config=config,
+            spec=spec,
+            log=console,
+            body_to_stdout=True,
         )
-        from engineering_hub.journaler.engine import ConversationEngine
-        from engineering_hub.journaler.org_writer import (
-            append_to_heading,
-            create_org_node,
-            find_org_by_title,
-        )
-
-        note_path_str = getattr(args, "note", None)
-        find_title = getattr(args, "find_title", None)
-        new_node_title = getattr(args, "new_node", None)
-        summarize = getattr(args, "summarize", False)
-        heading = (getattr(args, "heading", None) or "Journaler export").strip() or "Journaler export"
-        jsonl_override = getattr(args, "jsonl", None)
-        output_path = getattr(args, "output", None)
-        export_format = getattr(args, "export_format", None) or "raw"
-
-        if note_path_str and find_title:
-            console.print("[red]Error:[/red] Use either --note or --find-title, not both.")
-            return 1
-        if new_node_title and (note_path_str or find_title):
-            console.print(
-                "[red]Error:[/red] --new-node cannot be combined with --note or --find-title."
-            )
-            return 1
-
-        jsonl_path = (
-            Path(jsonl_override).expanduser().resolve()
-            if jsonl_override
-            else settings.journaler_state_dir / "conversation.jsonl"
-        )
-
-        if not jsonl_path.is_file():
-            console.print(f"[yellow]No transcript at {jsonl_path}[/yellow]")
-            return 0
-
-        turns = load_transcript(jsonl_path)
-        if not turns:
-            console.print("[dim]Transcript is empty; nothing to export.[/dim]")
-            return 0
-
-        if summarize:
-            console.print("[bold]Loading model for summarized export...[/bold]")
-            backend = build_journaler_mlx_backend(spec)
-            engine = ConversationEngine(
-                backend=backend,
-                system_prompt="You format chat transcripts into Emacs org mode.",
-                log_dir=config.state_dir,
-                max_tokens=config.max_tokens,
-                pressure_config=config.get_pressure_config(),
-                model_context_window=config.model_context_window,
-                corpus_service=config.corpus_service,
-                load_file_budget=config.get_load_file_budget(),
-            )
-            prompt = build_summarize_prompt(transcript_to_plain_text(turns))
-            cap = min(1200, config.max_tokens)
-            raw_out = engine._raw_complete(prompt, cap)
-            body = postprocess_model_org(raw_out)
-        else:
-            if export_format != "raw":
-                console.print(f"[red]Error:[/red] Unknown export format {export_format!r}.")
-                return 1
-            body = render_raw_org(turns)
-
-        target_note_resolved: Path | None = None
-        if find_title:
-            ok, matches = find_org_by_title(config.org_roam_dir, find_title)
-            if not ok:
-                console.print(
-                    f"[red]Error:[/red] Could not search org-roam in {config.org_roam_dir}"
-                )
-                return 1
-            if len(matches) == 0:
-                console.print(
-                    f"[yellow]No note with #+title containing {find_title!r}[/yellow]"
-                )
-                return 1
-            if len(matches) > 1:
-                console.print(
-                    f"[red]Error:[/red] Title fragment {find_title!r} matched multiple notes:"
-                )
-                for p in matches:
-                    console.print(f"  {p}")
-                return 1
-            target_note_resolved = matches[0]
-
-        if note_path_str:
-            target_note_resolved = Path(note_path_str).expanduser().resolve()
-
-        wrote_file = False
-        if new_node_title:
-            ok, msg = create_org_node(config.org_roam_dir, new_node_title, body=body)
-            if ok:
-                console.print(f"[green]{escape(msg)}[/green]")
-            else:
-                console.print(f"[red]{escape(msg)}[/red]")
-                return 1
-            wrote_file = True
-        elif target_note_resolved is not None:
-            ok, msg = append_to_heading(
-                target_note_resolved,
-                heading,
-                body,
-                create_heading_if_missing=True,
-            )
-            color = "green" if ok else "red"
-            console.print(f"[{color}]{escape(msg)}[/{color}]")
-            if not ok:
-                return 1
-            wrote_file = True
-
-        if output_path:
-            outp = Path(output_path).expanduser().resolve()
-            outp.parent.mkdir(parents=True, exist_ok=True)
-            outp.write_text(body, encoding="utf-8")
-            console.print(f"[dim]Wrote {outp}[/dim]")
-            wrote_file = True
-
-        if not wrote_file:
-            sys.stdout.write(body)
-
-        return 0
 
     console.print("[yellow]Unknown journaler command.[/yellow]")
     return 1
@@ -1546,6 +1732,69 @@ def cmd_memory(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_docker(args: argparse.Namespace) -> int:
+    """Docker container management commands."""
+    sub = getattr(args, "docker_command", None)
+    if sub is None:
+        console.print("[yellow]Usage:[/yellow] engineering-hub docker {build|status|prune}")
+        return 0
+
+    setup_logging(args.verbose)
+    settings = load_settings(args.config)
+
+    from engineering_hub.container.docker_executor import DockerExecutor, DockerExecutorError
+
+    if sub == "build":
+        try:
+            executor = DockerExecutor(settings)
+            context_dir = Path.cwd()
+            console.print(f"[bold]Building image {settings.docker_task_image}...[/bold]")
+            executor.build_image(context_dir)
+            console.print(f"[green]Image built successfully: {settings.docker_task_image}[/green]")
+            return 0
+        except DockerExecutorError as e:
+            console.print(f"[red]Error:[/red] {e}")
+            return 1
+        except Exception as e:
+            console.print(f"[red]Build failed:[/red] {e}")
+            return 1
+
+    if sub == "status":
+        executor = DockerExecutor(settings)
+        info = executor.status()
+
+        table = Table(title="Docker Status")
+        table.add_column("Key", style="cyan")
+        table.add_column("Value")
+
+        table.add_row("Image", info.get("image", "n/a"))
+        table.add_row("Image available", str(info.get("image_available", False)))
+        if info.get("image_size"):
+            table.add_row("Image size", info["image_size"])
+        table.add_row("Network", info.get("network", "n/a"))
+        table.add_row("Provider", info.get("provider", "n/a"))
+        table.add_row("Max concurrent", str(info.get("max_concurrent", "n/a")))
+
+        running = info.get("running_containers", [])
+        table.add_row("Running containers", str(len(running)))
+        for c in running:
+            table.add_row(f"  {c['name']}", c.get("status", ""))
+
+        console.print(table)
+        return 0
+
+    if sub == "prune":
+        executor = DockerExecutor(settings)
+        console.print("[bold]Pruning stopped task containers...[/bold]")
+        output = executor.prune_containers()
+        if output:
+            console.print(output)
+        console.print("[green]Done.[/green]")
+        return 0
+
+    return 0
+
+
 def cmd_load(args: argparse.Namespace) -> int:
     """Load a file or directory into the persistent memory store."""
     setup_logging(args.verbose)
@@ -1647,6 +1896,19 @@ def main() -> int:
 
     # start command
     start_parser = subparsers.add_parser("start", help="Start the orchestrator")
+    start_parser.add_argument(
+        "--docker", action="store_true", default=None,
+        help="Run agent tasks in Docker containers (overrides docker.enabled in config)",
+    )
+    start_parser.add_argument(
+        "--no-docker", action="store_false", dest="docker",
+        help="Force local execution even if docker.enabled is true",
+    )
+    start_parser.add_argument(
+        "--llm-provider", dest="llm_provider_override",
+        choices=["anthropic", "mlx", "ollama"],
+        help="Override llm_provider from config",
+    )
 
     # status command
     status_parser = subparsers.add_parser("status", help="Show status")
@@ -1655,6 +1917,19 @@ def main() -> int:
     run_parser = subparsers.add_parser(
         "run-once",
         help="Process pending tasks once and exit",
+    )
+    run_parser.add_argument(
+        "--docker", action="store_true", default=None,
+        help="Run agent tasks in Docker containers",
+    )
+    run_parser.add_argument(
+        "--no-docker", action="store_false", dest="docker",
+        help="Force local execution",
+    )
+    run_parser.add_argument(
+        "--llm-provider", dest="llm_provider_override",
+        choices=["anthropic", "mlx", "ollama"],
+        help="Override llm_provider from config",
     )
 
     # init command
@@ -1863,6 +2138,15 @@ def main() -> int:
         help="Create a new org-roam node with this #+title and export as body",
     )
 
+    # docker command
+    docker_parser = subparsers.add_parser(
+        "docker", help="Docker container management for agent tasks"
+    )
+    docker_sub = docker_parser.add_subparsers(dest="docker_command")
+    docker_sub.add_parser("build", help="Build the task runner Docker image")
+    docker_sub.add_parser("status", help="Show Docker image and container status")
+    docker_sub.add_parser("prune", help="Remove stopped task containers")
+
     # load command
     load_parser = subparsers.add_parser(
         "load",
@@ -1919,6 +2203,7 @@ def main() -> int:
         "mcp-server": cmd_mcp_server,
         "template": cmd_template,
         "journaler": cmd_journaler,
+        "docker": cmd_docker,
         "load": cmd_load,
         "memory": cmd_memory,
         "weekly-review": cmd_weekly_review,

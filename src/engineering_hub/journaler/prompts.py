@@ -129,6 +129,11 @@ You can tell the user about these commands; the user types them directly:
 
   /skills                      List all available agent delegation skills with
                                descriptions and example invocations.
+
+  /export [flags]              Export conversation.jsonl to org (same as CLI
+                               `journaler export`): --summarize, -o PATH,
+                               --note, --heading, --find-title, --new-node, --jsonl.
+                               Type `/export --help` for the full list.
 """
 
 BRIEFING_PROMPT = """\

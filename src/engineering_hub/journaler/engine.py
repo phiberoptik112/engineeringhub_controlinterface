@@ -326,7 +326,7 @@ class ConversationEngine:
         system_prompt: str,
         log_dir: Path,
         max_history: int = 20,
-        max_tokens: int = 4000,
+        max_tokens: int = 4096,
         pressure_config: PressureConfig | None = None,
         model_context_window: int = 32768,
         corpus_service: CorpusService | None = None,
@@ -351,6 +351,7 @@ class ConversationEngine:
             max_turns=cfg.max_history_turns,
             max_tokens=cfg.max_history_tokens,
         )
+        reserved_gen = max(cfg.reserved_for_generation, max_tokens)
         self.budget = TokenBudget(
             window_size=cfg.model_context_window,
             system_prompt_tokens=estimate_tokens(system_prompt),
@@ -358,7 +359,7 @@ class ConversationEngine:
             history_tokens=0,
             loaded_files_tokens=0,
             corpus_injection_tokens=0,
-            reserved_for_generation=cfg.reserved_for_generation,
+            reserved_for_generation=reserved_gen,
         )
         self.compressor = ContextCompressor(
             engine_call=self._raw_complete,
@@ -397,6 +398,9 @@ class ConversationEngine:
         self._backend = backend
         if max_tokens is not None:
             self._max_tokens = max_tokens
+            self.budget.reserved_for_generation = max(
+                self._pressure_config.reserved_for_generation, max_tokens
+            )
         if model_context_window is not None:
             self._pressure_config.model_context_window = model_context_window
             self.budget.window_size = model_context_window

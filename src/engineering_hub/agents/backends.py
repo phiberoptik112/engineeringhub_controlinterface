@@ -1,7 +1,7 @@
 """LLM backend abstraction layer.
 
 Provides a Protocol-based interface so AgentWorker can use either the
-Anthropic API or local MLX models transparently.
+Anthropic API, local MLX models, or a remote Ollama server transparently.
 """
 
 from __future__ import annotations
@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 import anthropic
+import requests
 
 from engineering_hub.core.exceptions import LLMBackendError
 
@@ -153,6 +154,83 @@ class MLXBackend:
         return self._model is not None
 
 
+@dataclass
+class OllamaSamplingConfig:
+    """Sampling parameters for Ollama generation."""
+
+    temp: float = 0.7
+    top_p: float = 0.9
+
+
+class OllamaBackend:
+    """Wraps the Ollama /api/chat HTTP endpoint for local or networked inference.
+
+    Works on any platform (Linux, macOS, Docker containers) — only needs
+    network access to a running Ollama instance.
+    """
+
+    def __init__(
+        self,
+        host: str = "http://localhost:11434",
+        model: str = "llama3.1:8b",
+        timeout: int = 120,
+        sampling: OllamaSamplingConfig | None = None,
+    ) -> None:
+        self._host = host.rstrip("/")
+        self._model = model
+        self._timeout = timeout
+        self._sampling = sampling or OllamaSamplingConfig()
+
+    def complete(self, system: str, user_message: str, max_tokens: int) -> str:
+        messages = [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user_message},
+        ]
+        payload: dict = {
+            "model": self._model,
+            "messages": messages,
+            "stream": False,
+            "options": {
+                "num_predict": max_tokens,
+                "temperature": self._sampling.temp,
+                "top_p": self._sampling.top_p,
+            },
+        }
+        try:
+            resp = requests.post(
+                f"{self._host}/api/chat",
+                json=payload,
+                timeout=self._timeout,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            return data.get("message", {}).get("content", "")
+        except requests.ConnectionError as exc:
+            raise LLMBackendError(
+                f"Cannot reach Ollama at {self._host}. Start it with: ollama serve",
+                provider="ollama",
+            ) from exc
+        except requests.HTTPError as exc:
+            raise LLMBackendError(
+                f"Ollama HTTP error {resp.status_code}: {resp.text[:300]}",
+                provider="ollama",
+            ) from exc
+        except Exception as exc:
+            raise LLMBackendError(
+                f"Ollama generation failed: {exc}",
+                provider="ollama",
+            ) from exc
+
+    def test_connection(self) -> bool:
+        try:
+            resp = requests.get(f"{self._host}/api/tags", timeout=5)
+            models = [m["name"] for m in resp.json().get("models", [])]
+            return any(self._model in m for m in models)
+        except Exception as exc:
+            logger.error(f"Ollama connection test failed: {exc}")
+            return False
+
+
 def create_backend(settings: Settings) -> LLMBackend:
     """Factory: build the appropriate LLM backend from application settings."""
     provider = settings.llm_provider.lower()
@@ -184,6 +262,24 @@ def create_backend(settings: Settings) -> LLMBackend:
         )
         return MLXBackend(model_path=settings.mlx_model_path, sampling=sampling)
 
+    if provider == "ollama":
+        if not settings.ollama_chat_model:
+            raise LLMBackendError(
+                "ollama.chat_model is required when llm_provider is 'ollama'. "
+                "Set it to an Ollama model tag (e.g. 'llama3.1:8b').",
+                provider="ollama",
+            )
+        sampling = OllamaSamplingConfig(
+            temp=settings.ollama_temp,
+            top_p=settings.ollama_top_p,
+        )
+        return OllamaBackend(
+            host=settings.ollama_host,
+            model=settings.ollama_chat_model,
+            timeout=settings.ollama_chat_timeout,
+            sampling=sampling,
+        )
+
     raise LLMBackendError(
-        f"Unknown llm_provider '{provider}'. Choose 'anthropic' or 'mlx'.",
+        f"Unknown llm_provider '{provider}'. Choose 'anthropic', 'mlx', or 'ollama'.",
     )

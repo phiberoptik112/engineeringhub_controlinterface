@@ -6,7 +6,7 @@ A persistent, agent-first workspace enabling collaboration between engineers and
 
 Engineering Hub provides two complementary modes of AI collaboration:
 
-1. **Orchestrator** (task-driven) -- watches your org-roam journal for `@agent:` task lines, dispatches work to specialized agents via Claude API or local MLX models, and writes results back to the workspace.
+1. **Orchestrator** (task-driven) -- watches your org-roam journal for `@agent:` task lines, dispatches work to specialized agents via Claude API, local MLX models, or an Ollama server, and writes results back to the workspace. Optionally runs agent tasks in **Docker containers** for isolation.
 2. **Journaler** (ambient) -- a persistent daemon that runs a local ~32B model via MLX, continuously monitors your org-roam workspace, delivers morning briefings, and responds to ad-hoc questions through **`engineering-hub journaler chat`** (interactive) and an **HTTP** chat endpoint when the daemon is running.
 
 They coexist cleanly: the Orchestrator processes explicit tasks while the Journaler maintains ambient awareness. The Journaler can read the full org-roam workspace, write back to daily journals, create org-roam nodes via slash commands, and — now — **delegate tasks directly to any agent personality inline** using the `/agent` command, with a choice of local MLX or Claude API execution.
@@ -18,6 +18,8 @@ They coexist cleanly: the Orchestrator processes explicit tasks while the Journa
 - **Django Integration**: Pulls project context, standards, and files from the consultingmanager API
 - **File Watching**: Monitors workspace for changes and automatically dispatches agent tasks
 - **Local MLX Models**: Run agents on Apple Silicon via `mlx-lm` with HuggingFace model IDs
+- **Ollama Backend**: Use Ollama for agent generation — works on any platform and inside Docker containers
+- **Docker Containers**: Isolate agent task execution in ephemeral containers with resource limits and network controls
 - **Journaler Daemon**: Always-on ambient listener with morning briefings, HTTP chat, and Slack integration — optional **model profiles**, Qwen3 **thinking mode**, CLI `--profile` / `--model`, and **`/model`** to switch checkpoints without losing chat history
 - **Agent Delegation**: **`journaler chat`** and the daemon’s HTTP `/chat` both use the same setup: an **AgentDelegator**, YAML **skills** summaries injected into the system prompt (personas, when-to-use hints, examples), and **`/agent`** / **`/skills`** slash commands — execution is local MLX or Claude API, selectable per-command via `journaler.agent_backend` and `--backend`
 - **Skills System**: Extensible `skills/` directory of YAML files defines each agent personality's capabilities; drop a new `.yaml` to add a delegation skill without code changes
@@ -30,9 +32,10 @@ They coexist cleanly: the Orchestrator processes explicit tasks while the Journa
 ## Requirements
 
 - Python 3.11+
-- Access to Anthropic API (Claude) or a local MLX model on Apple Silicon
+- Access to Anthropic API (Claude), a local MLX model on Apple Silicon, or an Ollama server
 - Django consultingmanager backend (optional, for full project context)
-- Ollama with `nomic-embed-text` (optional, for memory/embeddings)
+- Ollama with `nomic-embed-text` (optional, for memory/embeddings; also serves as a generation backend)
+- Docker (optional, for containerised agent execution)
 
 ## Quick Start
 
@@ -120,6 +123,12 @@ engineering-hub journaler export --find-title "Phase B" --heading "Journaler cap
 engineering-hub journaler export --new-node "Chat export 2026-04-06"
 engineering-hub journaler export --summarize --note ~/org-roam/my-note.org   # loads MLX; emits * Summary and * Open TODOs
 
+# Same export from an active `journaler chat` session (shell-like quoting for paths/titles), e.g.:
+#   /export
+#   /export -o ~/org-roam/exports/chat.org
+#   /export --summarize --note ~/org-roam/my-note.org --heading "Journaler capture"
+#   /export --help
+
 # Pick a named profile or HF id (applies to start, chat, briefing, download, export --summarize)
 engineering-hub journaler --profile reasoning chat
 engineering-hub journaler --model mlx-community/Qwen3-30B-A3B-Instruct-2507-4bit start
@@ -129,9 +138,11 @@ engineering-hub journaler --model mlx-community/Qwen3-30B-A3B-Instruct-2507-4bit
 
 `journaler export --summarize` loads the Journaler MLX model once (same `--profile` / `--model` flags as other journaler commands). Raw export does not load a model.
 
+In **`journaler chat`**, **`/export`** runs the same pipeline: if you do not pass `-o`, `--note`, `--new-node`, or `--find-title`, the org body is printed into the session (use `-o` … for large transcripts).
+
 ### 6. Load Files into Context
 
-**In a live `journaler chat` session** — use slash commands to inject file content directly into the model's context for the current conversation:
+**In a live `journaler chat` session** — use slash commands to inject file content into the model’s context, delegate to agents, and export the transcript:
 
 ```
 /load path/to/file.md           Load a single file
@@ -139,6 +150,9 @@ engineering-hub journaler --model mlx-community/Qwen3-30B-A3B-Instruct-2507-4bit
 /load path/to/dir/ -r           Load recursively
 /files                          List currently loaded files (with sizes)
 /files clear                    Remove all loaded files from context
+/export                         Export conversation.jsonl to org in-session (see below)
+/export -o ~/path/to/out.org    Same flags as `engineering-hub journaler export`
+/export --help                  Full `/export` flag list
 /agent technical-writer ...     Delegate inline (see Agent Delegation below)
 /skills                         List delegation skills / personas from skills/*.yaml
 /open today                     Set /edit target to today's journal (or /open <path>, /open <title>)
@@ -168,9 +182,15 @@ Files loaded this way are captured via `MemoryService` and are searchable by all
 ```text
 engineeringhub_controlinterface/
 ├── src/engineering_hub/
-│   ├── agents/          # Agent backends (Anthropic, MLX), worker, prompts
+│   ├── agents/          # Agent backends (Anthropic, MLX, Ollama), worker, prompts
 │   ├── cli.py           # Command-line interface
 │   ├── config/          # Settings (pydantic-settings) and YAML loader
+│   ├── container/       # Docker container execution
+│   │   ├── docker_executor.py  # Host-side container lifecycle management
+│   │   ├── router.py           # Task routing (local vs container)
+│   │   ├── task_payload.py     # Serialisation for container payloads
+│   │   ├── task_runner.py      # Entry point that runs inside the container
+│   │   └── resource_limits.py  # Per-container CPU/memory/timeout limits
 │   ├── context/         # Context building and formatting for agents
 │   ├── core/            # Data models, exceptions, constants
 │   ├── django/          # Django REST API client and cache
@@ -194,6 +214,9 @@ engineeringhub_controlinterface/
 │   └── config.example.yaml
 ├── prompts/             # Agent system prompts (used by Orchestrator and Journaler delegation)
 ├── skills/              # Agent delegation skill definitions (YAML, one per agent type)
+├── Dockerfile           # Full orchestrator image (Linux deployment)
+├── Dockerfile.task-runner # Slim ephemeral task container image
+├── docker-compose.yml   # Ollama service + shared Docker network
 └── tests/
 ```
 
@@ -233,7 +256,7 @@ journaler:
   slack_enabled: false
   slack_webhook_url: ""  # or set JOURNALER_SLACK_WEBHOOK env var
   max_conversation_history: 20
-  max_tokens: 4000
+  max_tokens: 4096
 
   # Agent delegation — applies to BOTH `journaler start` and `journaler chat`
   agent_backend: "auto"   # "auto" | "claude" | "mlx" (see Agent Delegation below)
@@ -249,7 +272,7 @@ journaler:
     end_of_day_time: "00:00"       # daily conversation reset time
     inactivity_clear_minutes: 120  # auto-clear after 2h of silence
     capture_daily_to_memory: false # write daily summaries to memory.db
-    reserved_for_generation: 2000  # tokens held back for model output
+    reserved_for_generation: 4096  # tokens held back for model output (≥ journaler.max_tokens)
 
   # Optional — slash /load size limits (see config.example.yaml for defaults)
   # load_max_context_fraction: 0.40   # fraction of remaining context per file chunk
@@ -413,6 +436,14 @@ While in `engineering-hub journaler chat`, any input starting with `/` is handle
 | `/files` | List all files currently loaded, with character counts |
 | `/files clear` | Remove all loaded files from context |
 
+**Export transcript** (same behavior as `engineering-hub journaler export`)
+
+| Command | Description |
+| --- | --- |
+| `/export` | Export `.journaler/conversation.jsonl` to raw org in the chat |
+| `/export …` | Flags: `--jsonl`, `--summarize`, `-o` / `--output`, `--note`, `--heading`, `--find-title`, `--new-node` (shell-style quoting supported) |
+| `/export --help` | Print usage |
+
 **Agent delegation**
 
 | Command | Description |
@@ -441,7 +472,7 @@ While in `engineering-hub journaler chat`, any input starting with `/` is handle
 | --- | --- |
 | `/help` | Show the full list of available slash commands |
 
-Tasks added with `/task` use the `- [ ] @agent:` format understood by the Orchestrator, so they will be picked up and dispatched automatically. `/agent` tasks run immediately and return their output in the current chat turn. **`/model`** in interactive chat reloads the MLX weights but **keeps the delegator’s adapter in sync**, so `/agent --backend mlx` continues to use the active checkpoint (same behavior as HTTP `/chat`). `/open` and `/edit` apply only in **`journaler chat`** (the interactive CLI); they are not available on the Journaler HTTP `/chat` endpoint. Loaded files are appended to the system prompt as fenced blocks and persist for the life of the chat session only.
+Tasks added with `/task` use the `- [ ] @agent:` format understood by the Orchestrator, so they will be picked up and dispatched automatically. `/agent` tasks run immediately and return their output in the current chat turn. **`/model`** in interactive chat reloads the MLX weights but **keeps the delegator’s adapter in sync**, so `/agent --backend mlx` continues to use the active checkpoint (same behavior as HTTP `/chat`). **`/export`** matches **`journaler export`** but is only available in interactive **`journaler chat`** (not on the HTTP `/chat` endpoint — use the CLI there). `/open` and `/edit` apply only in **`journaler chat`** as well. Loaded files are appended to the system prompt as fenced blocks and persist for the life of the chat session only.
 
 To persist files for long-term retrieval across sessions, use `engineering-hub load` instead (see [Load Files into Context](#6-load-files-into-context)).
 
@@ -564,6 +595,95 @@ In your daily `.org` journal files under a `* Overnight Agent Tasks` heading:
 | `standards-checker` | Verify compliance with ASTM/ISO standards |
 | `technical-reviewer` | Review technical documents for accuracy |
 
+## Docker Container Execution
+
+Agent tasks can run in isolated Docker containers instead of the host process. This provides resource limits, network isolation, and a clean execution environment for each task.
+
+### Architecture
+
+The system uses a hybrid model:
+
+- **MLX tasks** always run on the host (requires Apple Silicon Metal — not available in Linux containers)
+- **Anthropic tasks** can run in containers (HTTP API calls to Anthropic)
+- **Ollama tasks** can run in containers (HTTP API calls to the Ollama service on the Docker network)
+
+The Orchestrator and Journaler always run on the host. Only the agent task execution step is containerised.
+
+### Quick Start
+
+```bash
+# 1. Start the Ollama service (provides local model inference to containers)
+docker compose up -d
+
+# 2. Pull a model into Ollama
+docker compose exec ollama ollama pull llama3.1:8b
+
+# 3. Build the task runner image
+engineering-hub docker build
+
+# 4. Run the orchestrator with Docker execution
+engineering-hub start --docker --llm-provider ollama
+```
+
+### Configuration
+
+Add a `docker:` section to your `config.yaml`:
+
+```yaml
+llm_provider: "ollama"
+
+ollama:
+  host: "http://localhost:11434"
+  chat_model: "llama3.1:8b"
+
+docker:
+  enabled: true
+  task_image: "engineering-hub-task:latest"
+  network: "engineering-hub-net"
+  cpu_limit: 2.0
+  memory_limit: "2g"
+  task_timeout: 300
+  max_concurrent: 3
+  ollama_host: "http://ollama:11434"
+```
+
+### CLI Commands
+
+```bash
+# Build the task runner Docker image
+engineering-hub docker build
+
+# Show Docker status (image, running containers, connectivity)
+engineering-hub docker status
+
+# Clean up stopped task containers
+engineering-hub docker prune
+
+# Override docker execution from CLI (regardless of config)
+engineering-hub start --docker
+engineering-hub run-once --docker --llm-provider ollama
+engineering-hub start --no-docker   # force local even if config says docker
+```
+
+### How It Works
+
+1. The Orchestrator's `TaskRouter` checks `docker_enabled` and `llm_provider`
+2. For containerisable providers (Anthropic, Ollama), it serialises the task payload to JSON
+3. `DockerExecutor` spawns an ephemeral container with:
+   - The payload mounted read-only at `/task`
+   - A writable `/output` volume for results
+   - API keys injected via environment variables (never baked into the image)
+   - CPU, memory, and timeout limits enforced by Docker
+   - The `engineering-hub-net` Docker network for Ollama/API access
+4. The `task_runner.py` entry point inside the container reads the payload, runs the LLM backend, and writes `result.json`
+5. The host reads the result and continues the normal orchestrator flow (memory capture, roam wrappers, etc.)
+
+### Networking
+
+- **With Docker Compose Ollama**: Task containers reach Ollama at `http://ollama:11434` via the shared `engineering-hub-net` network
+- **With host Ollama**: Task containers use `http://host.docker.internal:11434` (set `docker.ollama_host` accordingly)
+- **Anthropic API**: Containers make outbound HTTPS calls to `api.anthropic.com`
+
 ## Development
 
 ### Running Tests
@@ -592,13 +712,23 @@ mypy src/
 
 See [config/config.example.yaml](config/config.example.yaml) for all available options:
 
-- `llm_provider` - `"anthropic"` (cloud API) or `"mlx"` (local Apple Silicon)
+- `llm_provider` - `"anthropic"` (cloud API), `"mlx"` (local Apple Silicon), or `"ollama"` (local/networked Ollama server)
 - `django.api_url` - Django consultingmanager API endpoint
 - `django.api_token` - API authentication token
 - `anthropic.api_key` - Anthropic API key for Claude (Orchestrator; Journaler `/agent --backend claude` also accepts optional `journaler.anthropic_api_key` first)
 - `anthropic.model` - Claude model to use (default: claude-sonnet-4-5-20250929)
 - `workspace.dir` - Base workspace directory
 - `mlx.model_path` - HuggingFace model ID for local MLX inference
+- `ollama.host` - Ollama server URL (default: `http://localhost:11434`)
+- `ollama.embed_model` - Embedding model (default: `nomic-embed-text`)
+- `ollama.chat_model` - Generation model (required when `llm_provider: "ollama"`)
+- `ollama.chat_timeout` - HTTP timeout for generation requests (default: 120s)
+- `docker.enabled` - Run agent tasks in Docker containers (default: false)
+- `docker.task_image` - Docker image for task containers (default: `engineering-hub-task:latest`)
+- `docker.network` - Docker network name (default: `engineering-hub-net`)
+- `docker.cpu_limit` / `docker.memory_limit` / `docker.task_timeout` - Resource limits per container
+- `docker.max_concurrent` - Maximum parallel task containers (default: 3)
+- `docker.ollama_host` - Ollama URL as seen from inside containers (default: `http://ollama:11434`)
 - `journaler.*` - Journaler daemon settings (model, scan interval, briefing, chat, Slack)
 - `journaler.model_profile` - Name of the active entry in `journaler.models` (when the map is non-empty)
 - `journaler.models` - Optional map of named MLX profiles (`model_path`, `model_context_window`, sampling, `mlx_backend`, `enable_thinking`)
@@ -608,7 +738,6 @@ See [config/config.example.yaml](config/config.example.yaml) for all available o
 - `journaler.skills_dir` - Path to skills YAML directory (default: `skills/` at repo root; loaded into the system prompt for daemon and interactive chat)
 - `journaler.context_management.*` - Token pressure thresholds, compression triggers, EOD reset time, topic-shift behavior
 - `memory.*` - Vector memory settings (enabled, search_k, threshold)
-- `ollama.*` - Ollama embedding model settings
 
 ## License
 

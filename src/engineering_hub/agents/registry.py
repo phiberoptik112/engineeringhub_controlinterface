@@ -12,7 +12,7 @@ class AgentConfig:
     agent_type: AgentType
     prompt_file: str
     tools: list[str] = field(default_factory=list)
-    max_tokens: int = 4000
+    max_tokens: int = 4096
     enabled: bool = True
 
 
@@ -22,32 +22,32 @@ DEFAULT_AGENT_CONFIGS = {
         agent_type=AgentType.RESEARCH,
         prompt_file="research-agent.txt",
         tools=["web_search", "web_fetch", "django_api"],
-        max_tokens=4000,
+        max_tokens=4096,
     ),
     AgentType.TECHNICAL_WRITER: AgentConfig(
         agent_type=AgentType.TECHNICAL_WRITER,
         prompt_file="technical-writer.txt",
         tools=["create_file", "view", "ingest_files", "django_api"],
-        max_tokens=4000,
+        max_tokens=4096,
     ),
     AgentType.STANDARDS_CHECKER: AgentConfig(
         agent_type=AgentType.STANDARDS_CHECKER,
         prompt_file="standards-checker.txt",
         tools=["view", "django_api"],
-        max_tokens=4000,
+        max_tokens=4096,
     ),
     AgentType.REF_ENGINEER: AgentConfig(
         agent_type=AgentType.REF_ENGINEER,
         prompt_file="ref-engineer.txt",
         tools=["web_search", "get_project_file", "get_standard_details"],
-        max_tokens=4000,
+        max_tokens=4096,
         enabled=False,  # Phase 5
     ),
     AgentType.EVALUATOR: AgentConfig(
         agent_type=AgentType.EVALUATOR,
         prompt_file="evaluator.txt",
         tools=["get_project_file", "view"],
-        max_tokens=4000,
+        max_tokens=4096,
         enabled=False,  # Phase 5
     ),
     AgentType.TECHNICAL_REVIEWER: AgentConfig(
