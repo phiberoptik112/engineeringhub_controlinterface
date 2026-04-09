@@ -69,18 +69,17 @@ def _today_journal_path(journal_dir: Path) -> Path:
     return journal_dir / f"{today}.org"
 
 
-def _create_journal_file(path: Path) -> None:
-    """Create a minimal daily journal file if it does not exist."""
+def _create_journal_file(path: Path) -> bool:
+    """Create a minimal daily journal file if it does not exist.
+
+    Returns:
+        True if the file was newly created, False if it already existed.
+    """
+    path = path.expanduser().resolve()
     if path.exists():
-        return
+        return False
     path.parent.mkdir(parents=True, exist_ok=True)
     today = path.stem
-    try:
-        dt = datetime.strptime(today, "%Y-%m-%d")
-        day_abbr = dt.strftime("%a")
-        ts = f"[{today} {day_abbr}]"
-    except ValueError:
-        ts = f"[{today}]"
 
     content = (
         f":PROPERTIES:\n"
@@ -94,6 +93,7 @@ def _create_journal_file(path: Path) -> None:
         f"* Notes\n\n"
     )
     path.write_text(content, encoding="utf-8")
+    return True
 
 
 # ---------------------------------------------------------------------------

@@ -702,6 +702,7 @@ def _handle_chat_slash_command(
     engine: ConversationEngine,
     chat_console: Console,
     org_roam_dir: Path | None = None,
+    daily_journal_dir: Path | None = None,
     journaler_model_ctx: object | None = None,
     journal_ctx: object | None = None,
     delegator: object | None = None,
@@ -714,6 +715,9 @@ def _handle_chat_slash_command(
     Recognised commands:
       /model                     Show or switch HF model (profile or path).
       /load <path> [-r]          Load a file or directory into context.
+      /load_browse               Interactive file browser for org-roam files.
+      /agent_browse              Interactive skill picker for agent delegation.
+      /edit_browse               Interactive file browser to set /edit target.
       /files                     List all currently loaded files.
       /files clear               Remove all loaded files from the context.
       /clear [--hard|--summarize] Clear conversation history (soft by default).
@@ -762,9 +766,9 @@ def _handle_chat_slash_command(
     if cmd in ("/exit", "/quit"):
         raise JournalerChatExit()
 
-    # Determine the daily journal directory (child of org_roam_dir named "journal")
-    journal_dir: Path | None = None
-    if org_roam_dir is not None:
+    # Daily journal directory: config journal.org_journal_dir, else legacy journal/ under roam
+    journal_dir: Path | None = daily_journal_dir
+    if journal_dir is None and org_roam_dir is not None:
         candidate = org_roam_dir / "journal"
         journal_dir = candidate if candidate.exists() else org_roam_dir
 
@@ -785,6 +789,48 @@ def _handle_chat_slash_command(
 
         msg = _handle_agent_command(raw, delegator, journal_ctx)
         chat_console.print(f"[green]{escape(msg)}[/green]")
+        return
+
+    if cmd == "/agent_browse":
+        if delegator is None:
+            chat_console.print(
+                "[yellow]/agent_browse requires a configured delegator "
+                "(set journaler.agent_backend in config).[/yellow]"
+            )
+            return
+
+        skills = delegator.list_skills()
+        if not skills:
+            chat_console.print("[yellow]No agent skills loaded.[/yellow]")
+            return
+
+        from engineering_hub.journaler.file_browser import browse_skills
+
+        chat_console.print("[dim]Opening skill picker… (Esc or q to cancel)[/dim]")
+        selected_skill = browse_skills(skills)
+
+        if selected_skill is None:
+            chat_console.print("[dim]No agent selected.[/dim]")
+            return
+
+        chat_console.print(
+            f"[cyan]Selected:[/cyan] [bold]{escape(selected_skill.display_name)}[/bold]"
+        )
+        try:
+            description = input(f"Task for {selected_skill.display_name}: ").strip()
+        except (KeyboardInterrupt, EOFError):
+            chat_console.print("[dim]Cancelled.[/dim]")
+            return
+
+        if not description:
+            chat_console.print("[yellow]No description provided.[/yellow]")
+            return
+
+        result = delegator.delegate(
+            agent_type=selected_skill.agent_type,
+            description=description,
+        )
+        chat_console.print(f"[green]{escape(result)}[/green]")
         return
 
     if cmd == "/export":
@@ -823,6 +869,7 @@ def _handle_chat_slash_command(
             "  [cyan]/open <path>[/cyan]                  Target a .org file under org-roam\n"
             "  [cyan]/open <title fragment>[/cyan]        Target unique #+title: match\n"
             "  [cyan]/edit <heading> :: <text>[/cyan]   Append under a heading in /open target\n"
+            "  [cyan]/edit_browse[/cyan]               Browse org-roam files to set /edit target\n"
             "  [cyan]/find <title fragment>[/cyan]       Search org-roam files by title\n"
         ) if org_roam_dir else ""
 
@@ -830,6 +877,7 @@ def _handle_chat_slash_command(
             "\n[bold cyan]Slash commands:[/bold cyan]\n"
             "  [cyan]/load <path> [-r][/cyan]          Load a file or directory into context\n"
             "                                 (-r / --recursive scans subdirectories)\n"
+            "  [cyan]/load_browse[/cyan]               Browse and select org-roam files to load\n"
             "  [cyan]/model[/cyan]                     Show active MLX model / profile\n"
             "  [cyan]/model <profile>[/cyan]           Switch to a named journaler.models profile\n"
             "  [cyan]/model path <id-or-path>[/cyan]   Load a Hugging Face id or local path\n"
@@ -842,6 +890,7 @@ def _handle_chat_slash_command(
             "  [cyan]/budget[/cyan]                    Show token budget breakdown\n"
             "  [cyan]/topic[/cyan]                     Show currently detected conversation topic\n"
             "  [cyan]/agent <type> <desc>[/cyan]      Delegate to a named agent (see README)\n"
+            "  [cyan]/agent_browse[/cyan]              Browse and pick an agent skill interactively\n"
             "  [cyan]/skills[/cyan]                    List agent delegation skills / personas\n"
             "  [cyan]/export[/cyan]                    Export transcript (`/export --help`)\n"
             + write_cmds +
@@ -948,6 +997,30 @@ def _handle_chat_slash_command(
             chat_console.print(f"[{color}]{escape(line)}[/{color}]")
         return
 
+    if cmd == "/load_browse":
+        if org_roam_dir is None:
+            chat_console.print(
+                "[yellow]/load_browse requires org-roam dir "
+                "(set journaler.org_journal_dir or start with 'journaler chat')[/yellow]"
+            )
+            return
+
+        from engineering_hub.journaler.file_browser import browse_org_roam
+
+        chat_console.print("[dim]Opening file browser… (Esc or q to cancel)[/dim]")
+        selected = browse_org_roam(org_roam_dir, SUPPORTED_EXTENSIONS)
+
+        if not selected:
+            chat_console.print("[dim]No files selected.[/dim]")
+            return
+
+        for file_path in selected:
+            ok, msg = engine.load_file(file_path, extensions=SUPPORTED_EXTENSIONS)
+            color = "green" if ok else "red"
+            for line in msg.splitlines():
+                chat_console.print(f"[{color}]{escape(line)}[/{color}]")
+        return
+
     if cmd == "/find":
         if org_roam_dir is None:
             chat_console.print("[yellow]/find requires org_roam_dir (start with 'journaler start' or 'journaler chat')[/yellow]")
@@ -1040,20 +1113,25 @@ def _handle_chat_slash_command(
             )
             return
         if rest.lower() == "today":
-            if journal_dir is None:
-                chat_console.print(
-                    "[yellow]/open today requires org-roam dir (start with journaler chat)[/yellow]"
-                )
-                return
             from engineering_hub.journaler.org_writer import (
                 _create_journal_file,
                 _today_journal_path,
             )
 
             today_path = _today_journal_path(journal_dir)
-            _create_journal_file(today_path)
+            created = _create_journal_file(today_path)
             engine.set_roam_edit_target(today_path)
-            chat_console.print(f"[green]Opened today's journal for /edit:[/green] {today_path}")
+            resolved = engine.get_roam_edit_target()
+            if resolved is None or not resolved.exists():
+                chat_console.print(
+                    f"[red]Could not open today's journal: {today_path}[/red]"
+                )
+                engine.set_roam_edit_target(None)
+                return
+            verb = "Created" if created else "Opened"
+            chat_console.print(
+                f"[green]{verb} today's journal for /edit:[/green] {resolved}"
+            )
             return
         path_candidate = Path(rest).expanduser()
         is_path_like = path_candidate.suffix.lower() == ".org" or path_candidate.is_file()
@@ -1107,6 +1185,32 @@ def _handle_chat_slash_command(
         ok, msg = append_to_heading(target, heading, text, create_heading_if_missing=True)
         color = "green" if ok else "red"
         chat_console.print(f"[{color}]{escape(msg)}[/{color}]")
+        return
+
+    if cmd == "/edit_browse":
+        if org_roam_dir is None:
+            chat_console.print(
+                "[yellow]/edit_browse requires org-roam dir "
+                "(set journaler.org_journal_dir or start with 'journaler chat')[/yellow]"
+            )
+            return
+
+        from engineering_hub.journaler.file_browser import browse_org_file
+
+        chat_console.print("[dim]Opening file browser… (Esc or q to cancel)[/dim]")
+        selected = browse_org_file(org_roam_dir)
+
+        if selected is None:
+            chat_console.print("[dim]No file selected.[/dim]")
+            return
+
+        ok_path, res = assert_org_path_under_roam(selected, org_roam_dir)
+        if not ok_path:
+            chat_console.print(f"[red]{escape(str(res))}[/red]")
+            return
+        if isinstance(res, Path):
+            engine.set_roam_edit_target(res)
+            chat_console.print(f"[green]Opened for /edit:[/green] {res}")
         return
 
     chat_console.print(
@@ -1182,6 +1286,7 @@ def cmd_journaler(args: argparse.Namespace) -> int:
     config = JournalerConfig(
         model_path=spec.model_path,
         org_roam_dir=settings.org_journal_dir.parent,
+        journal_dir=settings.org_journal_dir,
         workspace_dir=settings.workspace_dir,
         state_dir=settings.journaler_state_dir,
         scan_interval_min=settings.journaler_scan_interval_min,
@@ -1208,16 +1313,25 @@ def cmd_journaler(args: argparse.Namespace) -> int:
         load_max_chars_absolute=settings.journaler_load_max_chars_absolute,
         load_min_chars=settings.journaler_load_min_chars,
         load_slack_tokens=settings.journaler_load_slack_tokens,
-        anthropic_api_key=settings.journaler_delegation_api_key(),
         agent_backend=settings.journaler_agent_backend,
         skills_dir=settings.journaler_skills_dir,
+        watch_dirs=list(settings.journaler_watch_dirs)
+        if settings.journaler_watch_dirs
+        else None,
+        scan_org_roam_tree=settings.journaler_scan_org_roam_tree,
+        journal_lookback_days=settings.journaler_journal_lookback_days,
+        journal_max_files=settings.journaler_journal_max_files,
     )
 
     if sub == "start":
         console.print("[bold green]Starting Journaler daemon...[/bold green]")
         console.print(f"  Model: {config.model_path}")
         console.print(f"  Org-roam: {config.org_roam_dir}")
+        console.print(f"  Daily journals: {config.journal_dir}")
         console.print(f"  Scan interval: {config.scan_interval_min}min")
+        console.print(
+            f"  Org scan: {'full roam tree' if config.scan_org_roam_tree else 'journal + watch_dirs only'}"
+        )
         if config.briefing_enabled:
             console.print(f"  Briefing at: {config.briefing_time}")
         if config.chat_enabled:
@@ -1247,14 +1361,21 @@ def cmd_journaler(args: argparse.Namespace) -> int:
         backend = build_journaler_mlx_backend(chat_model_ctx.spec)
         ctx = JournalContext(
             org_roam_dir=config.org_roam_dir,
+            journal_dir=config.journal_dir,
             workspace_dir=config.workspace_dir,
             memory_service=config.memory_service,
             state_dir=config.state_dir,
+            watch_dirs=config.watch_dirs,
+            scan_org_roam_tree=config.scan_org_roam_tree,
+            journal_lookback_days=config.journal_lookback_days,
+            journal_max_files=config.journal_max_files,
         )
         ctx.scan()
 
         system_template = load_system_prompt(config.state_dir)
-        workspace_map = build_workspace_layout(config.org_roam_dir, config.workspace_dir)
+        workspace_map = build_workspace_layout(
+            config.org_roam_dir, config.workspace_dir, config.journal_dir
+        )
         system_prompt = format_system_prompt(
             system_template,
             ctx.get_current_context(),
@@ -1274,7 +1395,7 @@ def cmd_journaler(args: argparse.Namespace) -> int:
 
         delegator = build_delegator(
             backend,
-            anthropic_api_key=config.anthropic_api_key,
+            anthropic_api_key=settings.journaler_delegation_api_key(),
             skills_dir=config.skills_dir,
             default_backend=config.agent_backend,
             output_dir=config.workspace_dir / "outputs",
@@ -1295,7 +1416,7 @@ def cmd_journaler(args: argparse.Namespace) -> int:
             "[green]Journaler ready. "
             "Type your questions (Ctrl-C, /exit, or exit to leave).[/green]\n"
             "[dim]Tip: /agent and /skills for agent personas; /model to switch profile; "
-            "/load for files; /help for commands.[/dim]\n"
+            "/load for files; /load_browse to browse; /help for commands.[/dim]\n"
             "[dim]Context: /status, /budget, /topic — "
             "Clear: /clear, /clear --summarize, /clear --hard[/dim]\n"
             "[dim]Input: Up/Down recall previous lines (saved under .journaler). "
@@ -1321,6 +1442,7 @@ def cmd_journaler(args: argparse.Namespace) -> int:
                             engine,
                             console,
                             org_roam_dir=config.org_roam_dir,
+                            daily_journal_dir=settings.org_journal_dir,
                             journaler_model_ctx=chat_model_ctx,
                             journal_ctx=ctx,
                             delegator=delegator,
@@ -1396,9 +1518,14 @@ def cmd_journaler(args: argparse.Namespace) -> int:
         console.print("[bold]Running scan...[/bold]")
         ctx = JournalContext(
             org_roam_dir=config.org_roam_dir,
+            journal_dir=config.journal_dir,
             workspace_dir=config.workspace_dir,
             memory_service=config.memory_service,
             state_dir=config.state_dir,
+            watch_dirs=config.watch_dirs,
+            scan_org_roam_tree=config.scan_org_roam_tree,
+            journal_lookback_days=config.journal_lookback_days,
+            journal_max_files=config.journal_max_files,
         )
         snapshot = ctx.scan()
         console.print(f"  Last scan: {snapshot.last_scan}")

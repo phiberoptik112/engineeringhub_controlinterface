@@ -124,8 +124,8 @@ You can tell the user about these commands; the user types them directly:
                                --backend mlx    use local model (no API key needed;
                                                 reuses Journaler's loaded model)
                                --backend claude use Claude API (requires api key config)
-                               Default backend is determined by journaler.agent_backend
-                               in config ("auto" prefers Claude when key is present).
+                               Default backend is journaler.agent_backend in config
+                               ("mlx" is default; use "auto" for Claude when a key is present).
 
   /skills                      List all available agent delegation skills with
                                descriptions and example invocations.
@@ -193,17 +193,19 @@ def load_briefing_prompt(state_dir: Path | None = None) -> str:
     return BRIEFING_PROMPT
 
 
-def build_workspace_layout(org_roam_dir: Path, workspace_dir: Path) -> str:
+def build_workspace_layout(
+    org_roam_dir: Path, workspace_dir: Path, journal_dir: Path
+) -> str:
     """Return the filled-in WORKSPACE_LAYOUT block for injection into the system prompt.
 
     Args:
         org_roam_dir: Absolute path to the org-roam directory.
         workspace_dir: Absolute path to the Engineering Hub workspace directory.
+        journal_dir: Absolute path to daily journal *.org files (e.g. roam/journal or roam/journals).
 
     Returns:
         The formatted layout string ready for appending to the system prompt.
     """
-    journal_dir = org_roam_dir / "journal"
     return WORKSPACE_LAYOUT.format(
         org_roam_dir=org_roam_dir,
         workspace_dir=workspace_dir,

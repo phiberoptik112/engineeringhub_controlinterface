@@ -59,9 +59,10 @@ journal:
   # Capture templates are defined in $DOOMDIR/config.el (see docs/workflow.md).
   use_org_mode: true
 
-  # Path to daily .org files (YYYY-MM-DD.org)
+  # Path to daily .org files (YYYY-MM-DD.org). Journaler uses this path directly
+  # (not only org_roam_dir/journal). Example: ~/org-roam/journals
   # Default: ~/org-roam/journal
-  # org_journal_dir: "~/org-roam/journal"
+  # org_journal_dir: "~/org-roam/journals"
 
   # Org headings whose list items are treated as agent tasks
   org_task_sections:
@@ -242,7 +243,14 @@ chunking:
 #
 #   # Morning briefing schedule
 #   briefing_enabled: true
-#   briefing_time: "07:00"       # local time (HH:MM)
+#   briefing_time: "09:00"       # local time (HH:MM); default 9:00
+#
+#   # Scan scope: when false, only journal.org_journal_dir + watch_dirs are scanned
+#   # for *.org (not the full roam tree). Large journal years: pair with lookback below.
+#   # scan_org_roam_tree: true
+#   # watch_dirs: []             # extra org directories to rglob, e.g. ["~/org-roam/projects"]
+#   # journal_lookback_days: 5   # daily journal files within this many days (with cap)
+#   # journal_max_files: 5       # max recent daily journal files to parse for context/tasks
 #
 #   # HTTP chat endpoint
 #   chat_enabled: true
@@ -303,11 +311,11 @@ chunking:
 #   # using the /agent slash command in chat.
 #
 #   # Backend used when the Journaler delegates to an agent personality.
-#   #   "auto"   — Claude API if anthropic.api_key is present, else local MLX (default)
+#   #   "mlx"    — always local model (default; reuses Journaler's loaded model, no extra RAM)
 #   #   "claude" — always use Claude API (requires anthropic.api_key to be set)
-#   #   "mlx"    — always use local model (reuses Journaler's loaded model, no extra RAM)
+#   #   "auto"   — Claude API if anthropic.api_key is present, else local MLX
 #   # Can be overridden per-command with --backend mlx|claude in the /agent command.
-#   agent_backend: "auto"
+#   agent_backend: "mlx"
 #
 #   # Path to skills YAML directory. Each .yaml file defines one agent delegation skill.
 #   # Drop a new .yaml here to add a delegation capability without code changes.
@@ -315,8 +323,9 @@ chunking:
 #   # skills_dir: "~/org-roam/engineering-hub/skills"
 #
 #   # Anthropic API key for Claude-backed delegation.
+#   # Prefer ENGINEERING_HUB_ANTHROPIC_API_KEY or ENGINEERING_HUB_JOURNALER_ANTHROPIC_API_KEY in the environment
+#   # (or top-level anthropic.api_key in YAML); use journaler.anthropic_api_key in YAML only if the file stays private.
 #   # If omitted, delegation always uses the local MLX model.
-#   # Falls back to ENGINEERING_HUB_ANTHROPIC_API_KEY environment variable if set.
 #   # anthropic_api_key: ""
 
 # Agent configurations (optional - defaults are provided)

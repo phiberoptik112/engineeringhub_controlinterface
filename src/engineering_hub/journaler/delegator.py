@@ -26,6 +26,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 import yaml
+from pydantic import SecretStr
 
 from engineering_hub.agents.worker import AgentWorker
 from engineering_hub.core.constants import AgentType
@@ -38,12 +39,18 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _anthropic_key_str(anthropic_api_key: SecretStr | str) -> str:
+    if isinstance(anthropic_api_key, SecretStr):
+        return (anthropic_api_key.get_secret_value() or "").strip()
+    return (anthropic_api_key or "").strip()
+
+
 def build_delegator(
     mlx_backend: ConversationalMLXBackend,
     *,
-    anthropic_api_key: str = "",
+    anthropic_api_key: SecretStr | str = "",
     skills_dir: Path | None = None,
-    default_backend: str = "auto",
+    default_backend: str = "mlx",
     output_dir: Path | None = None,
     prompts_dir: Path | None = None,
 ) -> AgentDelegator | None:
@@ -58,7 +65,7 @@ def build_delegator(
         from engineering_hub.agents.worker import AgentWorker
 
         anthropic_worker = None
-        key = (anthropic_api_key or "").strip()
+        key = _anthropic_key_str(anthropic_api_key)
         if key:
             anthropic_worker = AgentWorker.from_anthropic(
                 api_key=key,
@@ -201,7 +208,7 @@ class AgentDelegator:
         mlx_backend: ConversationalMLXBackend,
         anthropic_worker: AgentWorker | None = None,
         skills_dir: Path | None = None,
-        default_backend: str = "auto",
+        default_backend: str = "mlx",
         prompts_dir: Path | None = None,
         output_dir: Path | None = None,
     ) -> None:
