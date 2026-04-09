@@ -271,7 +271,7 @@ class Settings(BaseSettings):
         description="Enable scheduled morning briefings",
     )
     journaler_briefing_time: str = Field(
-        default="07:00",
+        default="09:00",
         description="Time for morning briefing (HH:MM, local time)",
     )
     journaler_chat_enabled: bool = Field(
@@ -340,8 +340,8 @@ class Settings(BaseSettings):
         description="Extra tokens subtracted from headroom when sizing /load (safety margin)",
     )
     journaler_agent_backend: str = Field(
-        default="auto",
-        description='Journaler /agent delegation: "auto", "claude", or "mlx"',
+        default="mlx",
+        description='Journaler /agent delegation: "mlx", "claude", or "auto"',
     )
     journaler_skills_dir: Path | None = Field(
         default=None,
@@ -350,6 +350,25 @@ class Settings(BaseSettings):
     journaler_anthropic_api_key: SecretStr | None = Field(
         default=None,
         description="Optional Anthropic key for Journaler /agent; falls back to anthropic_api_key",
+    )
+    journaler_scan_org_roam_tree: bool = Field(
+        default=True,
+        description="When True, rglob the full org_roam_dir for *.org; when False, scan only "
+        "journal.org_journal_dir plus journaler.watch_dirs",
+    )
+    journaler_watch_dirs: list[Path] = Field(
+        default_factory=list,
+        description="Extra org directories to include in Journaler scans (rglob *.org)",
+    )
+    journaler_journal_lookback_days: int = Field(
+        default=5,
+        ge=0,
+        description="Include daily journal files from the last N calendar days (with journal_max_files cap)",
+    )
+    journaler_journal_max_files: int = Field(
+        default=5,
+        ge=1,
+        description="Max number of recent daily journal files to parse for context/tasks",
     )
 
     # Report template settings
@@ -640,6 +659,16 @@ class Settings(BaseSettings):
             j_anthropic = j.get("anthropic_api_key")
             if j_anthropic:
                 flat_config["journaler_anthropic_api_key"] = SecretStr(str(j_anthropic))
+            if j.get("scan_org_roam_tree") is not None:
+                flat_config["journaler_scan_org_roam_tree"] = j["scan_org_roam_tree"]
+            if j.get("watch_dirs") is not None:
+                flat_config["journaler_watch_dirs"] = [
+                    Path(p).expanduser() for p in (j["watch_dirs"] or [])
+                ]
+            if j.get("journal_lookback_days") is not None:
+                flat_config["journaler_journal_lookback_days"] = j["journal_lookback_days"]
+            if j.get("journal_max_files") is not None:
+                flat_config["journaler_journal_max_files"] = j["journal_max_files"]
 
         if "templates" in config:
             tpl = config["templates"]

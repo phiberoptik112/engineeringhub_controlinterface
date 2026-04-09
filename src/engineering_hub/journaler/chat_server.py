@@ -13,6 +13,7 @@ Slash commands (parsed before reaching the LLM):
         Show active model, switch named profile, or load a HF id/path (daemon).
     /agent <type> <description> [--project <id>] [--backend mlx|claude]
         Delegate a task to a named agent and return the result inline.
+        Default backend follows journaler.agent_backend (defaults to mlx).
     Falls back to writing to the journal if no delegator is configured.
     /skills
         List available agent delegation skills.
@@ -296,7 +297,7 @@ def _handle_agent_command(
 
     if delegator is None:
         # Fall back to journal write when no delegator is configured
-        journal_dir = context.org_roam_dir / "journal"
+        journal_dir = context.journal_dir
         from engineering_hub.journaler.org_writer import add_todo_to_journal
 
         item = f"@{agent_type}: {description}"

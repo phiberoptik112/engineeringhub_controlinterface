@@ -37,22 +37,121 @@ class JournalContext:
     def __init__(
         self,
         org_roam_dir: Path,
+        journal_dir: Path,
         workspace_dir: Path,
         memory_service: MemoryService | None,
         state_dir: Path,
         watch_dirs: list[Path] | None = None,
+        scan_org_roam_tree: bool = True,
+        journal_lookback_days: int = 5,
+        journal_max_files: int = 5,
     ) -> None:
         self.org_roam_dir = org_roam_dir
+        self.journal_dir = journal_dir
         self.workspace_dir = workspace_dir
         self.memory_service = memory_service
         self.state_dir = state_dir
         self.watch_dirs = watch_dirs or []
+        self.scan_org_roam_tree = scan_org_roam_tree
+        self.journal_lookback_days = max(0, journal_lookback_days)
+        self.journal_max_files = max(1, journal_max_files)
 
         self.state_file = state_dir / "state.json"
         self.cache_file = state_dir / "context_cache.json"
 
         self._state = self._load_state()
         self._snapshot = self._load_cache()
+
+    def _resolved_journal_dir(self) -> Path:
+        return self.journal_dir.expanduser().resolve()
+
+    def _selected_journal_files(self, today: date) -> set[Path]:
+        """Daily journal *.org paths to track and parse (lookback + cap).
+
+        Always includes today's file when it exists.
+        """
+        jd = self._resolved_journal_dir()
+        if not jd.exists():
+            return set()
+
+        dated: list[tuple[date, Path]] = []
+        for p in jd.glob("*.org"):
+            d = self._extract_date_from_filename(p)
+            if d is not None:
+                dated.append((d, p.resolve()))
+
+        dated.sort(key=lambda x: x[0], reverse=True)
+        if not dated:
+            out: set[Path] = set()
+            today_p = jd / f"{today.isoformat()}.org"
+            if today_p.exists():
+                out.add(today_p.resolve())
+            return out
+
+        lookback = today - timedelta(days=self.journal_lookback_days)
+        W = [(d, p) for d, p in dated if d >= lookback]
+        max_f = self.journal_max_files
+        if len(W) >= max_f:
+            selected = [p for _, p in W[:max_f]]
+        else:
+            selected = [p for _, p in dated[:max_f]]
+
+        out = set(selected)
+        today_p = jd / f"{today.isoformat()}.org"
+        if today_p.exists():
+            out.add(today_p.resolve())
+        return out
+
+    def _should_parse_org_file(self, org_file: Path, journal_sel: set[Path]) -> bool:
+        """Skip daily journals outside the selected recent window."""
+        try:
+            r = org_file.resolve()
+        except OSError:
+            return False
+        jd = self._resolved_journal_dir()
+        if not jd.exists():
+            return True
+        try:
+            r.relative_to(jd)
+        except ValueError:
+            return True
+        return r in journal_sel
+
+    def _append_changed_org(
+        self, org_file: Path, changed_files: list[Path], seen: set[str]
+    ) -> None:
+        key = str(org_file.resolve())
+        if key in seen:
+            return
+        if self._state.is_changed(org_file):
+            changed_files.append(org_file)
+            self._state.record(org_file)
+            seen.add(key)
+
+    def _prune_journal_state(self, journal_sel: set[Path]) -> None:
+        """Drop mtime entries for daily files outside the current journal window."""
+        try:
+            jd = self._resolved_journal_dir()
+        except OSError:
+            return
+        if not jd.exists():
+            return
+        keep = {p.resolve() for p in journal_sel}
+        new_mtimes: dict[str, float] = {}
+        for key, mtime in self._state.file_mtimes.items():
+            p = Path(key)
+            try:
+                rp = p.resolve()
+            except OSError:
+                continue
+            try:
+                rp.relative_to(jd)
+            except ValueError:
+                new_mtimes[key] = mtime
+                continue
+            if rp in keep:
+                new_mtimes[key] = mtime
+        self._state.file_mtimes = new_mtimes
 
     def scan(self) -> ContextSnapshot:
         """Incremental scan. Reads only changed files since last scan.
@@ -61,17 +160,28 @@ class JournalContext:
         """
         now = datetime.now()
         today = date.today()
-        changed_files: list[Path] = []
+        journal_sel = self._selected_journal_files(today)
+        self._prune_journal_state(journal_sel)
 
-        # Walk org-roam directory for .org files
-        scan_dirs = [self.org_roam_dir] + self.watch_dirs
-        for scan_dir in scan_dirs:
-            if not scan_dir.exists():
-                continue
-            for org_file in scan_dir.rglob("*.org"):
-                if self._state.is_changed(org_file):
-                    changed_files.append(org_file)
-                    self._state.record(org_file)
+        changed_files: list[Path] = []
+        seen_keys: set[str] = set()
+
+        if self.scan_org_roam_tree:
+            scan_dirs = [self.org_roam_dir] + self.watch_dirs
+            for scan_dir in scan_dirs:
+                if not scan_dir.exists():
+                    continue
+                for org_file in scan_dir.rglob("*.org"):
+                    self._append_changed_org(org_file, changed_files, seen_keys)
+        else:
+            for org_file in journal_sel:
+                if org_file.exists():
+                    self._append_changed_org(org_file, changed_files, seen_keys)
+            for scan_dir in self.watch_dirs:
+                if not scan_dir.exists():
+                    continue
+                for org_file in scan_dir.rglob("*.org"):
+                    self._append_changed_org(org_file, changed_files, seen_keys)
 
         # Also check workspace outputs directory
         outputs_dir = self.workspace_dir / "outputs"
@@ -89,11 +199,13 @@ class JournalContext:
         project_changes: list[dict[str, str]] = []
 
         for org_file in changed_files:
+            if not self._should_parse_org_file(org_file, journal_sel):
+                continue
             info = parse_org_file(org_file)
             all_pending.extend(extract_pending_tasks(info.entries))
             all_completed.extend(extract_completed_tasks(info.entries))
 
-            # Check if this is today's or yesterday's journal
+            # Journal headings for today / yesterday only (within selected files)
             file_date = self._extract_date_from_filename(org_file)
             if file_date and file_date >= today - timedelta(days=1):
                 for entry in info.entries:
@@ -118,8 +230,13 @@ class JournalContext:
                 })
 
         # Also scan today's journal even if it didn't change (for completeness on first run)
-        today_journal = self.org_roam_dir / "journal" / f"{today.isoformat()}.org"
-        if today_journal.exists() and not any(f == today_journal for f in changed_files):
+        today_journal = self.journal_dir / f"{today.isoformat()}.org"
+        tj_resolved = today_journal.expanduser().resolve()
+        if (
+            today_journal.exists()
+            and tj_resolved in journal_sel
+            and not any(f.resolve() == tj_resolved for f in changed_files)
+        ):
             info = parse_org_file(today_journal)
             # Merge pending/completed from today's journal if not already captured
             for task in extract_pending_tasks(info.entries):
@@ -244,7 +361,7 @@ class JournalContext:
 
         # Yesterday's journal: scan yesterday's file directly for full content
         yesterday = date.today() - timedelta(days=1)
-        yesterday_file = self.org_roam_dir / "journal" / f"{yesterday.isoformat()}.org"
+        yesterday_file = self.journal_dir / f"{yesterday.isoformat()}.org"
         if yesterday_file.exists():
             info = parse_org_file(yesterday_file, max_body_chars=1000)
             lines.append("### Yesterday's Activity")

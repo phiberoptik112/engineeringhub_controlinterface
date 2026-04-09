@@ -148,6 +148,7 @@ In **`journaler chat`**, **`/export`** runs the same pipeline: if you do not pas
 /load path/to/file.md           Load a single file
 /load path/to/dir/              Load all supported files in a directory
 /load path/to/dir/ -r           Load recursively
+/load_browse                    Interactive file browser (arrow keys, multi-select)
 /files                          List currently loaded files (with sizes)
 /files clear                    Remove all loaded files from context
 /export                         Export conversation.jsonl to org in-session (see below)
@@ -226,14 +227,14 @@ The Journaler is a persistent daemon that runs a local ~32B model on Apple Silic
 
 ### How It Works
 
-- **Scans** your org-roam directory every 10 minutes (mtime-based incremental diff)
+- **Scans** org-roam (full tree or only `journal.org_journal_dir` plus optional `journaler.watch_dirs`) every 10 minutes (mtime-based incremental diff)
 - **Extracts** headings, TODO/DONE items, timestamps, and `@agent:` tasks from `.org` files
 - **Reads** recent agent outputs from `memory.db` via `MemoryService.browse_recent()`
 - **Compresses** everything into a rolling context snapshot (~4000 tokens)
 - **Knows** the workspace layout and org-roam format conventions — injected into the system prompt when the conversation engine starts so the model can reason about file locations and produce valid org syntax
 - **Loads agent personas** from `skills/*.yaml`: a concise **skills block** (display name, description, when-to-use, example `/agent` lines) is appended to the system prompt for **both** `journaler start` and **`journaler chat`**. On the daemon, each scheduled org-roam scan refreshes the rolling context snapshot **and re-attaches** that skills block so personas are not dropped mid-run
 - **Uses** `journaler.agent_backend`, optional `journaler.skills_dir`, and optional `journaler.anthropic_api_key` (else `anthropic.api_key` / `ENGINEERING_HUB_ANTHROPIC_API_KEY`) for delegation — same resolution for daemon and interactive chat
-- **Generates** a morning briefing at a configurable time (default 7:00 AM)
+- **Generates** a morning briefing at a configurable time (default 9:00 AM)
 - **Responds** to ad-hoc questions via an HTTP chat endpoint on `localhost:18790`
 - **Writes** to daily journals and org-roam nodes via slash commands in the interactive chat session
 - **Posts** briefings and alerts to Slack via incoming webhooks (optional)
@@ -249,7 +250,11 @@ journaler:
   model_context_window: 32768   # match your model's actual context window
   scan_interval_min: 10
   briefing_enabled: true
-  briefing_time: "07:00"
+  briefing_time: "09:00"
+  # scan_org_roam_tree: true        # false = only journal.org_journal_dir + watch_dirs
+  # journal_lookback_days: 5
+  # journal_max_files: 5
+  # watch_dirs: []
   chat_enabled: true
   chat_host: "127.0.0.1"
   chat_port: 18790
@@ -259,7 +264,7 @@ journaler:
   max_tokens: 4096
 
   # Agent delegation — applies to BOTH `journaler start` and `journaler chat`
-  agent_backend: "auto"   # "auto" | "claude" | "mlx" (see Agent Delegation below)
+  agent_backend: "mlx"   # "mlx" | "claude" | "auto" (see Agent Delegation below)
   # anthropic_api_key: "" # optional Journaler-only override; else top-level anthropic.api_key / ENGINEERING_HUB_ANTHROPIC_API_KEY
   # skills_dir: "~/org-roam/engineering-hub/skills"  # default: skills/ at repo root (resolved from YAML)
 
@@ -433,6 +438,7 @@ While in `engineering-hub journaler chat`, any input starting with `/` is handle
 | --- | --- |
 | `/load <path>` | Load a file or directory into the current conversation context |
 | `/load <path> -r` | Load a directory recursively |
+| `/load_browse` | Interactive fullscreen file browser for org-roam — arrow keys to navigate, Space to multi-select, Enter to load |
 | `/files` | List all files currently loaded, with character counts |
 | `/files clear` | Remove all loaded files from context |
 
@@ -494,7 +500,7 @@ The Journaler can delegate tasks directly to any named agent personality and ret
 | `--backend mlx` | Use the local MLX model (reuses the Journaler's loaded model — no extra RAM) |
 | `--backend claude` | Use the Claude API (requires `journaler.anthropic_api_key` or global `anthropic.api_key` / env) |
 
-The default backend is controlled by `journaler.agent_backend` in config (`"auto"` prefers Claude when a key is present, otherwise falls back to MLX). The `--backend` flag overrides this per-command.
+The default backend is controlled by `journaler.agent_backend` in config (`"mlx"` uses the local model; set `"auto"` if you want Claude when a key is present, otherwise MLX). The `--backend` flag overrides this per-command.
 
 For **draft reports, protocols, executive summaries, and other client-facing Markdown deliverables**, use the **`technical-writer`** persona. The default Journaler system prompt and workspace layout tell the ambient model to suggest practical routes: immediate **`/agent technical-writer …`**, queue **`/task`** / journal lines with `@technical-writer:`, optional **`--project <id>`** for Django context, and **`/skills`** for full persona text. Delegated technical-writer runs use `prompts/technical-writer.txt`; saved artifacts often land under **`outputs/docs/`**.
 
@@ -513,9 +519,9 @@ If no live backend is configured, the command falls back to writing the task to 
 
 | Mode | Description |
 | --- | --- |
-| `"auto"` (default) | Claude API if `journaler.anthropic_api_key` or top-level `anthropic.api_key` (or env) is set, otherwise local MLX |
+| `"mlx"` (default) | Always the local model — the Journaler's already-loaded MLX model is reused via a thin adapter, so no second model is loaded and no extra RAM is consumed |
 | `"claude"` | Always Claude API — errors if no key is configured |
-| `"mlx"` | Always the local model — the Journaler's already-loaded MLX model is reused via a thin adapter, so no second model is loaded and no extra RAM is consumed |
+| `"auto"` | Claude API if a key is configured, otherwise local MLX (previous default behavior) |
 
 #### The `/skills` command
 
@@ -729,11 +735,15 @@ See [config/config.example.yaml](config/config.example.yaml) for all available o
 - `docker.cpu_limit` / `docker.memory_limit` / `docker.task_timeout` - Resource limits per container
 - `docker.max_concurrent` - Maximum parallel task containers (default: 3)
 - `docker.ollama_host` - Ollama URL as seen from inside containers (default: `http://ollama:11434`)
+- `journal.org_journal_dir` - Daily `YYYY-MM-DD.org` directory (Journaler uses this path directly; parent is the roam root for searches)
 - `journaler.*` - Journaler daemon settings (model, scan interval, briefing, chat, Slack)
+- `journaler.scan_org_roam_tree` - When false, scan only `journal.org_journal_dir` and `journaler.watch_dirs` (default: true)
+- `journaler.watch_dirs` - Extra org directories to include in scans
+- `journaler.journal_lookback_days` / `journaler.journal_max_files` - Window for parsing daily journals (defaults: 5 / 5)
 - `journaler.model_profile` - Name of the active entry in `journaler.models` (when the map is non-empty)
 - `journaler.models` - Optional map of named MLX profiles (`model_path`, `model_context_window`, sampling, `mlx_backend`, `enable_thinking`)
 - `journaler.model_context_window` - Context window for pressure math when not using per-profile values (default: 32768)
-- `journaler.agent_backend` - Backend for `/agent` delegation: `"auto"` (default), `"claude"`, or `"mlx"` (used by **`journaler start`** and **`journaler chat`**)
+- `journaler.agent_backend` - Backend for `/agent` delegation: `"mlx"` (default), `"claude"`, or `"auto"` (used by **`journaler start`** and **`journaler chat`**)
 - `journaler.anthropic_api_key` - Optional per-journaler Anthropic key (falls back to `anthropic.api_key` / env if unset; same scope as `agent_backend`)
 - `journaler.skills_dir` - Path to skills YAML directory (default: `skills/` at repo root; loaded into the system prompt for daemon and interactive chat)
 - `journaler.context_management.*` - Token pressure thresholds, compression triggers, EOD reset time, topic-shift behavior

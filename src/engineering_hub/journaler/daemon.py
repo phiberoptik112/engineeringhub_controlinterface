@@ -52,12 +52,13 @@ class JournalerConfig:
 
     model_path: str
     org_roam_dir: Path
+    journal_dir: Path
     workspace_dir: Path
     state_dir: Path
 
     scan_interval_min: int = 10
     briefing_enabled: bool = True
-    briefing_time: str = "07:00"
+    briefing_time: str = "09:00"
     briefing_output_dir: Path | None = None
 
     chat_enabled: bool = True
@@ -87,6 +88,9 @@ class JournalerConfig:
     mlx_backend: str = "auto"
 
     watch_dirs: list[Path] | None = None
+    scan_org_roam_tree: bool = True
+    journal_lookback_days: int = 5
+    journal_max_files: int = 5
 
     memory_service: MemoryService | None = None
 
@@ -99,15 +103,12 @@ class JournalerConfig:
     load_min_chars: int = 1024
     load_slack_tokens: int = 256
 
-    # Agent delegation settings
-    # anthropic_api_key: Anthropic API key for Claude-backed agent delegation.
-    #   If empty, delegation falls back to the local MLX model.
-    anthropic_api_key: str = ""
+    # Agent delegation settings (API key is not stored here — use Settings / ENGINEERING_HUB_* env).
     # agent_backend: Which LLM to use for delegated agent tasks.
-    #   "auto"   — Claude if api key present, else local MLX (default)
+    #   "mlx"    — local model (default; reuses Journaler's loaded model, no extra RAM)
     #   "claude" — always Claude API (error if no key)
-    #   "mlx"    — always local model (reuses Journaler's loaded model, no extra RAM)
-    agent_backend: str = "auto"
+    #   "auto"   — Claude if api key present, else local MLX
+    agent_backend: str = "mlx"
     # skills_dir: Path to the skills/ YAML directory.
     #   Defaults to the skills/ directory at the repo root.
     skills_dir: Path | None = None
@@ -151,10 +152,14 @@ def run_daemon(config: JournalerConfig, settings: Settings | None = None) -> Non
     # Init context scanner
     context = JournalContext(
         org_roam_dir=config.org_roam_dir,
+        journal_dir=config.journal_dir,
         workspace_dir=config.workspace_dir,
         memory_service=config.memory_service,
         state_dir=config.state_dir,
         watch_dirs=config.watch_dirs,
+        scan_org_roam_tree=config.scan_org_roam_tree,
+        journal_lookback_days=config.journal_lookback_days,
+        journal_max_files=config.journal_max_files,
     )
 
     # Init MLX backend (model loads here — takes ~10-30s for 32B)
@@ -187,7 +192,9 @@ def run_daemon(config: JournalerConfig, settings: Settings | None = None) -> Non
     # Do initial scan
     logger.info("Running initial scan...")
     context.scan()
-    workspace_map = build_workspace_layout(config.org_roam_dir, config.workspace_dir)
+    workspace_map = build_workspace_layout(
+        config.org_roam_dir, config.workspace_dir, config.journal_dir
+    )
     engine.update_context(context.get_current_context())
     # Re-set system prompt with actual context and workspace layout
     engine._system_prompt = format_system_prompt(
@@ -199,9 +206,12 @@ def run_daemon(config: JournalerConfig, settings: Settings | None = None) -> Non
     # Init agent delegator (bridges Journaler chat → AgentWorker)
     from engineering_hub.journaler.delegator import build_delegator
 
+    delegation_key = (
+        settings.journaler_delegation_api_key() if settings is not None else ""
+    )
     delegator = build_delegator(
         backend,
-        anthropic_api_key=config.anthropic_api_key,
+        anthropic_api_key=delegation_key,
         skills_dir=config.skills_dir,
         default_backend=config.agent_backend,
         output_dir=config.workspace_dir / "outputs",
@@ -320,10 +330,14 @@ def generate_briefing_now(
     if context is None:
         context = JournalContext(
             org_roam_dir=config.org_roam_dir,
+            journal_dir=config.journal_dir,
             workspace_dir=config.workspace_dir,
             memory_service=config.memory_service,
             state_dir=config.state_dir,
             watch_dirs=config.watch_dirs,
+            scan_org_roam_tree=config.scan_org_roam_tree,
+            journal_lookback_days=config.journal_lookback_days,
+            journal_max_files=config.journal_max_files,
         )
         context.scan()
 
