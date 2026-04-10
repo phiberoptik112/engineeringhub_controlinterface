@@ -22,6 +22,7 @@ class AgentType(str, Enum):
     EVALUATOR = "evaluator"
     TECHNICAL_REVIEWER = "technical-reviewer"
     WEEKLY_REVIEWER = "weekly-reviewer"
+    LATEX_WRITER = "latex-writer"
 
 
 def is_ingest_task(description: str) -> bool:
@@ -42,4 +43,5 @@ AGENT_PROMPT_FILES = {
     AgentType.EVALUATOR: "evaluator.txt",
     AgentType.TECHNICAL_REVIEWER: "technical-reviewer.txt",
     AgentType.WEEKLY_REVIEWER: "weekly-reviewer.txt",
+    AgentType.LATEX_WRITER: "latex-writer.txt",
 }

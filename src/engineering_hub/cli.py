@@ -11,7 +11,9 @@ from urllib.parse import urlparse
 from rich.console import Console
 from rich.logging import RichHandler
 from rich.markup import escape
+from rich.panel import Panel
 from rich.table import Table
+from rich.text import Text
 
 from engineering_hub.config.loader import find_config_file
 from engineering_hub.config.settings import Settings
@@ -697,6 +699,31 @@ def cmd_mcp_server(args: argparse.Namespace) -> int:
     return 0
 
 
+def _build_status_bar(engine: ConversationEngine, model_label: str) -> Panel:
+    """Render a one-line status panel for the journaler chat loop."""
+    status = engine.get_status()
+    raw_pct = status["utilization"]
+    pct_int = int(raw_pct.rstrip("%"))
+    filled = round(pct_int / 10)
+    gauge = "▓" * filled + "░" * (10 - filled)
+    color = "red" if pct_int >= 80 else ("yellow" if pct_int >= 60 else "green")
+    topic = status["current_topic"] or "—"
+    turns = status["history_turns"]
+    files = len(engine.list_loaded_files())
+
+    t = Text(overflow="ellipsis", no_wrap=True)
+    t.append(f" Model: {model_label}", style="cyan")
+    t.append(" │ ", style="dim")
+    t.append(f"Context: {raw_pct} {gauge}", style=color)
+    t.append(" │ ", style="dim")
+    t.append(f"Turns: {turns}", style="white")
+    t.append(" │ ", style="dim")
+    t.append(f"Topic: {topic}", style="magenta")
+    t.append(" │ ", style="dim")
+    t.append(f"Files: {files} ", style="blue")
+    return Panel(t, height=3, padding=(0, 0))
+
+
 def _handle_chat_slash_command(
     raw: str,
     engine: ConversationEngine,
@@ -890,7 +917,7 @@ def _handle_chat_slash_command(
             "  [cyan]/budget[/cyan]                    Show token budget breakdown\n"
             "  [cyan]/topic[/cyan]                     Show currently detected conversation topic\n"
             "  [cyan]/agent <type> <desc>[/cyan]      Delegate to a named agent (see README)\n"
-            "  [cyan]/agent_browse[/cyan]              Browse and pick an agent skill interactively\n"
+            "  [cyan]/agent_browse[/cyan]              Browse and pick an agent skill\n"
             "  [cyan]/skills[/cyan]                    List agent delegation skills / personas\n"
             "  [cyan]/export[/cyan]                    Export transcript (`/export --help`)\n"
             + write_cmds +
@@ -1346,7 +1373,14 @@ def cmd_journaler(args: argparse.Namespace) -> int:
         return 0
 
     elif sub == "chat":
-        from engineering_hub.journaler.chat_repl import configure_chat_readline, prompt_line
+        from engineering_hub.journaler.chat_repl import (
+            COMMAND_CATALOG,
+            _PALETTE_SENTINEL,
+            configure_chat_readline,
+            prompt_line,
+            set_pending_insertion,
+        )
+        from engineering_hub.journaler.file_browser import browse_commands
         from engineering_hub.journaler.delegator import build_delegator
         from engineering_hub.journaler.engine import ConversationEngine
         from engineering_hub.journaler.prompts import (
@@ -1412,11 +1446,13 @@ def cmd_journaler(args: argparse.Namespace) -> int:
 
         transcript_path = config.state_dir / "conversation.jsonl"
         max_hist = config.max_conversation_history
+        model_label = spec.profile_name or Path(spec.model_path).name
         console.print(
             "[green]Journaler ready. "
             "Type your questions (Ctrl-C, /exit, or exit to leave).[/green]\n"
             "[dim]Tip: /agent and /skills for agent personas; /model to switch profile; "
             "/load for files; /load_browse to browse; /help for commands.[/dim]\n"
+            "[dim]Ctrl+P opens the command palette. Tab completes slash commands.[/dim]\n"
             "[dim]Context: /status, /budget, /topic — "
             "Clear: /clear, /clear --summarize, /clear --hard[/dim]\n"
             "[dim]Input: Up/Down recall previous lines (saved under .journaler). "
@@ -1424,6 +1460,7 @@ def cmd_journaler(args: argparse.Namespace) -> int:
             f"Longer model memory: raise journaler.max_conversation_history "
             f"(now {max_hist}).[/dim]\n"
         )
+        console.print(_build_status_bar(engine, model_label))
         log = logging.getLogger(__name__)
         try:
             while True:
@@ -1432,6 +1469,11 @@ def cmd_journaler(args: argparse.Namespace) -> int:
                 except (KeyboardInterrupt, EOFError):
                     raise
                 if not user_input:
+                    continue
+                if user_input.lower() == _PALETTE_SENTINEL:
+                    selected = browse_commands(COMMAND_CATALOG)
+                    if selected:
+                        set_pending_insertion(selected)
                     continue
                 if user_input.lower() in ("exit", "quit", ":q"):
                     break
@@ -1458,6 +1500,7 @@ def cmd_journaler(args: argparse.Namespace) -> int:
                             f"[red]Command failed:[/red] {escape(str(exc))}\n"
                             "[dim]Type /help for commands. You can keep chatting.[/dim]\n"
                         )
+                    console.print(_build_status_bar(engine, model_label))
                     continue
                 try:
                     response = engine.chat(user_input)
@@ -1469,6 +1512,7 @@ def cmd_journaler(args: argparse.Namespace) -> int:
                     )
                     continue
                 console.print(f"\n[bold]Journaler:[/bold] {escape(response)}\n")
+                console.print(_build_status_bar(engine, model_label))
         except (KeyboardInterrupt, EOFError):
             pass
         console.print("\n[dim]Chat ended.[/dim]")

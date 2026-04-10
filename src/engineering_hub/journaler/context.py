@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import logging
+from collections import defaultdict
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -17,6 +18,7 @@ from engineering_hub.journaler.models import ContextSnapshot, ScanState
 from engineering_hub.journaler.org_parser import (
     extract_completed_tasks,
     extract_pending_tasks,
+    extract_topic_keywords,
     parse_org_file,
     summarize_file,
 )
@@ -25,6 +27,14 @@ if TYPE_CHECKING:
     from engineering_hub.memory.service import MemoryService
 
 logger = logging.getLogger(__name__)
+
+
+def _parse_date_key(key: str) -> date | None:
+    """Parse an ISO date string (YYYY-MM-DD) used as a journal_window key."""
+    try:
+        return date.fromisoformat(key)
+    except ValueError:
+        return None
 
 
 class JournalContext:
@@ -197,6 +207,9 @@ class JournalContext:
         all_completed: list[str] = []
         today_entries: list[dict[str, str]] = []
         project_changes: list[dict[str, str]] = []
+        # journal_window_delta accumulates entries from changed journal files only;
+        # merged with the cached window at snapshot time.
+        journal_window_delta: dict[str, list[dict[str, str]]] = {}
 
         for org_file in changed_files:
             if not self._should_parse_org_file(org_file, journal_sel):
@@ -205,8 +218,9 @@ class JournalContext:
             all_pending.extend(extract_pending_tasks(info.entries))
             all_completed.extend(extract_completed_tasks(info.entries))
 
-            # Journal headings for today / yesterday only (within selected files)
             file_date = self._extract_date_from_filename(org_file)
+
+            # today_entries: today + yesterday (backward-compatible)
             if file_date and file_date >= today - timedelta(days=1):
                 for entry in info.entries:
                     ts_str = ""
@@ -217,6 +231,21 @@ class JournalContext:
                         "heading": entry.title,
                         "content": entry.body[:300] if entry.body else "",
                     })
+
+            # journal_window: full lookback window, grouped by date
+            if file_date:
+                date_key = file_date.isoformat()
+                day_entries: list[dict[str, str]] = []
+                for entry in info.entries:
+                    ts_str = entry.timestamp.strftime("%H:%M") if entry.timestamp else ""
+                    day_entries.append({
+                        "time": ts_str,
+                        "heading": entry.title,
+                        "content": entry.body[:200] if entry.body else "",
+                        "state": entry.state or "",
+                        "tags": ",".join(entry.tags),
+                    })
+                journal_window_delta[date_key] = day_entries
 
             # Track project note changes
             summary = summarize_file(info, max_chars=300)
@@ -229,7 +258,7 @@ class JournalContext:
                     "summary": summary,
                 })
 
-        # Also scan today's journal even if it didn't change (for completeness on first run)
+        # Ensure today's journal is always represented in the window, even when unchanged
         today_journal = self.journal_dir / f"{today.isoformat()}.org"
         tj_resolved = today_journal.expanduser().resolve()
         if (
@@ -238,13 +267,26 @@ class JournalContext:
             and not any(f.resolve() == tj_resolved for f in changed_files)
         ):
             info = parse_org_file(today_journal)
-            # Merge pending/completed from today's journal if not already captured
             for task in extract_pending_tasks(info.entries):
                 if task not in all_pending:
                     all_pending.append(task)
             for task in extract_completed_tasks(info.entries):
                 if task not in all_completed:
                     all_completed.append(task)
+            # Add today to window even when not changed, for completeness
+            date_key = today.isoformat()
+            if date_key not in journal_window_delta:
+                day_entries = []
+                for entry in info.entries:
+                    ts_str = entry.timestamp.strftime("%H:%M") if entry.timestamp else ""
+                    day_entries.append({
+                        "time": ts_str,
+                        "heading": entry.title,
+                        "content": entry.body[:200] if entry.body else "",
+                        "state": entry.state or "",
+                        "tags": ",".join(entry.tags),
+                    })
+                journal_window_delta[date_key] = day_entries
 
         # Fetch recent agent outputs from memory
         recent_agent_outputs: list[dict[str, str]] = []
@@ -260,6 +302,30 @@ class JournalContext:
             except Exception as exc:
                 logger.warning(f"Memory browse failed during scan (non-fatal): {exc}")
 
+        # Merge the incremental window delta with the cached window, then prune
+        # dates outside the lookback window.
+        merged_window = dict(self._snapshot.journal_window)
+        merged_window.update(journal_window_delta)
+        lookback_cutoff = today - timedelta(days=self.journal_lookback_days)
+        merged_window = {
+            k: v for k, v in merged_window.items()
+            if _parse_date_key(k) is not None and _parse_date_key(k) >= lookback_cutoff  # type: ignore[operator]
+        }
+
+        # Carry over previous task_first_seen and record any new pending tasks
+        task_first_seen = dict(self._snapshot.task_first_seen)
+        today_str = today.isoformat()
+        new_pending = all_pending or self._snapshot.pending_tasks
+        for task in new_pending:
+            key = task[:80]
+            if key not in task_first_seen:
+                task_first_seen[key] = today_str
+
+        # Build derived topic data from the full merged window
+        recurring_topics = self._build_recurring_topics(merged_window)
+        active_roam_nodes = self._build_active_roam_nodes()
+        stale_tasks = self._flag_stale_tasks(new_pending, merged_window, task_first_seen)
+
         # Detect significance
         has_significant = bool(changed_files) or bool(new_outputs)
         change_parts: list[str] = []
@@ -273,13 +339,18 @@ class JournalContext:
             last_scan=now.isoformat(timespec="seconds"),
             today_date=today.isoformat(),
             today_entries=today_entries or self._snapshot.today_entries,
-            pending_tasks=all_pending or self._snapshot.pending_tasks,
+            pending_tasks=new_pending,
             completed_tasks=all_completed or self._snapshot.completed_tasks,
             recent_project_changes=project_changes or self._snapshot.recent_project_changes,
             recent_agent_outputs=recent_agent_outputs or self._snapshot.recent_agent_outputs,
             active_projects=self._snapshot.active_projects,
             has_significant_changes=has_significant,
             change_summary="; ".join(change_parts) if change_parts else "no changes",
+            journal_window=merged_window,
+            recurring_topics=recurring_topics,
+            active_roam_nodes=active_roam_nodes,
+            stale_tasks=stale_tasks,
+            task_first_seen=task_first_seen,
         )
 
         self._state.last_scan = now.isoformat(timespec="seconds")
@@ -289,7 +360,76 @@ class JournalContext:
         logger.info(
             f"Scan complete: {len(changed_files)} org files, "
             f"{len(new_outputs)} outputs, "
-            f"{len(all_pending)} pending tasks"
+            f"{len(all_pending)} pending tasks, "
+            f"{len(recurring_topics)} recurring topics, "
+            f"{len(stale_tasks)} stale tasks"
+        )
+        return self._snapshot
+
+    def full_window_scan(self) -> ContextSnapshot:
+        """Force-reparse all files in the journal lookback window regardless of mtime.
+
+        Intended for the periodic deep-scan schedule (default every 60 min) to
+        keep topic digests fresh even when no files have been modified.
+        """
+        now = datetime.now()
+        today = date.today()
+        journal_sel = self._selected_journal_files(today)
+
+        journal_window: dict[str, list[dict[str, str]]] = {}
+
+        for org_file in journal_sel:
+            if not org_file.exists():
+                continue
+            file_date = self._extract_date_from_filename(org_file)
+            if not file_date:
+                continue
+            info = parse_org_file(org_file)
+            date_key = file_date.isoformat()
+            day_entries: list[dict[str, str]] = []
+            for entry in info.entries:
+                ts_str = entry.timestamp.strftime("%H:%M") if entry.timestamp else ""
+                day_entries.append({
+                    "time": ts_str,
+                    "heading": entry.title,
+                    "content": entry.body[:200] if entry.body else "",
+                    "state": entry.state or "",
+                    "tags": ",".join(entry.tags),
+                })
+            journal_window[date_key] = day_entries
+            # Update mtime record so incremental scan won't re-parse unchanged files
+            self._state.record(org_file)
+
+        recurring_topics = self._build_recurring_topics(journal_window)
+        active_roam_nodes = self._build_active_roam_nodes()
+        stale_tasks = self._flag_stale_tasks(
+            self._snapshot.pending_tasks, journal_window, self._snapshot.task_first_seen
+        )
+
+        self._snapshot = ContextSnapshot(
+            last_scan=self._snapshot.last_scan,
+            today_date=self._snapshot.today_date,
+            today_entries=self._snapshot.today_entries,
+            pending_tasks=self._snapshot.pending_tasks,
+            completed_tasks=self._snapshot.completed_tasks,
+            recent_project_changes=self._snapshot.recent_project_changes,
+            recent_agent_outputs=self._snapshot.recent_agent_outputs,
+            active_projects=self._snapshot.active_projects,
+            has_significant_changes=False,
+            change_summary="deep scan refresh",
+            journal_window=journal_window,
+            recurring_topics=recurring_topics,
+            active_roam_nodes=active_roam_nodes,
+            stale_tasks=stale_tasks,
+            task_first_seen=self._snapshot.task_first_seen,
+        )
+
+        self._save_state()
+        self._save_cache()
+        logger.info(
+            f"Deep scan complete: {len(journal_window)} journal days, "
+            f"{len(recurring_topics)} recurring topics, "
+            f"{len(active_roam_nodes)} active roam nodes"
         )
         return self._snapshot
 
@@ -313,6 +453,12 @@ class JournalContext:
                 lines.append(f"  _(+ {len(s.pending_tasks) - 15} more)_")
             lines.append("")
 
+        if s.stale_tasks:
+            lines.append("### Possibly Stalled")
+            for task in s.stale_tasks[:8]:
+                lines.append(f"- [ ] {task}  _(no recent journal mention)_")
+            lines.append("")
+
         if s.completed_tasks:
             lines.append("### Recently Completed")
             for task in s.completed_tasks[:10]:
@@ -326,6 +472,50 @@ class JournalContext:
                 lines.append(f"- {time_prefix}{entry.get('heading', '')}")
                 if entry.get("content"):
                     lines.append(f"  {entry['content'][:150]}")
+            lines.append("")
+
+        # Multi-day journal thread (all lookback days beyond today/yesterday)
+        if s.journal_window:
+            sorted_dates = sorted(s.journal_window.keys(), reverse=True)
+            older_dates = [d for d in sorted_dates if d < date.today().isoformat()]
+            if older_dates:
+                lines.append(f"### Journal Thread (last {self.journal_lookback_days} days)")
+                for date_key in older_dates[:4]:
+                    day_entries = s.journal_window[date_key]
+                    if not day_entries:
+                        continue
+                    lines.append(f"**{date_key}**")
+                    for entry in day_entries[:5]:
+                        state_prefix = f"[{entry['state']}] " if entry.get("state") else ""
+                        time_prefix = f"**{entry['time']}** " if entry.get("time") else ""
+                        lines.append(f"- {time_prefix}{state_prefix}{entry.get('heading', '')}")
+                        if entry.get("content"):
+                            lines.append(f"  {entry['content'][:120]}")
+                    if len(day_entries) > 5:
+                        lines.append(f"  _(+ {len(day_entries) - 5} more entries)_")
+                lines.append("")
+
+        if s.recurring_topics:
+            lines.append("### Recurring Topics")
+            for topic in s.recurring_topics[:10]:
+                days = topic.get("days_seen", 1)
+                last = topic.get("last_seen", "")
+                lines.append(
+                    f"- **{topic.get('topic', '')}** "
+                    f"_(seen {days}d, last {last})_"
+                )
+            lines.append("")
+
+        if s.active_roam_nodes:
+            lines.append("### Active Project Notes")
+            for node in s.active_roam_nodes[:8]:
+                tags_str = f" `{node['tags']}`" if node.get("tags") else ""
+                lines.append(
+                    f"- **{node.get('title', node.get('path_rel', '?'))}**{tags_str}"
+                    f" (modified {node.get('modified', '')[:10]})"
+                )
+                if node.get("top_headings"):
+                    lines.append(f"  {node['top_headings']}")
             lines.append("")
 
         if s.recent_project_changes:
@@ -421,6 +611,151 @@ class JournalContext:
                 pass
 
         return "\n".join(lines)
+
+    # ------------------------------------------------------------------
+    # Topic / node analysis helpers
+    # ------------------------------------------------------------------
+
+    def _build_recurring_topics(
+        self, window: dict[str, list[dict[str, str]]]
+    ) -> list[dict[str, str | int]]:
+        """Identify topics that appear on 2+ distinct days in the journal window.
+
+        Returns a list of dicts sorted by days_seen descending, capped at 10.
+        """
+        # topic_str -> set of date strings where it appeared
+        topic_days: dict[str, set[str]] = defaultdict(set)
+        # topic_str -> total occurrence count
+        topic_count: dict[str, int] = defaultdict(int)
+
+        for date_key, entries in window.items():
+            seen_today: set[str] = set()
+            for entry in entries:
+                heading = (entry.get("heading") or "").strip()
+                if not heading:
+                    continue
+                normalized = heading.lower().rstrip(".")
+                # Skip generic catch-all headings that aren't meaningful
+                if normalized in {
+                    "notes", "tasks", "overnight agent tasks", "log",
+                    "meetings", "todo", "done", "agenda",
+                }:
+                    continue
+                topic_count[normalized] += 1
+                seen_today.add(normalized)
+            for topic in seen_today:
+                topic_days[topic].add(date_key)
+
+        results = []
+        for topic, days in topic_days.items():
+            if len(days) >= 2:
+                last_seen = max(days)
+                results.append({
+                    "topic": topic,
+                    "days_seen": len(days),
+                    "count": topic_count[topic],
+                    "last_seen": last_seen,
+                })
+
+        results.sort(key=lambda x: (-x["days_seen"], -x["count"]))  # type: ignore[operator]
+        return results[:10]
+
+    def _build_active_roam_nodes(self) -> list[dict[str, str]]:
+        """Return recently modified org-roam nodes (excluding daily journals).
+
+        Filters to files with mtime within the lookback window, capped at 12.
+        """
+        roam_dir = self.org_roam_dir.expanduser().resolve()
+        journal_dir = self._resolved_journal_dir()
+        if not roam_dir.exists():
+            return []
+
+        cutoff_mtime = (
+            datetime.now() - timedelta(days=self.journal_lookback_days)
+        ).timestamp()
+
+        candidates: list[tuple[float, Path]] = []
+        for org_file in roam_dir.rglob("*.org"):
+            # Skip files in the daily journals directory
+            try:
+                org_file.relative_to(journal_dir)
+                continue
+            except ValueError:
+                pass
+            try:
+                mtime = org_file.stat().st_mtime
+            except OSError:
+                continue
+            if mtime >= cutoff_mtime:
+                candidates.append((mtime, org_file))
+
+        # Sort newest-first, take top 12
+        candidates.sort(key=lambda x: x[0], reverse=True)
+        nodes: list[dict[str, str]] = []
+        for mtime, org_file in candidates[:12]:
+            info = parse_org_file(org_file, max_body_chars=100)
+            try:
+                path_rel = str(org_file.relative_to(roam_dir))
+            except ValueError:
+                path_rel = str(org_file)
+            top_headings = ", ".join(
+                e.title for e in info.entries[:2] if e.title
+            )
+            nodes.append({
+                "title": info.title or org_file.stem,
+                "tags": " ".join(info.filetags),
+                "path_rel": path_rel,
+                "modified": datetime.fromtimestamp(mtime).isoformat(timespec="seconds"),
+                "top_headings": top_headings,
+            })
+        return nodes
+
+    def _flag_stale_tasks(
+        self,
+        pending_tasks: list[str],
+        window: dict[str, list[dict[str, str]]],
+        task_first_seen: dict[str, str],
+        threshold_days: int = 3,
+    ) -> list[str]:
+        """Return pending tasks that have no recent journal mention and are old enough.
+
+        A task is considered stale when:
+        - It first appeared >= threshold_days ago, AND
+        - No journal window entry's heading or content contains a 4+-word fragment of it.
+        """
+        today = date.today()
+        cutoff = (today - timedelta(days=threshold_days)).isoformat()
+
+        # Build a flat searchable corpus from all window entries
+        all_text = " ".join(
+            f"{e.get('heading', '')} {e.get('content', '')}".lower()
+            for entries in window.values()
+            for e in entries
+        )
+
+        stale: list[str] = []
+        for task in pending_tasks:
+            key = task[:80]
+            first_seen = task_first_seen.get(key, today.isoformat())
+            if first_seen > cutoff:
+                continue  # too recent to flag
+            # Check if any significant fragment of the task appears in the window
+            words = task.lower().split()
+            if len(words) <= 2:
+                # Short tasks: require exact substring match
+                if task.lower() in all_text:
+                    continue
+            else:
+                # Longer tasks: look for a 3-word contiguous fragment
+                found = any(
+                    " ".join(words[i:i + 3]) in all_text
+                    for i in range(len(words) - 2)
+                )
+                if found:
+                    continue
+            stale.append(task)
+
+        return stale[:10]
 
     # ------------------------------------------------------------------
     # State persistence

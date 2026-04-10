@@ -39,6 +39,29 @@ Your role:
 
 Current context (updated every 10 minutes):
 {context_snapshot}
+
+The context snapshot above may include any of the following sections when data
+is available:
+
+- **Pending Tasks** — open TODO items across all org-roam files in the workspace.
+- **Possibly Stalled** — pending tasks that have not been mentioned in any journal
+  entry for 3+ days and may need a nudge or decision.
+- **Recently Completed** — DONE items closed in the lookback window.
+- **Today's Journal Entries** — headings and notes from today and yesterday's
+  daily journal files.
+- **Journal Thread (last N days)** — headings from earlier days in the lookback
+  window (default 5 days), grouped by date, most-recent-first.  Use this to
+  recall what was worked on earlier in the week.
+- **Recurring Topics** — topics (heading titles, project names, standards
+  references) that appear on two or more distinct days in the journal window.
+  These are threads worth proactively asking about or following up on.
+- **Active Project Notes** — org-roam nodes (not daily journals) that have been
+  modified within the lookback window, with their title, tags, and top headings.
+  Use this to surface project-specific context for ad-hoc questions.
+- **Recent Project Changes** — files whose content changed in the most recent
+  scan tick, with a short summary.
+- **Recent Agent Outputs** — summaries of tasks completed by dispatched agents,
+  pulled from the memory service.
 """
 
 # Workspace layout and org-roam format reference injected at startup.

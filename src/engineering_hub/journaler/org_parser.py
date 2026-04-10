@@ -51,6 +51,12 @@ _AGENT_TASK = re.compile(
     r"^\s*[-*]\s+\[([xX ])\]\s+@([\w-]+):\s+(.+)$", re.MULTILINE
 )
 
+# Standards references: ASTM E336, ISO 717-1, IBC 1207.3, E1007, etc.
+_STANDARDS_REF = re.compile(
+    r"\b(?:ASTM\s+[A-Z]\d{3,4}(?:[/-]\d+)?|ISO\s+\d{3,5}(?:[/-]\d+)?|IBC\s+[\d.]+|E\d{3,4}(?:-\d+)?|ANSI\s+[\w/.-]+)\b",
+    re.IGNORECASE,
+)
+
 
 def parse_org_file(path: Path, max_body_chars: int = 500) -> OrgFileInfo:
     """Extract structured entries from an org file.
@@ -125,6 +131,62 @@ def extract_agent_tasks(entries: list[OrgEntry]) -> list[dict]:
                 })
         results.extend(extract_agent_tasks(entry.children))
     return results
+
+
+def extract_topic_keywords(info: OrgFileInfo) -> list[str]:
+    """Extract topic keywords from a parsed org file.
+
+    Returns a deduplicated list of:
+    - Heading titles (excluding raw TODO/DONE/WAITING/CANCELLED keywords alone)
+    - Standards references found in headings or body text
+    - Filetags from the file-level metadata
+    - Headings tagged with :meeting:, :call:, or :client:
+
+    Results are suitable for cross-day topic frequency analysis.
+    """
+    _SKIP_STATES = {"TODO", "DONE", "WAITING", "CANCELLED"}
+    _NOTABLE_TAGS = {"meeting", "call", "client", "project", "review"}
+
+    seen: set[str] = set()
+    keywords: list[str] = []
+
+    def _add(kw: str) -> None:
+        kw = kw.strip()
+        if kw and kw not in seen:
+            seen.add(kw)
+            keywords.append(kw)
+
+    # File-level tags
+    for tag in info.filetags:
+        _add(tag)
+
+    def _visit(entries: list[OrgEntry]) -> None:
+        for entry in entries:
+            title = entry.title.strip()
+            # Skip headings that are just a bare task state word
+            if title.upper() in _SKIP_STATES:
+                continue
+            if title:
+                _add(title)
+
+            # Notable-tag headings get added even if already seen (for signal)
+            for tag in entry.tags:
+                if tag.lower() in _NOTABLE_TAGS:
+                    # prefix with tag type for clarity, e.g. "meeting: Client call"
+                    _add(f"{tag.lower()}: {title}")
+
+            # Standards references from body text
+            for m in _STANDARDS_REF.finditer(entry.body):
+                _add(m.group(0).upper().strip())
+
+            # Standards refs in the title itself
+            for m in _STANDARDS_REF.finditer(title):
+                _add(m.group(0).upper().strip())
+
+            _visit(entry.children)
+
+    _visit(info.entries)
+    return keywords
 
 
 def summarize_file(info: OrgFileInfo, max_chars: int = 800) -> str:

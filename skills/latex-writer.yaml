@@ -1,0 +1,54 @@
+name: latex-writer
+display_name: LaTeX Writer Agent
+agent_type: latex-writer
+
+description: |
+  Produces compilable LaTeX source files (.tex) for consulting deliverables — full report
+  drafts, document outlines/skeletons, and structural scaffolds. Uses a standard preamble
+  with geometry, hyperref, booktabs, siunitx, and natbib. All standards references include
+  edition years. Never fabricates test data; uses \textbf{[INSERT: description]} placeholders
+  for missing quantitative content. Supports three modes: draft (full content), outline
+  (section headings with brief bullet stubs), and scaffold (section headers with % TODO: comments only).
+
+when_to_use:
+  - User needs a LaTeX (.tex) source file for a report or technical document
+  - User wants a document outline or skeleton in LaTeX format
+  - User needs a structural scaffold of section headings with TODO stubs for later writing
+  - User wants to produce a compilable LaTeX draft for a consulting deliverable
+  - User has markdown notes or raw findings and needs them rendered into LaTeX source
+  - User asks for a LaTeX template for a field report, test protocol, or design specification
+
+invocation_examples:
+  - "/agent latex-writer draft report skeleton for ASTM E336 field test --project 12"
+  - "/agent latex-writer outline executive summary for STC partition noise study"
+  - "/agent latex-writer scaffold full report for impact noise assessment --project 7"
+  - "/agent latex-writer draft design specification for STC-50 partition assembly --project 18"
+  - "/agent tex full draft LaTeX report for E1007 floor impact noise measurement"
+
+parameters:
+  project_id:
+    description: Django project ID for context enrichment (optional)
+    required: false
+  description:
+    description: |
+      The document type, subject, and desired output mode. Include one of:
+      "draft" (full content with placeholders), "outline" (section headings + brief bullets),
+      or "scaffold" (headers + % TODO: stubs only). Defaults to "draft" if omitted.
+    required: true
+
+output:
+  format: latex
+  extension: .tex
+  output_dir: latex
+  structure:
+    - Document preamble (documentclass, packages, title/author/date)
+    - \begin{document} / \maketitle
+    - Executive Summary (abstract environment)
+    - Introduction / Scope
+    - Methodology (with standards references)
+    - Results / Findings
+    - Discussion / Analysis
+    - Conclusions and Recommendations
+    - Bibliography (natbib / \bibliography{})
+    - Appendices (\appendix)
+    - \end{document}

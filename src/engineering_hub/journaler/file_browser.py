@@ -30,6 +30,16 @@ class BrowseEntry:
     selected: bool = False
 
 
+@dataclass
+class CommandEntry:
+    """A single slash command shown in the command palette."""
+
+    name: str
+    args_hint: str
+    description: str
+    category: str
+
+
 # ---------------------------------------------------------------------------
 # Public entry points
 # ---------------------------------------------------------------------------
@@ -80,6 +90,21 @@ def browse_skills(skills: list[SkillDef]) -> SkillDef | None:
         return None
     try:
         return curses.wrapper(_browse_skills_inner, skills)
+    except Exception:
+        return None
+
+
+def browse_commands(commands: list[CommandEntry]) -> str | None:
+    """Open the command palette overlay.
+
+    Returns the selected command text (e.g. ``/load ``), or ``None`` on cancel.
+    The returned string is intended to be pre-filled into the readline input
+    buffer so the user can edit and submit it.
+    """
+    if not commands:
+        return None
+    try:
+        return curses.wrapper(_browse_commands_inner, commands)
     except Exception:
         return None
 
@@ -438,7 +463,8 @@ def _browse_skills_inner(
         for si, skill in enumerate(skills):
             lines: list[str] = []
             lines.append(f"  {skill.display_name}")
-            desc_first = skill.description.strip().splitlines()[0] if skill.description.strip() else ""
+            desc = skill.description.strip()
+            desc_first = desc.splitlines()[0] if desc else ""
             if desc_first:
                 wrapped = textwrap.wrap(desc_first, width=max(20, max_x - 8))
                 for wl in wrapped:
@@ -564,3 +590,242 @@ def _browse_skills_inner(
 
         elif key == curses.KEY_END:
             cursor = len(skills) - 1
+
+
+# ---------------------------------------------------------------------------
+# Command palette (used by Ctrl+P / browse_commands)
+# ---------------------------------------------------------------------------
+
+_CP_CATEGORY = 8
+
+
+def _fuzzy_match(query: str, text: str) -> bool:
+    """Return True if all chars of *query* appear in *text* as a subsequence."""
+    if not query:
+        return True
+    text_lower = text.lower()
+    query_lower = query.lower()
+    pos = 0
+    for ch in query_lower:
+        idx = text_lower.find(ch, pos)
+        if idx == -1:
+            return False
+        pos = idx + 1
+    return True
+
+
+def _browse_commands_inner(
+    stdscr: curses.window,
+    commands: list[CommandEntry],
+) -> str | None:
+    curses.start_color()
+    curses.use_default_colors()
+    curses.init_pair(_CP_DIR, curses.COLOR_BLUE, -1)
+    curses.init_pair(_CP_FILE, -1, -1)
+    curses.init_pair(_CP_SELECTED, curses.COLOR_GREEN, -1)
+    curses.init_pair(_CP_HEADER, curses.COLOR_CYAN, -1)
+    curses.init_pair(_CP_FOOTER, curses.COLOR_YELLOW, -1)
+    curses.init_pair(_CP_CURSOR, curses.COLOR_BLACK, curses.COLOR_WHITE)
+    curses.init_pair(_CP_DESC, curses.COLOR_WHITE, -1)
+    curses.init_pair(_CP_CATEGORY, curses.COLOR_CYAN, -1)
+    curses.curs_set(0)
+    stdscr.keypad(True)
+
+    filter_text = ""
+    cursor = 0
+    scroll_offset = 0
+
+    while True:
+        stdscr.erase()
+        max_y, max_x = stdscr.getmaxyx()
+
+        header_lines = 2
+        footer_lines = 2
+        list_height = max(1, max_y - header_lines - footer_lines)
+
+        # -- Apply fuzzy filter -----------------------------------------------
+        if filter_text:
+            filtered = [
+                e for e in commands
+                if _fuzzy_match(filter_text, e.name + " " + e.description)
+            ]
+        else:
+            filtered = list(commands)
+
+        # -- Build visual rows: category headers + command rows ---------------
+        # visual_rows: list of (entry | None, display_text, is_category_header)
+        visual_rows: list[tuple[CommandEntry | None, str, bool]] = []
+        last_category: str | None = None
+        for entry in filtered:
+            if not filter_text and entry.category != last_category:
+                visual_rows.append((None, f" {entry.category.upper()}", True))
+                last_category = entry.category
+            visual_rows.append((entry, "", False))
+
+        # Command index list (for cursor tracking)
+        cmd_indices = [i for i, (e, _, _) in enumerate(visual_rows) if e is not None]
+        n_cmds = len(cmd_indices)
+
+        cursor = max(0, min(cursor, n_cmds - 1)) if n_cmds else 0
+
+        # Determine the visual row index of the cursor
+        cursor_vr = cmd_indices[cursor] if cmd_indices else 0
+
+        # Scroll to keep cursor visible
+        if cursor_vr < scroll_offset:
+            scroll_offset = cursor_vr
+        if cursor_vr >= scroll_offset + list_height:
+            scroll_offset = cursor_vr - list_height + 1
+        scroll_offset = max(0, scroll_offset)
+
+        # -- Header -----------------------------------------------------------
+        filter_display = filter_text or ""
+        filter_box = f"[filter: {filter_display:<16}]"
+        header_left = " Command Palette  "
+        header_text = header_left + filter_box
+        stdscr.attron(curses.color_pair(_CP_HEADER) | curses.A_BOLD)
+        stdscr.addnstr(0, 0, "─" * max_x, max_x)
+        stdscr.addnstr(0, 0, header_text[:max_x - 1], max_x - 1)
+        stdscr.attroff(curses.color_pair(_CP_HEADER) | curses.A_BOLD)
+        stdscr.addnstr(1, 0, "─" * max_x, max_x)
+
+        # -- Draw visible rows ------------------------------------------------
+        if not visual_rows:
+            stdscr.attron(curses.A_DIM)
+            try:
+                stdscr.addnstr(header_lines + 1, 2, "(no matching commands)", max_x - 3)
+            except curses.error:
+                pass
+            stdscr.attroff(curses.A_DIM)
+        else:
+            for i in range(list_height):
+                vr_idx = scroll_offset + i
+                if vr_idx >= len(visual_rows):
+                    break
+                entry, _, is_cat = visual_rows[vr_idx]
+                row = header_lines + i
+                if row >= max_y - footer_lines:
+                    break
+
+                if is_cat:
+                    try:
+                        stdscr.addnstr(
+                            row, 0,
+                            visual_rows[vr_idx][1].ljust(max_x),
+                            max_x - 1,
+                            curses.color_pair(_CP_CATEGORY) | curses.A_BOLD | curses.A_DIM,
+                        )
+                    except curses.error:
+                        pass
+                    continue
+
+                assert entry is not None
+                # Find this entry's position in cmd_indices to check if cursor
+                cmd_pos = next(
+                    (ci for ci, vi in enumerate(cmd_indices) if vi == vr_idx), -1
+                )
+                is_active = cmd_pos == cursor
+
+                # Build the display line
+                name_col = f" {entry.name:<18}"
+                args_col = f"{entry.args_hint:<16}" if entry.args_hint else " " * 16
+                desc_budget = max(0, max_x - len(name_col) - len(args_col) - 4)
+                desc = entry.description
+                if len(desc) > desc_budget > 3:
+                    desc = desc[: desc_budget - 1] + "…"
+
+                marker = ">" if is_active else " "
+                line = f" {marker}{name_col}{args_col}  {desc}"
+
+                attr: int
+                if is_active:
+                    attr = curses.color_pair(_CP_CURSOR) | curses.A_BOLD
+                else:
+                    attr = curses.color_pair(_CP_FILE)
+
+                try:
+                    stdscr.addnstr(row, 0, line.ljust(max_x), max_x - 1, attr)
+                except curses.error:
+                    pass
+
+            # Scroll indicators
+            if scroll_offset > 0:
+                try:
+                    stdscr.addnstr(header_lines, max_x - 2, "▲", 1, curses.A_DIM)
+                except curses.error:
+                    pass
+            if scroll_offset + list_height < len(visual_rows):
+                try:
+                    stdscr.addnstr(
+                        header_lines + list_height - 1, max_x - 2, "▼", 1, curses.A_DIM,
+                    )
+                except curses.error:
+                    pass
+
+        # -- Footer -----------------------------------------------------------
+        footer_y = max_y - footer_lines
+        if footer_y > header_lines:
+            try:
+                stdscr.addnstr(footer_y, 0, "─" * max_x, max_x)
+            except curses.error:
+                pass
+            stdscr.attron(curses.color_pair(_CP_FOOTER))
+            controls = " ↑↓ navigate  type to filter  Backspace erase  Enter select  Esc cancel"
+            try:
+                stdscr.addnstr(footer_y + 1, 0, controls, max_x - 1)
+            except curses.error:
+                pass
+            stdscr.attroff(curses.color_pair(_CP_FOOTER))
+
+        stdscr.refresh()
+
+        # -- Input handling ---------------------------------------------------
+        key = stdscr.getch()
+
+        if key == 27:  # Esc → cancel
+            return None
+
+        if key == curses.KEY_UP or key == ord("k"):
+            if cursor > 0:
+                cursor -= 1
+
+        elif key == curses.KEY_DOWN or key == ord("j"):
+            if cursor < n_cmds - 1:
+                cursor += 1
+
+        elif key == curses.KEY_SR:  # Shift+Up
+            cursor = max(0, cursor - _FAST_SCROLL_LINES)
+
+        elif key == curses.KEY_SF:  # Shift+Down
+            cursor = min(max(0, n_cmds - 1), cursor + _FAST_SCROLL_LINES)
+
+        elif key == curses.KEY_PPAGE:
+            cursor = max(0, cursor - list_height)
+
+        elif key == curses.KEY_NPAGE:
+            cursor = min(max(0, n_cmds - 1), cursor + list_height)
+
+        elif key == curses.KEY_HOME:
+            cursor = 0
+
+        elif key == curses.KEY_END:
+            cursor = max(0, n_cmds - 1)
+
+        elif key in (curses.KEY_ENTER, 10, 13):
+            if not cmd_indices:
+                continue
+            entry, _, _ = visual_rows[cmd_indices[cursor]]
+            if entry is None:
+                continue
+            return entry.name + (" " if entry.args_hint else "")
+
+        elif key in (curses.KEY_BACKSPACE, 127, 8):  # Backspace / DEL
+            if filter_text:
+                filter_text = filter_text[:-1]
+                cursor = 0
+                scroll_offset = 0
+
+        elif 32 <= key <= 126:  # Printable ASCII
+            filter_text += chr(key)
+            cursor = 0
+            scroll_offset = 0

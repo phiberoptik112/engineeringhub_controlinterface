@@ -92,6 +92,10 @@ class JournalerConfig:
     journal_lookback_days: int = 5
     journal_max_files: int = 5
 
+    # Periodic deep scan: force-reparses the full journal window regardless of mtime.
+    # Set to 0 to disable.
+    deep_scan_interval_min: int = 60
+
     memory_service: MemoryService | None = None
 
     # Optional PDF reference corpus (libraryfiles-corpus); used for per-turn RAG in chat.
@@ -260,6 +264,20 @@ def run_daemon(config: JournalerConfig, settings: Settings | None = None) -> Non
         skills_suffix=skills_suffix,
     )
 
+    if config.deep_scan_interval_min > 0:
+        schedule.every(config.deep_scan_interval_min).minutes.do(
+            _deep_scan_tick,
+            context=context,
+            engine=engine,
+            system_template=system_template,
+            workspace_map=workspace_map,
+            skills_suffix=skills_suffix,
+        )
+        logger.info(
+            f"Deep scan (full journal window) scheduled every "
+            f"{config.deep_scan_interval_min} min"
+        )
+
     if config.briefing_enabled:
         schedule.every().day.at(config.briefing_time).do(
             _morning_briefing,
@@ -406,6 +424,37 @@ def _tick(
 
     if snapshot.has_significant_changes:
         logger.info(f"Significant changes detected: {snapshot.change_summary}")
+
+
+def _deep_scan_tick(
+    context: JournalContext,
+    engine: ConversationEngine,
+    system_template: str,
+    workspace_map: str = "",
+    skills_suffix: str = "",
+) -> None:
+    """Hourly deep-scan cycle.
+
+    Forces a full re-parse of the journal lookback window (ignoring mtimes) so
+    that recurring-topic and active-roam-node digests stay fresh even when no
+    files have been edited since the last scan.
+    """
+    snapshot = context.full_window_scan()
+    current_context = context.get_current_context()
+    engine.update_context(current_context)
+    prompt = format_system_prompt(
+        system_template, current_context, workspace_map=workspace_map
+    )
+    if skills_suffix:
+        prompt = prompt.rstrip() + "\n\n" + skills_suffix
+    engine._system_prompt = prompt
+
+    logger.info(
+        f"Deep scan refreshed context: "
+        f"{len(snapshot.recurring_topics)} recurring topics, "
+        f"{len(snapshot.active_roam_nodes)} active roam nodes, "
+        f"{len(snapshot.stale_tasks)} stale tasks"
+    )
 
 
 def _morning_briefing(

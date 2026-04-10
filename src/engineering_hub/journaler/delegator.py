@@ -108,6 +108,10 @@ _AGENT_ALIASES: dict[str, str] = {
     "reviewer": "technical-reviewer",
     "weekly-reviewer": "weekly-reviewer",
     "weekly": "weekly-reviewer",
+    "latex-writer": "latex-writer",
+    "latex": "latex-writer",
+    "tex-writer": "latex-writer",
+    "tex": "latex-writer",
 }
 
 

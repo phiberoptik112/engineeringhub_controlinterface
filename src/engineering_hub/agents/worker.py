@@ -139,8 +139,13 @@ class AgentWorker:
                 AgentType.REF_ENGINEER: "reviews",
                 AgentType.EVALUATOR: "analysis",
                 AgentType.TECHNICAL_REVIEWER: "reviews",
+                AgentType.LATEX_WRITER: "latex",
+            }
+            agent_extensions = {
+                AgentType.LATEX_WRITER: ".tex",
             }
             agent_dir = agent_dirs.get(task.agent_type, "outputs")
+            ext = agent_extensions.get(task.agent_type, ".md")
             project_id = task.project_id or "unknown"
 
             desc_slug = "".join(
@@ -149,7 +154,7 @@ class AgentWorker:
             )
             desc_slug = "-".join(filter(None, desc_slug.split("-")))
 
-            output_path = self.output_dir / agent_dir / f"project-{project_id}-{desc_slug}.md"
+            output_path = self.output_dir / agent_dir / f"project-{project_id}-{desc_slug}{ext}"
 
         output_path.parent.mkdir(parents=True, exist_ok=True)
         output_path.write_text(response, encoding="utf-8")

@@ -155,8 +155,10 @@ In **`journaler chat`**, **`/export`** runs the same pipeline: if you do not pas
 /export -o ~/path/to/out.org    Same flags as `engineering-hub journaler export`
 /export --help                  Full `/export` flag list
 /agent technical-writer ...     Delegate inline (see Agent Delegation below)
+/agent_browse                   Browse and pick an agent skill interactively
 /skills                         List delegation skills / personas from skills/*.yaml
 /open today                     Set /edit target to today's journal (or /open <path>, /open <title>)
+/edit_browse                    Browse org-roam files to set /edit target
 /edit Section :: body text      Append under a heading in the file opened with /open
 /help                           Show all slash commands
 ```
@@ -455,6 +457,7 @@ While in `engineering-hub journaler chat`, any input starting with `/` is handle
 | Command | Description |
 | --- | --- |
 | `/agent <type> <desc> [--project <id>] [--backend mlx\|claude]` | Delegate a task to a named agent and get the result inline. Types: `research`, `technical-writer`, `standards-checker`, `technical-reviewer`, `weekly-reviewer` |
+| `/agent_browse` | Interactive skill picker — arrow keys to browse agents, Enter to select, then type a task description |
 | `/skills` | List all available agent delegation skills with descriptions and examples |
 
 **Org-roam write operations**
@@ -470,6 +473,7 @@ While in `engineering-hub journaler chat`, any input starting with `/` is handle
 | `/open <path>` | Set target to an existing `.org` file; path must resolve under the configured org-roam directory |
 | `/open <title fragment>` | Set target when exactly one file matches `#+title:` (substring, case-insensitive); otherwise list matches for disambiguation |
 | `/edit <heading> :: <text>` | Append text under a heading in the note opened with `/open` (same ` :: ` delimiter as `/note`) |
+| `/edit_browse` | Interactive file browser to set the `/edit` target — browse `.org` files, Enter to select |
 | `/find <title fragment>` | Search all org-roam files for a case-insensitive `#+title:` match; prints matching paths |
 
 **General**

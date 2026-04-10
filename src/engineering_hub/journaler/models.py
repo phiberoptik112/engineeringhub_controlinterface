@@ -97,6 +97,21 @@ class ContextSnapshot:
     has_significant_changes: bool = False
     change_summary: str = ""
 
+    # Multi-day journal window: {date_str: [{time, heading, content, state, tags}]}
+    journal_window: dict[str, list[dict[str, str]]] = field(default_factory=dict)
+
+    # Topics appearing on 2+ distinct days: [{topic, days_seen, count, last_seen}]
+    recurring_topics: list[dict[str, str | int]] = field(default_factory=list)
+
+    # Recently modified org-roam nodes (non-journal): [{title, tags, path_rel, modified, top_headings}]
+    active_roam_nodes: list[dict[str, str]] = field(default_factory=list)
+
+    # Pending tasks with no journal mention in the lookback window
+    stale_tasks: list[str] = field(default_factory=list)
+
+    # Per-task first-seen dates for stale detection: {task_fragment: date_str}
+    task_first_seen: dict[str, str] = field(default_factory=dict)
+
     def to_dict(self) -> dict:
         """Serialize to a JSON-safe dictionary."""
         return {
@@ -108,6 +123,11 @@ class ContextSnapshot:
             "recent_project_changes": self.recent_project_changes,
             "recent_agent_outputs": self.recent_agent_outputs,
             "active_projects": self.active_projects,
+            "journal_window": self.journal_window,
+            "recurring_topics": self.recurring_topics,
+            "active_roam_nodes": self.active_roam_nodes,
+            "stale_tasks": self.stale_tasks,
+            "task_first_seen": self.task_first_seen,
         }
 
     @classmethod
@@ -121,6 +141,11 @@ class ContextSnapshot:
             recent_project_changes=data.get("recent_project_changes", []),
             recent_agent_outputs=data.get("recent_agent_outputs", []),
             active_projects=data.get("active_projects", []),
+            journal_window=data.get("journal_window", {}),
+            recurring_topics=data.get("recurring_topics", []),
+            active_roam_nodes=data.get("active_roam_nodes", []),
+            stale_tasks=data.get("stale_tasks", []),
+            task_first_seen=data.get("task_first_seen", {}),
         )
 
 
