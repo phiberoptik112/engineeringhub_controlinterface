@@ -328,6 +328,17 @@ chunking:
 #   # If omitted, delegation always uses the local MLX model.
 #   # anthropic_api_key: ""
 
+# ── Capture templates ──────────────────────────────────────────
+# Hub capture templates define reusable org-roam node structures
+# (contracting hours, project notes, etc.) with prompted fields
+# and optional agent dispatch. See capture_templates/*.yaml.
+#
+# capture:
+#   # Directory of capture template YAML files
+#   templates_dir: "~/org-roam/engineering-hub/capture_templates"
+#   # Emacs config.el for import/export of capture templates
+#   emacs_config: "~/.doom.d/config.el"
+
 # Agent configurations (optional - defaults are provided)
 # agents:
 #   research:

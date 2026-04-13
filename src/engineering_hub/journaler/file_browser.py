@@ -829,3 +829,212 @@ def _browse_commands_inner(
             filter_text += chr(key)
             cursor = 0
             scroll_offset = 0
+
+
+# ---------------------------------------------------------------------------
+# Capture template browser (used by /capture_browse)
+# ---------------------------------------------------------------------------
+
+def browse_capture_templates(
+    templates: list,
+) -> object | None:
+    """Open an interactive capture template picker.
+
+    *templates* is a list of ``CaptureTemplate`` instances. Returns the
+    selected template, or ``None`` on cancel.
+    """
+    if not templates:
+        return None
+    try:
+        return curses.wrapper(_browse_captures_inner, templates)
+    except Exception:
+        return None
+
+
+def _browse_captures_inner(
+    stdscr: curses.window,
+    templates: list,
+) -> object | None:
+    _init_colors()
+    curses.curs_set(0)
+    stdscr.keypad(True)
+
+    cursor = 0
+    scroll_offset = 0
+
+    while True:
+        stdscr.erase()
+        max_y, max_x = stdscr.getmaxyx()
+
+        header_lines = 2
+        footer_lines = 2
+        preview_width = max(20, max_x // 2)
+        list_width = max_x - preview_width - 1
+        list_height = max(1, max_y - header_lines - footer_lines)
+
+        # -- Header -----------------------------------------------------------
+        header_text = " Browse: Capture Templates"
+        stdscr.attron(curses.color_pair(_CP_HEADER) | curses.A_BOLD)
+        stdscr.addnstr(0, 0, "─" * max_x, max_x)
+        stdscr.addnstr(0, 0, header_text, max_x - 1)
+        stdscr.attroff(curses.color_pair(_CP_HEADER) | curses.A_BOLD)
+        stdscr.addnstr(1, 0, "─" * max_x, max_x)
+
+        # -- Build display blocks for each template --------------------------
+        blocks: list[tuple[int, list[str]]] = []
+        for ti, tpl in enumerate(templates):
+            lines: list[str] = []
+            key_label = f"[{tpl.key}]" if tpl.key else ""
+            lines.append(f"  {tpl.display_name} {key_label}")
+            desc_first = tpl.description.strip().splitlines()[0] if tpl.description.strip() else ""
+            if desc_first:
+                wrapped = textwrap.wrap(desc_first, width=max(20, list_width - 8))
+                for wl in wrapped:
+                    lines.append(f"      {wl}")
+            lines.append("")
+            blocks.append((ti, lines))
+
+        # Flatten into visual rows
+        visual_rows: list[tuple[int, str, bool]] = []
+        for ti, block_lines in blocks:
+            for li, text in enumerate(block_lines):
+                visual_rows.append((ti, text, li == 0))
+
+        tpl_start_row: dict[int, int] = {}
+        for vr_idx, (ti, _, is_name) in enumerate(visual_rows):
+            if is_name and ti not in tpl_start_row:
+                tpl_start_row[ti] = vr_idx
+
+        # Clamp cursor
+        cursor = max(0, min(cursor, len(templates) - 1))
+        target_vr = tpl_start_row.get(cursor, 0)
+        if target_vr < scroll_offset:
+            scroll_offset = target_vr
+        if target_vr >= scroll_offset + list_height:
+            scroll_offset = target_vr - list_height + 1
+        scroll_offset = max(0, scroll_offset)
+
+        # -- Draw left pane (template list) -----------------------------------
+        for i in range(list_height):
+            vr_idx = scroll_offset + i
+            if vr_idx >= len(visual_rows):
+                break
+            ti, text, is_name = visual_rows[vr_idx]
+            row = header_lines + i
+            if row >= max_y - footer_lines:
+                break
+
+            is_active = ti == cursor
+
+            if is_name and is_active:
+                marker_line = f" > {text.lstrip()}"
+            elif is_name:
+                marker_line = f"   {text.lstrip()}"
+            else:
+                marker_line = text
+
+            if is_active:
+                attr = curses.color_pair(_CP_CURSOR) | (curses.A_BOLD if is_name else 0)
+            else:
+                attr = (curses.color_pair(_CP_FILE) | curses.A_BOLD) if is_name else curses.A_DIM
+
+            try:
+                padded = marker_line[:list_width].ljust(list_width)
+                stdscr.addnstr(row, 0, padded, list_width, attr)
+            except curses.error:
+                pass
+
+        # -- Draw separator ---------------------------------------------------
+        sep_col = list_width
+        for row in range(header_lines, max_y - footer_lines):
+            try:
+                stdscr.addch(row, sep_col, curses.ACS_VLINE, curses.A_DIM)
+            except curses.error:
+                pass
+
+        # -- Draw right pane (preview) ----------------------------------------
+        if templates and 0 <= cursor < len(templates):
+            tpl = templates[cursor]
+            preview_col = sep_col + 2
+            pw = max(1, max_x - preview_col - 1)
+            preview_lines: list[tuple[str, int]] = []
+
+            preview_lines.append((f"Name: {tpl.display_name}", curses.A_BOLD))
+            preview_lines.append((f"Key:  {tpl.key}", 0))
+            preview_lines.append((f"Type: {tpl.template_type.value if hasattr(tpl.template_type, 'value') else tpl.template_type}", 0))
+            if tpl.target_dir:
+                preview_lines.append((f"Dir:  {tpl.target_dir}", 0))
+            preview_lines.append(("", 0))
+
+            if tpl.filetags:
+                preview_lines.append((f"Tags: {', '.join(tpl.filetags)}", curses.color_pair(_CP_SELECTED)))
+
+            if tpl.fields:
+                preview_lines.append(("", 0))
+                preview_lines.append(("Fields:", curses.A_BOLD))
+                for f in tpl.fields:
+                    default_hint = f" [{f.default}]" if f.default else ""
+                    ftype = f.type.value if hasattr(f.type, "value") else f.type
+                    preview_lines.append((f"  {f.name} ({ftype}){default_hint}", 0))
+
+            if tpl.headings:
+                preview_lines.append(("", 0))
+                preview_lines.append(("Headings:", curses.A_BOLD))
+                for h in tpl.headings:
+                    preview_lines.append((f"  {'*' * h.level} {h.title}", 0))
+
+            if tpl.agent_dispatch:
+                preview_lines.append(("", 0))
+                preview_lines.append(("Agent Dispatch:", curses.A_BOLD))
+                ad = tpl.agent_dispatch
+                trigger = ad.on.value if hasattr(ad.on, "value") else ad.on
+                preview_lines.append((f"  @{ad.agent_type} ({trigger})", curses.color_pair(_CP_FOOTER)))
+
+            for pi, (text, attr) in enumerate(preview_lines):
+                row = header_lines + pi
+                if row >= max_y - footer_lines:
+                    break
+                try:
+                    stdscr.addnstr(row, preview_col, text[:pw], pw, attr)
+                except curses.error:
+                    pass
+
+        # -- Footer -----------------------------------------------------------
+        footer_y = max_y - footer_lines
+        if footer_y > header_lines:
+            try:
+                stdscr.addnstr(footer_y, 0, "─" * max_x, max_x)
+            except curses.error:
+                pass
+            stdscr.attron(curses.color_pair(_CP_FOOTER))
+            controls = " ↑↓ navigate  Shift+↑↓ fast  Enter apply  Esc cancel"
+            try:
+                stdscr.addnstr(footer_y + 1, 0, controls, max_x - 1)
+            except curses.error:
+                pass
+            stdscr.attroff(curses.color_pair(_CP_FOOTER))
+
+        stdscr.refresh()
+
+        # -- Input handling ---------------------------------------------------
+        key = stdscr.getch()
+
+        if key in (27, ord("q")):
+            return None
+
+        if key == curses.KEY_UP or key == ord("k"):
+            if cursor > 0:
+                cursor -= 1
+        elif key == curses.KEY_DOWN or key == ord("j"):
+            if cursor < len(templates) - 1:
+                cursor += 1
+        elif key == curses.KEY_SR:
+            cursor = max(0, cursor - _FAST_SCROLL_LINES)
+        elif key == curses.KEY_SF:
+            cursor = min(len(templates) - 1, cursor + _FAST_SCROLL_LINES)
+        elif key in (curses.KEY_ENTER, 10, 13):
+            return templates[cursor]
+        elif key == curses.KEY_HOME:
+            cursor = 0
+        elif key == curses.KEY_END:
+            cursor = len(templates) - 1

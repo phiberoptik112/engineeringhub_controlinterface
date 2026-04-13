@@ -378,6 +378,17 @@ class Settings(BaseSettings):
         "Defaults to workspace_dir/templates",
     )
 
+    # Capture template settings
+    capture_templates_dir: Path | None = Field(
+        default=None,
+        description="Directory containing hub capture template YAML files. "
+        "Defaults to workspace_dir/capture_templates or repo root capture_templates/",
+    )
+    emacs_config_path: Path = Field(
+        default=Path.home() / ".doom.d" / "config.el",
+        description="Path to Emacs config.el for capture template import/export",
+    )
+
     # PDF reference corpus settings
     corpus_enabled: bool = Field(
         default=False,
@@ -402,6 +413,20 @@ class Settings(BaseSettings):
         if self.templates_dir is not None:
             return self.templates_dir
         return self.workspace_dir / "templates"
+
+    @property
+    def resolved_capture_templates_dir(self) -> Path:
+        """Effective capture templates directory.
+
+        Priority: explicit setting > workspace_dir/capture_templates > repo root fallback.
+        """
+        if self.capture_templates_dir is not None:
+            return self.capture_templates_dir
+        workspace_ct = self.workspace_dir / "capture_templates"
+        if workspace_ct.exists():
+            return workspace_ct
+        from engineering_hub.capture.loader import _default_capture_templates_dir
+        return _default_capture_templates_dir()
 
     @property
     def resolved_inputs_dir(self) -> Path:
@@ -674,6 +699,13 @@ class Settings(BaseSettings):
             tpl = config["templates"]
             if tpl.get("dir"):
                 flat_config["templates_dir"] = Path(tpl["dir"]).expanduser()
+
+        if "capture" in config:
+            cap = config["capture"]
+            if cap.get("templates_dir"):
+                flat_config["capture_templates_dir"] = Path(cap["templates_dir"]).expanduser()
+            if cap.get("emacs_config"):
+                flat_config["emacs_config_path"] = Path(cap["emacs_config"]).expanduser()
 
         if "corpus" in config:
             corpus = config["corpus"]

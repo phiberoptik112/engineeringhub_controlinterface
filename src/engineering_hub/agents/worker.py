@@ -140,6 +140,7 @@ class AgentWorker:
                 AgentType.EVALUATOR: "analysis",
                 AgentType.TECHNICAL_REVIEWER: "reviews",
                 AgentType.LATEX_WRITER: "latex",
+                AgentType.PANNING_FOR_GOLD: "panning",
             }
             agent_extensions = {
                 AgentType.LATEX_WRITER: ".tex",

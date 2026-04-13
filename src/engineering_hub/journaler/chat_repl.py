@@ -38,6 +38,10 @@ COMMAND_CATALOG: list[CommandEntry] = [
     CommandEntry("/agent", "<type> <description>", "Delegate to an agent persona", "Agent Delegation"),
     CommandEntry("/skills", "", "List available agent personas", "Agent Delegation"),
     CommandEntry("/agent_browse", "", "Interactive skill picker for agent delegation", "Agent Delegation"),
+    # Capture Templates
+    CommandEntry("/capture", "<name> [field=value ...]", "Apply a capture template", "Capture Templates"),
+    CommandEntry("/capture_list", "", "List available capture templates", "Capture Templates"),
+    CommandEntry("/capture_browse", "", "Interactive capture template picker", "Capture Templates"),
     # Org-Roam Write
     CommandEntry("/open", "[today|clear|<path>|<title>]", "Set session org-roam target for /edit", "Org-Roam Write"),
     CommandEntry("/edit", "<heading> :: <text>", "Append text under a heading in the open target", "Org-Roam Write"),

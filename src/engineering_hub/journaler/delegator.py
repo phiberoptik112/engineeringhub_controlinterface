@@ -1,7 +1,8 @@
 """AgentDelegator: bridge between the Journaler daemon and the agent worker system.
 
 Allows the Journaler to delegate tasks directly to named agent personalities
-(research, technical-writer, standards-checker, technical-reviewer, weekly-reviewer)
+(research, technical-writer, standards-checker, technical-reviewer, weekly-reviewer,
+latex-writer, panning-for-gold)
 using either the local MLX model already loaded in memory or the Claude API.
 
 Backend selection
@@ -15,7 +16,8 @@ Skills
 ------
 Skill definitions live in YAML files under the skills/ directory (top-level, alongside
 prompts/). Each YAML file describes one agent type: when to use it, example invocations,
-and output conventions. New skills are added by dropping a new .yaml file — no code changes.
+and output conventions. Personas reachable via `/agent` also need `AgentType`, prompt file,
+registry config, and delegator aliases (match existing agents such as `latex-writer`).
 """
 
 from __future__ import annotations
@@ -112,6 +114,10 @@ _AGENT_ALIASES: dict[str, str] = {
     "latex": "latex-writer",
     "tex-writer": "latex-writer",
     "tex": "latex-writer",
+    "panning-for-gold": "panning-for-gold",
+    "panning": "panning-for-gold",
+    "pan-for-gold": "panning-for-gold",
+    "gold": "panning-for-gold",
 }
 
 

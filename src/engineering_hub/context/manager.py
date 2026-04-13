@@ -444,6 +444,7 @@ class ContextManager:
             AgentType.STANDARDS_CHECKER: "analysis",
             AgentType.REF_ENGINEER: "reviews",
             AgentType.EVALUATOR: "analysis",
+            AgentType.PANNING_FOR_GOLD: "panning",
         }
 
         agent_dir = agent_dirs.get(task.agent_type, "outputs")
