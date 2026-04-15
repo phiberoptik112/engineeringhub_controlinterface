@@ -38,6 +38,7 @@ COMMAND_CATALOG: list[CommandEntry] = [
     CommandEntry("/agent", "<type> <description>", "Delegate to an agent persona", "Agent Delegation"),
     CommandEntry("/skills", "", "List available agent personas", "Agent Delegation"),
     CommandEntry("/agent_browse", "", "Interactive skill picker for agent delegation", "Agent Delegation"),
+    CommandEntry("/validate-latex", "<path>", "Compile a .tex file and report errors", "Agent Delegation"),
     # Capture Templates
     CommandEntry("/capture", "<name> [field=value ...]", "Apply a capture template", "Capture Templates"),
     CommandEntry("/capture_list", "", "List available capture templates", "Capture Templates"),

@@ -1,0 +1,43 @@
+% preamble-consulting.tex
+% Standard consulting-report preamble for Acoustic Engineering deliverables.
+% Use with: /agent latex-writer --template preamble-consulting
+% Compatible with pdflatex and xelatex.
+
+\documentclass[12pt,letterpaper]{report}
+
+% --- Layout & typography ---
+\usepackage[margin=1in]{geometry}
+\usepackage{setspace}
+\onehalfspacing
+
+% --- Links & PDF metadata ---
+\usepackage[hidelinks,pdfusetitle]{hyperref}
+
+% --- Tables ---
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{longtable}
+
+% --- SI units & numbers ---
+\usepackage{siunitx}
+\sisetup{detect-all, group-separator={,}}
+
+% --- Figures ---
+\usepackage{graphicx}
+\usepackage{float}
+
+% --- References ---
+\usepackage[numbers,sort&compress]{natbib}
+\bibliographystyle{plainnat}
+
+% --- Miscellaneous ---
+\usepackage{microtype}
+\usepackage{xcolor}
+\usepackage{amsmath}
+
+% Placeholder command (remove before final delivery)
+\newcommand{\placeholder}[1]{\textbf{\textcolor{red}{[INSERT: #1]}}}
+
+\title{TITLE}
+\author{FIRM NAME \\ Acoustic Engineering Consulting}
+\date{\today}

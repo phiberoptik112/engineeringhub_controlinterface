@@ -160,29 +160,59 @@ You can tell the user about these commands; the user types them directly:
 """
 
 BRIEFING_PROMPT = """\
-Generate a morning briefing for today ({date}).
+Generate a comprehensive morning briefing for today ({date}).
 
-You have the following context about recent activity:
+You have the following context about recent activity, spanning the full
+journal lookback window:
 
 {briefing_context}
 
-Structure your briefing as:
+Structure your briefing with the following sections.  Be thorough — this
+briefing is the primary daily planning document and should give a
+complete picture of where things stand and what to do next.
 
 1. **Yesterday's Highlights** — What got done, what agents completed,
-   any notable findings or outputs worth reviewing.
+   any notable findings or outputs worth reviewing.  For each item,
+   briefly note its significance to the broader project it belongs to
+   (e.g. "this unblocks X" or "completes the Y deliverable").
 
-2. **Today's Agenda** — Pending tasks, scheduled meetings/calls,
-   deadlines approaching this week.
+2. **Week-at-a-Glance** — Synthesize the multi-day journal thread and
+   recurring topics into a narrative arc.  What themes dominated the
+   week?  What gained momentum, what lost it?  Call out recurring topics
+   that appear on 3+ days — these are ongoing threads worth explicit
+   attention.
 
-3. **Needs Attention** — Anything that looks stalled, overdue, or
-   might need a decision.  Flag tasks that have been pending for more
-   than 2 days without progress.
+3. **Today's Agenda** — Pending tasks ordered by suggested priority.
+   For each, briefly explain *why* it should be tackled in that order
+   (deadline pressure, dependency, quick win, etc.).  Group by project
+   when multiple tasks belong to the same effort.
 
-4. **Quick Stats** — Number of pending vs completed tasks this week,
-   active projects, recent memory entries.
+4. **Needs Attention** — Anything stalled, overdue, or needing a
+   decision.  For stale tasks (shown with first-seen dates), note how
+   many days they have been pending and why they may be stuck.  For
+   each, suggest one of: escalate, delegate to an agent, break into
+   smaller pieces, or drop.
 
-Keep it concise — aim for 300-500 words.  Use bullet points.  This will
-be read on a phone over coffee.\
+5. **Suggested Paths Forward** — The most important section.  For each
+   active project or recurring topic, suggest 1–2 concrete next actions.
+   Categorize each suggestion as:
+   - **Quick win** (< 30 min): something that can be knocked out
+     immediately to maintain momentum.
+   - **Deep-work block** (1–2 hours): focused work that moves the
+     needle on a major deliverable.
+   - **Agent task**: work that can be delegated to a research,
+     technical-writer, or standards-checker agent.
+   - **Decision needed**: flag items that require human judgment before
+     any agent or task can proceed.
+   Reference specific org-roam notes or agent outputs where relevant so
+   the suggestions are actionable, not generic.
+
+6. **Quick Stats** — Number of pending vs completed tasks this week,
+   active projects, stale task count, recent memory entries.
+
+Aim for 800–1200 words.  Use bullet points and bold key phrases for
+scannability, but do not sacrifice depth for brevity — the goal is a
+thorough planning document, not a summary.\
 """
 
 

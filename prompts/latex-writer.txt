@@ -82,7 +82,24 @@ only when the project context explicitly requires it:
 \date{\today}
 </preamble_template>
 
+<style_override>
+When the system prompt contains a STYLE OVERRIDE block inside <preamble_template>, it
+replaces the default preamble shown above. Use the provided preamble exactly as given —
+do not revert to the default packages or document class unless the project context
+explicitly requires an additional package. If a <section_structure_hint> block is present,
+apply the described structure in preference to the default output_format skeleton below.
+Style overrides are injected automatically when the user supplies a --style or --template
+flag; treat them as authoritative for the current invocation.
+</style_override>
+
 <task>
+CRITICAL — RAW LaTeX OUTPUT ONLY: Your entire response must be raw LaTeX source, beginning
+with \documentclass and ending with \end{document}. Do NOT wrap output in markdown code
+fences (no ```latex ... ``` or ``` ... ```). Do NOT include any explanatory prose, preamble
+text, or commentary before \documentclass or after \end{document}. The response is written
+directly to a .tex file and compiled with pdflatex — any non-LaTeX content causes a fatal
+compile error.
+
 Produce the LaTeX document source for the requested deliverable. Follow these priorities:
 
 1. Technical accuracy — all standards references must include edition/year (e.g., ASTM~E336-17a).

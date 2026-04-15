@@ -1,0 +1,42 @@
+name: consulting-report
+display_name: "Consulting Field Report"
+description: |
+  Standard format for acoustic consulting deliverables. Uses the report document
+  class with 1-inch margins, one-and-a-half line spacing, booktabs tables,
+  natbib references, and siunitx for SI units. This is the default style when
+  no --style flag is provided.
+
+document_class: report
+class_options: "12pt,letterpaper"
+template_file: null
+
+packages:
+  - { name: geometry,  options: "margin=1in" }
+  - { name: setspace }
+  - { name: hyperref,  options: "hidelinks,pdfusetitle" }
+  - { name: booktabs }
+  - { name: array }
+  - { name: longtable }
+  - { name: siunitx }
+  - { name: graphicx }
+  - { name: float }
+  - { name: natbib,    options: "numbers,sort&compress" }
+  - { name: microtype }
+  - { name: xcolor }
+  - { name: amsmath }
+
+custom_commands:
+  - '\onehalfspacing'
+  - '\sisetup{detect-all, group-separator={,}}'
+  - '\bibliographystyle{plainnat}'
+  - '\newcommand{\placeholder}[1]{\textbf{\textcolor{red}{[INSERT: #1]}}}'
+
+title_block:
+  title: "TITLE"
+  author: "FIRM NAME \\\\ Acoustic Engineering Consulting"
+  date: "\\today"
+
+section_structure: |
+  Use \chapter{} for top-level divisions and \section{} / \subsection{} within.
+  Structure: Executive Summary (abstract) → Introduction → Methodology →
+  Results → Discussion → Conclusions and Recommendations → Bibliography → Appendices.

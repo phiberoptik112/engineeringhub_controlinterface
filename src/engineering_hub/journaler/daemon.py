@@ -384,7 +384,9 @@ def generate_briefing_now(
             load_file_budget=config.get_load_file_budget(),
         )
 
-    briefing = engine.generate_briefing(briefing_context, prompt)
+    briefing = engine.generate_briefing(
+        briefing_context, prompt, max_tokens=config.max_briefing_tokens
+    )
 
     # Save to file
     output_dir = config.briefing_output_dir or (config.state_dir / "briefings")
@@ -470,7 +472,9 @@ def _morning_briefing(
     today_str = date.today().isoformat()
     prompt = format_briefing_prompt(briefing_template, today_str, briefing_context)
 
-    briefing = engine.generate_briefing(briefing_context, prompt)
+    briefing = engine.generate_briefing(
+        briefing_context, prompt, max_tokens=config.max_briefing_tokens
+    )
 
     output_dir = config.briefing_output_dir or (config.state_dir / "briefings")
     output_dir.mkdir(parents=True, exist_ok=True)

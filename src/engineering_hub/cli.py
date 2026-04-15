@@ -759,6 +759,7 @@ def _handle_chat_slash_command(
       /edit <heading> :: <text>  Append under a heading in the /open target.
       /exit, /quit               Leave the chat (same as bare exit, quit, or :q).
       /agent … /skills           Delegate to agent personalities (when delegator is configured).
+      /validate-latex <path>     Compile a .tex file with pdflatex and report errors/warnings.
       /export …                  Export conversation.jsonl to org (same flags as journaler export).
       /model                     Show model, or switch profile / path (see /help).
       /help                      Show available slash commands.
@@ -860,6 +861,94 @@ def _handle_chat_slash_command(
         chat_console.print(f"[green]{escape(result)}[/green]")
         return
 
+    if cmd == "/validate-latex":
+        if len(parts) < 2:
+            chat_console.print("[yellow]Usage: /validate-latex <path-to-.tex-file>[/yellow]")
+            return
+
+        raw_path = " ".join(parts[1:])
+        tex_path = Path(raw_path).expanduser()
+        if not tex_path.is_absolute() and not tex_path.exists():
+            # Try resolving relative to output_dir when available (delegator knows it)
+            if delegator is not None and hasattr(delegator, "_output_dir"):
+                candidate = delegator._output_dir / tex_path
+                if candidate.exists():
+                    tex_path = candidate
+
+        from engineering_hub.agents.latex_validator import LatexValidator
+
+        validator = LatexValidator()
+
+        if not validator.is_available():
+            chat_console.print(
+                "[red]pdflatex not found on PATH.[/red]\n"
+                "[dim]Install TeX Live (https://www.tug.org/texlive/) or "
+                "MacTeX (https://www.tug.org/mactex/) to enable LaTeX validation.[/dim]"
+            )
+            return
+
+        if not tex_path.exists():
+            chat_console.print(f"[red]File not found: {escape(str(tex_path))}[/red]")
+            return
+
+        if tex_path.suffix.lower() != ".tex":
+            chat_console.print(
+                f"[yellow]Expected a .tex file, got '{tex_path.suffix}'. "
+                "Proceeding anyway…[/yellow]"
+            )
+
+        chat_console.print(f"[dim]Compiling {escape(tex_path.name)} with pdflatex…[/dim]")
+
+        result = validator.validate(tex_path)
+
+        if result.success:
+            pdf_note = f" → {escape(str(result.pdf_path))}" if result.pdf_path else ""
+            chat_console.print(f"[green]LaTeX compiled successfully{pdf_note}[/green]")
+            if result.warnings:
+                chat_console.print(
+                    f"[yellow]{len(result.warnings)} warning(s):[/yellow]\n"
+                    + result.formatted_warnings()
+                )
+        else:
+            chat_console.print(
+                f"[red]Compile failed — {len(result.errors)} error(s):[/red]\n"
+                + result.formatted_errors()
+            )
+            if result.warnings:
+                chat_console.print(
+                    f"[yellow]{len(result.warnings)} warning(s):[/yellow]\n"
+                    + result.formatted_warnings(max_warnings=3)
+                )
+
+            # Offer auto-fix via the agent if delegator is configured
+            if delegator is not None:
+                try:
+                    answer = input("Attempt automatic fix with the latex-writer agent? [y/N] ").strip().lower()
+                except (KeyboardInterrupt, EOFError):
+                    answer = ""
+                if answer in ("y", "yes"):
+                    chat_console.print("[dim]Running agent correction loop…[/dim]")
+                    worker = getattr(delegator, "_worker", None)
+                    if worker is None:
+                        chat_console.print(
+                            "[yellow]Auto-fix requires an AgentWorker on the delegator "
+                            "(delegator._worker). Skipping.[/yellow]"
+                        )
+                    else:
+                        fixed = validator.fix_with_agent(tex_path, result, worker)
+                        if fixed.success:
+                            pdf_note = f" → {escape(str(fixed.pdf_path))}" if fixed.pdf_path else ""
+                            chat_console.print(
+                                f"[green]Fixed and compiled successfully{pdf_note}[/green]"
+                            )
+                        else:
+                            chat_console.print(
+                                f"[red]Auto-fix could not resolve all errors "
+                                f"({len(fixed.errors)} remaining):[/red]\n"
+                                + fixed.formatted_errors()
+                            )
+        return
+
     if cmd == "/export":
         if export_settings is None or export_config is None or export_spec is None:
             chat_console.print(
@@ -919,6 +1008,8 @@ def _handle_chat_slash_command(
             "  [cyan]/agent <type> <desc>[/cyan]      Delegate to a named agent (see README)\n"
             "  [cyan]/agent_browse[/cyan]              Browse and pick an agent skill\n"
             "  [cyan]/skills[/cyan]                    List agent delegation skills / personas\n"
+            "  [cyan]/validate-latex <path>[/cyan]    Compile a .tex file and report errors\n"
+            "                                 (prompts to auto-fix via agent on failure)\n"
             "  [cyan]/export[/cyan]                    Export transcript (`/export --help`)\n"
             + write_cmds +
             "  [cyan]/exit[/cyan], [cyan]/quit[/cyan]          Leave chat (or type exit, quit, :q)\n"

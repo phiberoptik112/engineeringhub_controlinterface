@@ -537,10 +537,11 @@ class JournalContext:
         return "\n".join(lines)
 
     def get_briefing_context(self) -> str:
-        """Richer context for morning briefings — includes yesterday's full
-        activity, pending items across all projects, and unreviewed agent outputs.
+        """Richer context for morning briefings — includes multi-day journal
+        thread, recurring topics, active roam nodes, stale tasks, yesterday's
+        full activity, pending items, and unreviewed agent outputs.
 
-        Targeted at ~8000 tokens.
+        Targeted at ~12 000 tokens to support verbose briefing generation.
         """
         s = self._snapshot
         lines: list[str] = [
@@ -553,13 +554,73 @@ class JournalContext:
         yesterday = date.today() - timedelta(days=1)
         yesterday_file = self.journal_dir / f"{yesterday.isoformat()}.org"
         if yesterday_file.exists():
-            info = parse_org_file(yesterday_file, max_body_chars=1000)
+            info = parse_org_file(yesterday_file, max_body_chars=1500)
             lines.append("### Yesterday's Activity")
             for entry in info.entries:
                 state_marker = f" [{entry.state}]" if entry.state else ""
-                lines.append(f"- {entry.title}{state_marker}")
+                tags_str = f"  :{':'.join(entry.tags)}:" if entry.tags else ""
+                lines.append(f"- {entry.title}{state_marker}{tags_str}")
                 if entry.body.strip():
-                    lines.append(f"  {entry.body.strip()[:300]}")
+                    lines.append(f"  {entry.body.strip()[:600]}")
+            lines.append("")
+
+        # Multi-day journal thread (full lookback window beyond yesterday)
+        if s.journal_window:
+            sorted_dates = sorted(s.journal_window.keys(), reverse=True)
+            older_dates = [
+                d for d in sorted_dates
+                if d < date.today().isoformat() and d != yesterday.isoformat()
+            ]
+            if older_dates:
+                lines.append(
+                    f"### Journal Thread (last {self.journal_lookback_days} days)"
+                )
+                for date_key in older_dates:
+                    day_entries = s.journal_window[date_key]
+                    if not day_entries:
+                        continue
+                    lines.append(f"**{date_key}**")
+                    for entry in day_entries[:8]:
+                        state_prefix = (
+                            f"[{entry['state']}] " if entry.get("state") else ""
+                        )
+                        time_prefix = (
+                            f"**{entry['time']}** " if entry.get("time") else ""
+                        )
+                        tags_suffix = (
+                            f"  :{entry['tags']}:" if entry.get("tags") else ""
+                        )
+                        lines.append(
+                            f"- {time_prefix}{state_prefix}"
+                            f"{entry.get('heading', '')}{tags_suffix}"
+                        )
+                        if entry.get("content"):
+                            lines.append(f"  {entry['content'][:200]}")
+                    if len(day_entries) > 8:
+                        lines.append(
+                            f"  _(+ {len(day_entries) - 8} more entries)_"
+                        )
+                lines.append("")
+
+        # Recurring topics across multiple days
+        if s.recurring_topics:
+            lines.append("### Recurring Topics")
+            for topic in s.recurring_topics[:10]:
+                days = topic.get("days_seen", 1)
+                count = topic.get("count", 1)
+                last = topic.get("last_seen", "")
+                lines.append(
+                    f"- **{topic.get('topic', '')}** "
+                    f"_(seen on {days} days, {count} mentions, last {last})_"
+                )
+            lines.append("")
+
+        # Stale tasks (pending with no recent journal mention)
+        if s.stale_tasks:
+            lines.append("### Stalled / Stale Tasks")
+            for task in s.stale_tasks:
+                first_seen = s.task_first_seen.get(task, "unknown")
+                lines.append(f"- [ ] {task}  _(first seen {first_seen})_")
             lines.append("")
 
         # All pending tasks
@@ -576,12 +637,27 @@ class JournalContext:
                 lines.append(f"- [x] {task}")
             lines.append("")
 
+        # Active roam nodes (recently modified project notes)
+        if s.active_roam_nodes:
+            lines.append("### Active Project Notes")
+            for node in s.active_roam_nodes[:10]:
+                tags_str = f" `{node['tags']}`" if node.get("tags") else ""
+                lines.append(
+                    f"- **{node.get('title', node.get('path_rel', '?'))}**"
+                    f"{tags_str} (modified {node.get('modified', '')[:10]})"
+                )
+                if node.get("top_headings"):
+                    lines.append(f"  Sections: {node['top_headings']}")
+            lines.append("")
+
         # Recent project changes (full detail)
         if s.recent_project_changes:
             lines.append("### Recent Project Changes")
             for change in s.recent_project_changes:
-                lines.append(f"- **{change['file']}** (changed {change['changed']})")
-                lines.append(f"  {change['summary'][:500]}")
+                lines.append(
+                    f"- **{change['file']}** (changed {change['changed']})"
+                )
+                lines.append(f"  {change['summary'][:800]}")
             lines.append("")
 
         # Agent outputs (full detail)
@@ -590,7 +666,7 @@ class JournalContext:
             for output in s.recent_agent_outputs[:10]:
                 lines.append(
                     f"- @{output.get('agent', '?')} ({output.get('date', '?')}): "
-                    f"{output.get('summary', '')[:300]}"
+                    f"{output.get('summary', '')[:500]}"
                 )
             lines.append("")
 

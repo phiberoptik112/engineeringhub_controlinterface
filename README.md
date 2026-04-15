@@ -27,14 +27,16 @@ They coexist cleanly: the Orchestrator processes explicit tasks while the Journa
 - **Org-Roam Write Skill**: Journaler chat can write properly-formatted org-roam files — add TODOs, mark tasks done, append notes to today's journal (`/note`), set a session target on any roam note (`/open`), append under a heading there (`/edit`), search by title (`/find`), and create new nodes — via slash commands
 - **Journaler Export**: CLI `journaler export` reads the persisted chat transcript (`conversation.jsonl`) and writes org-roam-friendly output — raw per-turn org, optional MLX **summary + open TODOs**, append to a note (`--note` / `--find-title`), or create a new roam node (`--new-node`)
 - **Context File Loading**: Inject files or directories into the Journaler's live context (`/load`) or the persistent memory store (`engineering-hub load`)
-- **Vector Memory**: Local semantic memory (memory.db) with Ollama embeddings for context retrieval
+- **Vector Memory**: Local semantic memory (`memory.db`) with Ollama embeddings for past-task and ingest retrieval
+- **PDF Reference Corpus**: Optional ingested reference corpus (`corpus.db` from **libraryfiles-corpus**) injected as RAG into **Journaler chat** turns and **Orchestrator** agent tasks (separate from workspace memory)
 
 ## Requirements
 
 - Python 3.11+
 - Access to Anthropic API (Claude), a local MLX model on Apple Silicon, or an Ollama server
 - Django consultingmanager backend (optional, for full project context)
-- Ollama with `nomic-embed-text` (optional, for memory/embeddings; also serves as a generation backend)
+- Ollama with `nomic-embed-text` (optional, for memory/embeddings and PDF corpus query embeddings; also serves as a generation backend)
+- **libraryfiles-corpus** (optional, `pip install -e …`) plus a built `corpus.db` when using PDF reference RAG
 - Docker (optional, for containerised agent execution)
 
 ## Quick Start
@@ -217,6 +219,8 @@ engineeringhub_controlinterface/
 │   └── config.example.yaml
 ├── prompts/             # Agent system prompts (used by Orchestrator and Journaler delegation)
 ├── skills/              # Agent delegation skill definitions (YAML, one per agent type)
+├── latex-styles/        # Named LaTeX style profiles (YAML) for the latex-writer agent
+├── latex-templates/     # Raw .tex preamble partials for direct template loading
 ├── Dockerfile           # Full orchestrator image (Linux deployment)
 ├── Dockerfile.task-runner # Slim ephemeral task container image
 ├── docker-compose.yml   # Ollama service + shared Docker network
@@ -456,7 +460,7 @@ While in `engineering-hub journaler chat`, any input starting with `/` is handle
 
 | Command | Description |
 | --- | --- |
-| `/agent <type> <desc> [--project <id>] [--backend mlx\|claude]` | Delegate a task to a named agent and get the result inline. Types: `research`, `technical-writer`, `standards-checker`, `technical-reviewer`, `weekly-reviewer` |
+| `/agent <type> <desc> [--project <id>] [--backend mlx\|claude]` | Delegate a task to a named agent and get the result inline. Types: `research`, `technical-writer`, `standards-checker`, `technical-reviewer`, `weekly-reviewer`, `latex-writer` |
 | `/agent_browse` | Interactive skill picker — arrow keys to browse agents, Enter to select, then type a task description |
 | `/skills` | List all available agent delegation skills with descriptions and examples |
 
@@ -500,7 +504,7 @@ The Journaler can delegate tasks directly to any named agent personality and ret
 | --- | --- |
 | `<type>` | Agent personality: `research`, `technical-writer`, `standards-checker`, `technical-reviewer`, `weekly-reviewer` |
 | `<description>` | Free-text task description |
-| `--project <id>` | Optional Django project ID for context enrichment |
+| `--project <id>` | Optional Django project ID (stored on the task; does **not** load Orchestrator-style Django + PDF corpus into the delegated prompt — use journal `@agent:` + `[[django://project/id]]` for that) |
 | `--backend mlx` | Use the local MLX model (reuses the Journaler's loaded model — no extra RAM) |
 | `--backend claude` | Use the Claude API (requires `journaler.anthropic_api_key` or global `anthropic.api_key` / env) |
 
@@ -515,6 +519,8 @@ For **draft reports, protocols, executive summaries, and other client-facing Mar
 /agent technical-writer draft executive summary for noise assessment --project 25 --backend claude
 /agent standards-checker audit ASTM citations in draft report --backend mlx
 /agent weekly-reviewer summarize this week's work and open loops
+/agent latex-writer --style executive-summary draft exec summary for project 5
+/agent latex-writer --list-styles
 ```
 
 If no live backend is configured, the command falls back to writing the task to today's journal under `* Overnight Agent Tasks` for the Orchestrator to pick up on its next scan.
@@ -552,6 +558,92 @@ invocation_examples:
 
 To add a new delegation capability, drop a new `.yaml` file into `skills/` — no code changes needed. The Journaler loads all skill files when the **ConversationEngine** starts (**daemon** or **interactive `journaler chat`**) and injects a summary into the system prompt (including **when_to_use** hints) so the ambient model knows what it can delegate and how. **Custom** `.journaler/system_prompt.txt` overrides the default template; copy the `{context_snapshot}` placeholder and any delegation guidance you still want if you maintain your own file.
 
+### LaTeX Writer Agent
+
+The `latex-writer` agent produces compilable `.tex` source files for consulting deliverables — field reports, test protocols, executive summaries, and design specifications. Invoke it inline from the Journaler or queue it as an Orchestrator task.
+
+#### Output modes
+
+| Keyword | Behaviour |
+| --- | --- |
+| `draft` (or none) | Full paragraph content with `\placeholder{}` for any missing data |
+| `outline` / `skeleton` | Section headings + `\begin{itemize}` bullet stubs |
+| `scaffold` | Section headings only with `% TODO:` comments |
+
+#### Style and template selection
+
+Every invocation accepts two optional flags that control the LaTeX preamble and section structure used by the agent:
+
+| Flag | Effect |
+| --- | --- |
+| `--style <name>` | Load a named style profile from `latex-styles/<name>.yaml` |
+| `--template <stem>` | Load a raw `.tex` preamble partial from `latex-templates/<stem>.tex` (overrides `--style` when both are given) |
+| `--list-styles` | Return a listing of all available styles and templates without running the agent |
+
+The selected preamble **replaces** the default `<preamble_template>` block in the agent's system prompt before the request is sent, so the agent uses it exactly. Any `section_structure` field in the style YAML is also injected as a hint that takes precedence over the default chapter/section skeleton.
+
+**Available styles** (out of the box):
+
+| Name | Class | Best for |
+| --- | --- | --- |
+| `consulting-report` *(default)* | `report` | Standard acoustic consulting deliverables — 1-inch margins, natbib, booktabs, siunitx |
+| `executive-summary` | `article` | Client-facing 2–6 page summaries — lean packages, renamed abstract, `\section{}` only |
+| `technical-spec` | `report` | Detailed specifications — enumitem requirement lists, cleveref, listings, single-spacing |
+
+**Available preamble templates** (raw `.tex` partials):
+
+| Stem | Description |
+| --- | --- |
+| `preamble-consulting` | Mirrors the `consulting-report` style as a reusable `.tex` file |
+| `preamble-minimal` | Minimal compilable preamble for quick scaffolds |
+
+#### Invocation examples
+
+```text
+# List what's available
+/agent latex-writer --list-styles
+
+# Default style (consulting-report)
+/agent latex-writer draft report for ASTM E336 field test --project 12
+
+# Named style
+/agent latex-writer --style executive-summary draft exec summary for project 5
+/agent latex-writer --style technical-spec scaffold STC-55 wall assembly spec
+
+# Raw preamble template
+/agent latex-writer --template preamble-minimal scaffold quick outline --project 7
+```
+
+#### Adding your own styles
+
+Drop a new `.yaml` file into `latex-styles/` following the schema below — no code changes needed:
+
+```yaml
+name: my-style
+display_name: "My Custom Style"
+description: "One-line description shown by --list-styles"
+document_class: report
+class_options: "12pt,letterpaper"
+template_file: null           # optional: stem of a file in latex-templates/
+packages:
+  - { name: geometry, options: "margin=1in" }
+  - { name: booktabs }
+  # ... additional packages ...
+custom_commands:
+  - '\newcommand{\placeholder}[1]{\textbf{\textcolor{red}{[INSERT: #1]}}}'
+title_block:
+  title: "TITLE"
+  author: "FIRM NAME \\\\ Acoustic Engineering Consulting"
+  date: "\\today"
+section_structure: |
+  Optional hint injected into the agent's system prompt describing
+  the preferred chapter/section hierarchy for this style.
+```
+
+If `template_file` points to a `.tex` file in `latex-templates/` (e.g. `template_file: preamble-consulting.tex`), that file's content is used as-is and the `packages`/`custom_commands`/`title_block` fields are ignored. This is the fastest way to lock in an exact preamble you've already tuned.
+
+Outputs land under `outputs/latex/` with a `.tex` extension. If `pdflatex` is on your `$PATH`, compilation is attempted automatically and a one-line validation summary is appended to the agent response.
+
 ### Org-Roam Write Skill
 
 The Journaler's system prompt is enriched when the engine starts with a `## Workspace Layout` block that tells the model:
@@ -581,6 +673,67 @@ The Journaler writes to `<workspace_dir>/.journaler/`:
 
 `conversation.jsonl` is append-only and serves as the permanent audit trail. Archived and compressed turns are written here even after the in-memory history is cleared, so any day's conversation can be reconstructed from the log. Use **`engineering-hub journaler export`** to turn this file into org-mode: by default a deterministic **raw** transcript (headings plus `#+begin_src text` blocks per turn); with **`--summarize`**, a single model pass adds **`* Summary`** and **`* Open TODOs`** (`- [ ]` items). Target an existing file with **`--note`** or **`--find-title`** (substring match on `#+title:` under `org_journal_dir`'s parent), or **`--new-node`** to create a new org-roam node under that roam directory. Override the transcript path with **`--jsonl`**. See **`engineering-hub journaler export --help`** for all flags.
 
+### PDF reference corpus (vector DB / RAG)
+
+The hub can attach **PDF reference chunks** from a pre-ingested database (`corpus.db`, produced by the **libraryfiles-corpus** project). Query-time embeddings use the same Ollama host and embed model as **`memory.*`** (`ollama.host`, `ollama.embed_model`). Enable and point at the DB in `config.yaml`:
+
+```yaml
+corpus:
+  enabled: true
+  db_path: "~/path/to/corpus.db"
+  search_k: 5          # max chunks merged into the prompt
+  threshold: 0.40      # minimum cosine similarity (0–1)
+```
+
+See [config/config.example.yaml](config/config.example.yaml) for the full commented block.
+
+#### How retrieval is wired (two paths)
+
+| Path | When it runs | Query text | Where chunks appear |
+| --- | --- | --- | --- |
+| **Journaler chat** (`journaler start` HTTP `/chat`, **`journaler chat`**) | Every normal user turn (not slash commands) | The **entire user message** is embedded and searched | Appended to the **system** prompt for that turn only (`ConversationEngine.chat`) |
+| **Orchestrator agents** (`engineering-hub start`, `run-once`) | Each dispatched `@agent:` task after Django context is loaded | **`task.description`** plus optional **`task.context`** | Concatenated into the formatted context string after the memory block (`ContextManager` → `ContextFormatter`) |
+
+**Not covered by these paths:** morning **`journaler briefing`**, **`journaler export --summarize`** (single-shot completion), and **`/agent`** delegation (see below).
+
+#### `/agent` delegation and corpus
+
+Inline **`/agent`** uses `AgentWorker` with an **empty** formatted project context string. That means **no** Django block and **no** PDF corpus block inside the delegated call, even if you pass **`--project`**. The `--project` flag is still stored on the task (for output paths and future use), but it does not trigger `ContextManager.format_for_agent` today.
+
+**Practical implications:**
+
+- For **PDF RAG + persona in one shot**, ask in **plain chat** first (corpus injects automatically), then optionally **`/agent`** for structured output if the answer already sits in the visible thread.
+- For **Django + PDF RAG + agent prompt**, queue an **`@agent:`** line in the journal with **`[[django://project/<id>]]`** so the **Orchestrator** builds full context.
+
+#### Best practices
+
+1. **Keep Ollama and the embed model running** (`ollama pull <embed_model>`). If the embedder is down, corpus search returns nothing; startup logs warn when the DB is missing or the service is unavailable.
+2. **Journaler turns:** The model embeds the **full** message. Prefer one focused question (or a short paragraph listing synonyms/acronyms) over a no-op greeting — otherwise similarity can be weak or noisy.
+3. **Orchestrator tasks:** Put searchable substance in the **task line** (and extra phrasing in task `context` if your notes format supports it). The search does not see the whole journal entry, only the task fields passed into context build.
+4. **Tune `search_k` and `threshold`:** Raise `threshold` if you get irrelevant chunks; raise `k` slightly if recall is too thin. Corpus defaults are slightly stricter than workspace memory (`memory.threshold` vs `corpus.threshold`).
+5. **Budget:** In **`journaler chat`**, **`/status`** / **`/budget`** reports **Corpus injection** token usage so you can see when RAG is eating context.
+
+#### Example prompts (Journaler chat)
+
+Use wording that matches how references are written in your ingest (section titles, standard numbers, defined terms).
+
+```text
+What does ASTM E336 require for reverberation room volume qualifications?
+Summarize the field measurement procedure for impact insulation class in the reference corpus.
+IBC 1207.3 — occupant exposure limits and how they relate to NC curves.
+Define "normalized impact sound pressure level" as used in our lab reports.
+```
+
+#### Example task lines (Orchestrator / journal)
+
+Corpus query = task **description** + optional **context**:
+
+```org
+* Overnight Agent Tasks
+- [ ] @standards-checker: Verify ASTM E1007-16 vs E1007-22 delta for tapping machine calibration [[django://project/42]]
+- [ ] @research: IBC acoustical privacy requirements for adjacency between conference rooms and open offices
+```
+
 ## Orchestrator: Task-Driven Agents
 
 The Orchestrator watches your workspace for `@agent:` task lines and dispatches them to specialized agents.
@@ -604,6 +757,7 @@ In your daily `.org` journal files under a `* Overnight Agent Tasks` heading:
 | `technical-writer` | Draft reports, protocols, and technical documentation |
 | `standards-checker` | Verify compliance with ASTM/ISO standards |
 | `technical-reviewer` | Review technical documents for accuracy |
+| `latex-writer` | Produce compilable `.tex` source files with named style/template selection |
 
 ## Docker Container Execution
 
@@ -752,6 +906,9 @@ See [config/config.example.yaml](config/config.example.yaml) for all available o
 - `journaler.skills_dir` - Path to skills YAML directory (default: `skills/` at repo root; loaded into the system prompt for daemon and interactive chat)
 - `journaler.context_management.*` - Token pressure thresholds, compression triggers, EOD reset time, topic-shift behavior
 - `memory.*` - Vector memory settings (enabled, search_k, threshold)
+- `corpus.enabled` - Enable PDF reference corpus RAG (requires `libraryfiles-corpus` and `corpus.db`)
+- `corpus.db_path` - Path to `corpus.db` from libraryfiles-corpus ingest
+- `corpus.search_k` / `corpus.threshold` - Max chunks and minimum similarity for corpus hits (defaults: 5 / 0.40)
 
 ## License
 

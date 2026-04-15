@@ -501,26 +501,49 @@ class ConversationEngine:
             "current_topic": self.topic_tracker.current_topic,
         }
 
-    def generate_briefing(self, briefing_context: str, briefing_prompt: str) -> str:
+    def generate_briefing(
+        self,
+        briefing_context: str,
+        briefing_prompt: str,
+        max_tokens: int | None = None,
+    ) -> str:
         """Generate a morning briefing using a separate prompt.
 
         Uses a richer context and a dedicated prompt template.
         Does NOT pollute the chat history — briefing is a one-shot generation.
+
+        Args:
+            briefing_context: Unused legacy parameter (context is already
+                embedded in *briefing_prompt* by ``format_briefing_prompt``).
+            briefing_prompt: Fully-formatted prompt including context.
+            max_tokens: Override generation budget.  Falls back to
+                ``self._max_tokens`` when *None*.
         """
+        gen_tokens = max_tokens if max_tokens is not None else self._max_tokens
         messages = [
             {
                 "role": "system",
                 "content": (
-                    "You are the Journaler — an always-on engineering assistant. "
-                    "Generate a concise, actionable morning briefing."
+                    "You are the Journaler — an always-on engineering assistant "
+                    "embedded in Jake's acoustic engineering consulting workflow. "
+                    "You have deep familiarity with his org-roam workspace, "
+                    "ongoing projects (ASTM/ISO standards compliance, test "
+                    "protocols, client reports), and the agent delegation system "
+                    "(research, technical-writer, standards-checker agents).\n\n"
+                    "Generate a thorough, actionable morning briefing. Your goal "
+                    "is not just to summarize — it is to *reason about project "
+                    "trajectories* and suggest concrete paths forward. When you "
+                    "see recurring topics or stale tasks, diagnose likely causes "
+                    "and recommend next actions. Distinguish quick wins from deep "
+                    "work blocks and flag items that can be delegated to agents."
                 ),
             },
             {
                 "role": "user",
-                "content": f"{briefing_prompt}\n\n{briefing_context}",
+                "content": briefing_prompt,
             },
         ]
-        return self._backend.chat(messages, self._max_tokens)
+        return self._backend.chat(messages, gen_tokens)
 
     def get_history_summary(self) -> str:
         """Return a brief summary of recent conversation for status display."""

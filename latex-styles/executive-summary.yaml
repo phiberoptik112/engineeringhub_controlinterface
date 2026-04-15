@@ -1,0 +1,46 @@
+name: executive-summary
+display_name: "Executive Summary"
+description: |
+  Concise article-class deliverable for client-facing executive summaries.
+  Leaner preamble than the full consulting report: no longtable, smaller
+  margins, 11pt font. Intended for 2–6 page deliverables without chapters.
+  Use \section{} / \subsection{} only — no \chapter{}.
+
+document_class: article
+class_options: "11pt,letterpaper"
+template_file: null
+
+packages:
+  - { name: geometry,  options: "margin=1.25in" }
+  - { name: setspace }
+  - { name: hyperref,  options: "hidelinks,pdfusetitle" }
+  - { name: booktabs }
+  - { name: array }
+  - { name: siunitx }
+  - { name: graphicx }
+  - { name: float }
+  - { name: natbib,    options: "numbers,sort&compress" }
+  - { name: microtype }
+  - { name: xcolor }
+  - { name: amsmath }
+  - { name: abstract }
+
+custom_commands:
+  - '\onehalfspacing'
+  - '\sisetup{detect-all, group-separator={,}}'
+  - '\bibliographystyle{plainnat}'
+  - '\newcommand{\placeholder}[1]{\textbf{\textcolor{red}{[INSERT: #1]}}}'
+  - '\renewcommand{\abstractname}{Executive Summary}'
+
+title_block:
+  title: "TITLE"
+  author: "FIRM NAME \\\\ Acoustic Engineering Consulting"
+  date: "\\today"
+
+section_structure: |
+  Use \section{} / \subsection{} only (no \chapter{}). Structure:
+  Abstract (renamed Executive Summary via \renewcommand) →
+  \section{Background} → \section{Key Findings} →
+  \section{Recommendations} → \section{Next Steps} → References.
+  Keep body text to 2–6 pages. Relegate supporting data to a brief appendix
+  (\section*{Appendix}) if needed.
