@@ -408,6 +408,17 @@ class Settings(BaseSettings):
     )
 
     @property
+    def corpus_audit_log_path(self) -> Path | None:
+        """Path to the retrieval audit JSONL file, derived from corpus_db_path.
+
+        Returns None when corpus_db_path is not configured so callers can
+        treat audit logging as an optional no-op.
+        """
+        if self.corpus_db_path is None:
+            return None
+        return self.corpus_db_path.expanduser().parent / "retrieval_audit.jsonl"
+
+    @property
     def resolved_templates_dir(self) -> Path:
         """Effective templates directory — custom path if set, else workspace_dir/templates."""
         if self.templates_dir is not None:

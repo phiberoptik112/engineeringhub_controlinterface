@@ -472,6 +472,23 @@ class ConversationEngine:
         self.budget.corpus_injection_tokens = 0
         return response
 
+    def inject_turn(self, user: str, assistant: str) -> None:
+        """Inject a pre-computed (user, assistant) exchange into history and the log.
+
+        Used to persist agent dispatch results that bypassed ``chat()`` (e.g.
+        confirmed DISPATCH sentinel executions) so they appear in rolling context
+        and ``conversation.jsonl``.
+        """
+        now = datetime.now().isoformat(timespec="seconds")
+        self.history.add("user", user)
+        self.history.add("assistant", assistant)
+        self.budget.history_tokens = self.history.total_tokens
+        self._log_turn("user", user, now)
+        self._log_turn("assistant", assistant, now)
+        archived = self.history.flush_archive()
+        if archived:
+            self._log_archived_turns(archived)
+
     def clear(self, strategy: ClearStrategy) -> str:
         """Execute a manual clear command. Returns a status message."""
         last_scan = ""
@@ -565,6 +582,43 @@ class ConversationEngine:
         for label, content in self._loaded_files.items():
             blocks.append(f"### {label}\n```\n{content}\n```")
         return "\n".join(blocks)
+
+    def build_delegate_context(self, task_description: str) -> str:
+        """Assemble reference material for delegated agent tasks.
+
+        Includes files the user loaded via ``/load`` in this Journaler session,
+        plus semantic-search excerpts from ``corpus.db`` when a corpus service
+        is configured (same RAG path as chat turns).
+        """
+        parts: list[str] = []
+        loaded = self._loaded_files_section().strip()
+        if loaded:
+            parts.append(
+                "## Files loaded in Journaler chat\n\n"
+                "The user loaded these into the Journaler session before delegating. "
+                "Treat them as primary reference for the task unless they conflict "
+                "with stated requirements.\n\n"
+            )
+            parts.append(loaded)
+
+        cs = self._corpus_service
+        query = (task_description or "").strip()
+        if cs is not None and cs.is_available() and query:
+            try:
+                results = cs.search(query=query)
+            except Exception as exc:
+                logger.warning("Delegate corpus search failed (non-fatal): %s", exc)
+                results = []
+            if results:
+                parts.append(
+                    "\n## Reference corpus (corpus.db)\n\n"
+                    "Excerpts from the vector-indexed PDF reference library, retrieved "
+                    "for this task. Prefer these over generic knowledge when they apply; "
+                    "cite ``source_file`` and page when quoting.\n\n"
+                )
+                parts.append(cs.format_for_context(results))
+
+        return "\n".join(parts).strip()
 
     def _sync_loaded_files_budget(self) -> None:
         self.budget.loaded_files_tokens = estimate_tokens(self._loaded_files_section())

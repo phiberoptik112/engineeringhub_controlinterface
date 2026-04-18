@@ -13,7 +13,7 @@ class ParsedTask(BaseModel):
 
     agent: str
     status: TaskStatus
-    project_id: int | None = None
+    project_id: int | str | None = None
     description: str
     context: str | None = None
     deliverable: str | None = None

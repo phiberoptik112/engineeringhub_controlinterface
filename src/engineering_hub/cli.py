@@ -10,6 +10,7 @@ from urllib.parse import urlparse
 
 from rich.console import Console
 from rich.logging import RichHandler
+from rich.markdown import Markdown
 from rich.markup import escape
 from rich.panel import Panel
 from rich.table import Table
@@ -724,6 +725,13 @@ def _build_status_bar(engine: ConversationEngine, model_label: str) -> Panel:
     return Panel(t, height=3, padding=(0, 0))
 
 
+def _print_chat_markdown(console: Console, text: str) -> None:
+    """Render Markdown (GFM tables, headings, code fences) for chat/agent output."""
+    if not text.strip():
+        return
+    console.print(Markdown(text))
+
+
 def _handle_chat_slash_command(
     raw: str,
     engine: ConversationEngine,
@@ -815,8 +823,8 @@ def _handle_chat_slash_command(
             return
         from engineering_hub.journaler.chat_server import _handle_agent_command
 
-        msg = _handle_agent_command(raw, delegator, journal_ctx)
-        chat_console.print(f"[green]{escape(msg)}[/green]")
+        msg = _handle_agent_command(raw, delegator, journal_ctx, engine=engine)
+        _print_chat_markdown(chat_console, msg)
         return
 
     if cmd == "/agent_browse":
@@ -857,8 +865,9 @@ def _handle_chat_slash_command(
         result = delegator.delegate(
             agent_type=selected_skill.agent_type,
             description=description,
+            journaler_context=engine.build_delegate_context(description),
         )
-        chat_console.print(f"[green]{escape(result)}[/green]")
+        _print_chat_markdown(chat_console, result)
         return
 
     if cmd == "/validate-latex":
@@ -1692,7 +1701,7 @@ def cmd_journaler(args: argparse.Namespace) -> int:
                     console.print(_build_status_bar(engine, model_label))
                     continue
                 try:
-                    response = engine.chat(user_input)
+                    raw_response = engine.chat(user_input)
                 except Exception as exc:
                     log.exception("Journaler chat turn failed")
                     console.print(
@@ -1700,7 +1709,43 @@ def cmd_journaler(args: argparse.Namespace) -> int:
                         "[dim]You can try again, or type /exit to leave.[/dim]\n"
                     )
                     continue
-                console.print(f"\n[bold]Journaler:[/bold] {escape(response)}\n")
+
+                from engineering_hub.journaler.chat_server import (
+                    _extract_dispatch,
+                    _handle_agent_command,
+                )
+
+                response, dispatch_cmd = _extract_dispatch(raw_response)
+                console.print("\n[bold]Journaler:[/bold]")
+                _print_chat_markdown(console, response)
+                console.print()
+
+                if dispatch_cmd and ctx is not None:
+                    console.print(
+                        f"[cyan]Proposed dispatch:[/cyan] {escape(dispatch_cmd)}\n"
+                    )
+                    try:
+                        confirm = input("Run it? [y/N]: ").strip().lower()
+                    except (KeyboardInterrupt, EOFError):
+                        confirm = ""
+                    if confirm == "y":
+                        console.print("[dim]Running agent…[/dim]")
+                        try:
+                            agent_result = _handle_agent_command(
+                                dispatch_cmd, delegator, ctx, engine=engine
+                            )
+                        except Exception as exc:
+                            log.exception("Agent dispatch failed")
+                            agent_result = f"Agent dispatch failed: {exc}"
+                        console.print()
+                        _print_chat_markdown(console, agent_result)
+                        console.print()
+                        engine.inject_turn(
+                            user=dispatch_cmd, assistant=agent_result
+                        )
+                    else:
+                        console.print("[dim]Dispatch cancelled.[/dim]\n")
+
                 console.print(_build_status_bar(engine, model_label))
         except (KeyboardInterrupt, EOFError):
             pass

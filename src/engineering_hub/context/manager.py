@@ -24,6 +24,8 @@ if TYPE_CHECKING:
     from engineering_hub.memory.service import MemoryService
     from engineering_hub.templates.models import ReportSkeleton
 
+from engineering_hub.corpus.audit_log import RetrievalAuditLog
+
 # Optional corpus service (from libraryfiles_corpus package)
 try:
     from corpus.service import CorpusService
@@ -47,6 +49,7 @@ class ContextManager:
         history_notes_manager: SharedNotesManager | None = None,
         corpus_service: "CorpusService | None" = None,
         template_skeleton: "ReportSkeleton | None" = None,
+        corpus_audit_log: RetrievalAuditLog | None = None,
     ) -> None:
         """Initialize context manager.
 
@@ -64,6 +67,8 @@ class ContextManager:
             corpus_service: Optional corpus service for PDF reference corpus context
             template_skeleton: Optional report template skeleton for the technical
                 writer agent to follow when drafting reports.
+            corpus_audit_log: Optional audit log that records every corpus search
+                call with query, retrieved chunks, and similarity scores.
         """
         self.django_client = django_client
         self.notes_manager = notes_manager
@@ -76,6 +81,7 @@ class ContextManager:
         self.memory_service = memory_service
         self.corpus_service = corpus_service
         self.template_skeleton = template_skeleton
+        self._corpus_audit_log = corpus_audit_log
         self._file_ingest = FileIngestAction(output_dir=self.output_dir)
 
     def build_context(self, task: ParsedTask) -> ProjectContext:
@@ -359,6 +365,15 @@ class ContextManager:
         except Exception as e:
             logger.warning(f"Corpus search failed (non-fatal): {e}")
             return context
+
+        if self._corpus_audit_log is not None:
+            self._corpus_audit_log.write(
+                task_id=task.task_id,
+                query=query,
+                results=results,
+                k=getattr(self.corpus_service, "search_k", None),
+                threshold=getattr(self.corpus_service, "search_threshold", None),
+            )
 
         if results:
             context.metadata["corpus_results"] = [

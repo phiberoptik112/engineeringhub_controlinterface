@@ -247,8 +247,9 @@ class AgentDelegator:
         self,
         agent_type: str,
         description: str,
-        project_id: int | None = None,
+        project_id: int | str | None = None,
         backend: str = "auto",
+        journaler_context: str = "",
     ) -> str:
         """Execute a task via the selected backend and return the result as a string.
 
@@ -257,6 +258,8 @@ class AgentDelegator:
             description: Task description text.
             project_id: Optional Django project ID for context enrichment.
             backend: "auto", "mlx", or "claude". Overrides default_backend for this call.
+            journaler_context: Optional markdown block (loaded files, corpus excerpts)
+                assembled by the Journaler before delegation.
 
         Returns:
             Formatted result string for display in the Journaler chat.
@@ -298,7 +301,7 @@ class AgentDelegator:
         )
 
         try:
-            result = worker.execute(task, context="")
+            result = worker.execute(task, context=journaler_context)
         except Exception as exc:
             logger.error(f"Agent delegation failed: {exc}")
             return f"Agent execution failed: {exc}"
@@ -323,7 +326,7 @@ class AgentDelegator:
         agent_type: str,
         description: str,
         journal_dir: Path,
-        project_id: int | None = None,
+        project_id: int | str | None = None,
     ) -> str:
         """Write an agent task to today's org journal as a fallback.
 
