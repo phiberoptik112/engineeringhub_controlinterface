@@ -1,0 +1,58 @@
+name: technical-spec
+display_name: "Technical Specification"
+description: |
+  Detailed technical specification document for design criteria, partition
+  assemblies, or test protocols. Uses the report class with narrower margins
+  to accommodate data-dense tables. Adds enumitem for numbered requirement
+  lists and listings for code/configuration blocks. Full calculation chains
+  and comprehensive appendices are expected. Target audience: HIGH technical
+  level engineers and peer reviewers.
+
+document_class: report
+class_options: "11pt,letterpaper"
+template_file: null
+
+packages:
+  - { name: geometry,  options: "top=1in,bottom=1in,left=1.25in,right=1.25in" }
+  - { name: setspace }
+  - { name: hyperref,  options: "hidelinks,pdfusetitle,bookmarksnumbered" }
+  - { name: booktabs }
+  - { name: array }
+  - { name: longtable }
+  - { name: tabularx }
+  - { name: siunitx }
+  - { name: graphicx }
+  - { name: float }
+  - { name: natbib,    options: "numbers,sort&compress" }
+  - { name: microtype }
+  - { name: xcolor }
+  - { name: amsmath }
+  - { name: amssymb }
+  - { name: enumitem }
+  - { name: listings }
+  - { name: cleveref }
+
+custom_commands:
+  - '\singlespacing'
+  - '\sisetup{detect-all, group-separator={,}, per-mode=symbol}'
+  - '\bibliographystyle{plainnat}'
+  - '\newcommand{\placeholder}[1]{\textbf{\textcolor{red}{[INSERT: #1]}}}'
+  - '\newcommand{\req}[1]{\textbf{REQ-#1}}'
+  - '\newcommand{\std}[1]{\textit{#1}}'
+  - '\lstset{basicstyle=\ttfamily\small, breaklines=true, frame=single}'
+
+title_block:
+  title: "TITLE"
+  author: "FIRM NAME \\\\ Acoustic Engineering Consulting"
+  date: "\\today"
+
+section_structure: |
+  Use \chapter{} for major divisions with section numbering enabled.
+  Structure: \chapter{Purpose and Scope} → \chapter{Applicable Standards and
+  References} → \chapter{Design Criteria} (numbered requirement lists with \req{})
+  → \chapter{Test Methods and Acceptance Criteria} → \chapter{Calculation Methods}
+  (full equation chains with \begin{equation}) → \chapter{Compliance Checklist}
+  (longtable) → \chapter{Conclusions} → Bibliography → Appendices (raw data
+  tables, calibration records, equipment lists).
+  Reference specific standard sections inline, e.g.:
+  "per Section~7.2 of \std{ASTM~E336-17a}".

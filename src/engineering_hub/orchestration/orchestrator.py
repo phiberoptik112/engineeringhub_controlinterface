@@ -15,6 +15,8 @@ from engineering_hub.container.router import TaskRouter
 from engineering_hub.context.manager import ContextManager
 from engineering_hub.core.constants import TaskStatus, is_ingest_task
 from engineering_hub.core.models import ParsedTask, TaskResult
+from engineering_hub.corpus.audit_log import RetrievalAuditLog
+from engineering_hub.corpus.citation_verifier import CitationVerifier
 from engineering_hub.corpus_service_factory import build_corpus_service_from_settings
 from engineering_hub.django.client import DjangoClient
 from engineering_hub.memory.service import MemoryService
@@ -83,6 +85,15 @@ class Orchestrator:
 
         corpus_service = build_corpus_service_from_settings(self.settings)
 
+        corpus_audit_log = RetrievalAuditLog(self.settings.corpus_audit_log_path)
+
+        self._citation_verifier: CitationVerifier | None = None
+        if self.settings.corpus_enabled and self.settings.corpus_db_path is not None:
+            self._citation_verifier = CitationVerifier(
+                audit_log_path=self.settings.corpus_audit_log_path,
+                corpus_db_path=self.settings.corpus_db_path.expanduser(),
+            )
+
         # Context manager
         self.context_manager = ContextManager(
             django_client=self.django_client,
@@ -93,6 +104,7 @@ class Orchestrator:
             memory_service=self.memory_service,
             history_notes_manager=self._history_notes_manager,
             corpus_service=corpus_service,
+            corpus_audit_log=corpus_audit_log,
         )
 
         # Agent worker (provider chosen by llm_provider setting)
@@ -172,6 +184,7 @@ class Orchestrator:
         if result.success:
             self._capture_task_result(task, result)
             self._create_roam_wrapper(task, result)
+            self._verify_citations(task, result)
 
         return result
 
@@ -323,6 +336,60 @@ class Orchestrator:
             logger.info(f"Roam wrapper: {wrapper_path.name}")
         except OSError as e:
             logger.warning(f"Failed to write roam wrapper: {e}")
+
+    def _verify_citations(self, task: ParsedTask, result: TaskResult) -> None:
+        """Run citation verification on a successful agent response.
+
+        Parses [SOURCE:] and [PARAMETRIC:] tags from the agent output,
+        cross-checks each source against the retrieval audit log and corpus
+        database, and writes the verification report to:
+          1. The org journal (via ``append_message``).
+          2. A ``.citations.md`` sidecar file alongside the output document.
+
+        No-ops silently when the verifier is not configured or when the
+        result has no agent response.
+        """
+        if self._citation_verifier is None:
+            return
+        if not result.agent_response:
+            return
+
+        try:
+            citation_results = self._citation_verifier.verify_output(
+                output_text=result.agent_response,
+                task_id=task.task_id,
+            )
+            parametric_count = self._citation_verifier.count_parametric_claims(
+                result.agent_response
+            )
+            report = self._citation_verifier.format_verification_report(
+                citation_results,
+                parametric_count=parametric_count,
+            )
+
+            self.notes_manager.append_message(
+                agent=task.agent,
+                content=report,
+            )
+
+            if result.output_path:
+                sidecar = Path(result.output_path).with_suffix(".citations.md")
+                try:
+                    sidecar.write_text(report, encoding="utf-8")
+                except OSError as exc:
+                    logger.warning("Could not write citations sidecar: %s", exc)
+
+            verified = sum(1 for r in citation_results if r.status == "VERIFIED")
+            total = len(citation_results)
+            logger.info(
+                "Citation verification: %d/%d verified, %d parametric — %s",
+                verified,
+                total,
+                parametric_count,
+                task.description[:50],
+            )
+        except Exception as exc:
+            logger.warning("Citation verification failed (non-fatal): %s", exc)
 
     def _capture_journal_entries(self) -> None:
         """Backfill recent journal entries into memory.

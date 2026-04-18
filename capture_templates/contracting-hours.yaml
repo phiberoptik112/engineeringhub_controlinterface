@@ -1,0 +1,51 @@
+name: contracting-hours
+display_name: "Contracting Hour Log"
+key: "ch"
+description: "Log billable hours for a contracting engagement"
+template_type: roam-capture
+
+target:
+  dir: "contracting/"
+  filename: "%Y%m%d%H%M%S-${slug}.org"
+
+structure:
+  title: "${client} - ${date} Hours"
+  filetags: [contracting, hours, invoicing]
+  properties:
+    CLIENT: "${client}"
+    RATE: "${rate}"
+    HOURS: "${hours}"
+  headings:
+    - title: "Work Performed"
+      body: "${description}"
+    - title: "Invoice Notes"
+      body: ""
+    - title: "Time Breakdown"
+      body: |
+        | Task | Start | End | Hours |
+        |---+---+---+---|
+        | ${description} | | | ${hours} |
+
+fields:
+  - name: client
+    prompt: "Client name"
+    type: text
+  - name: rate
+    prompt: "Hourly rate"
+    type: number
+    default: "150"
+  - name: hours
+    prompt: "Hours worked"
+    type: number
+  - name: date
+    prompt: "Date"
+    type: date
+    default: "today"
+  - name: description
+    prompt: "Work description"
+    type: text
+
+agent_dispatch:
+  agent_type: research
+  description_template: "Summarize contracting hours for ${client} this week"
+  on: manual

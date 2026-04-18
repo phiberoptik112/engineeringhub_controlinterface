@@ -1,7 +1,8 @@
 """AgentDelegator: bridge between the Journaler daemon and the agent worker system.
 
 Allows the Journaler to delegate tasks directly to named agent personalities
-(research, technical-writer, standards-checker, technical-reviewer, weekly-reviewer)
+(research, technical-writer, standards-checker, technical-reviewer, weekly-reviewer,
+latex-writer, panning-for-gold)
 using either the local MLX model already loaded in memory or the Claude API.
 
 Backend selection
@@ -15,7 +16,8 @@ Skills
 ------
 Skill definitions live in YAML files under the skills/ directory (top-level, alongside
 prompts/). Each YAML file describes one agent type: when to use it, example invocations,
-and output conventions. New skills are added by dropping a new .yaml file — no code changes.
+and output conventions. Personas reachable via `/agent` also need `AgentType`, prompt file,
+registry config, and delegator aliases (match existing agents such as `latex-writer`).
 """
 
 from __future__ import annotations
@@ -108,6 +110,14 @@ _AGENT_ALIASES: dict[str, str] = {
     "reviewer": "technical-reviewer",
     "weekly-reviewer": "weekly-reviewer",
     "weekly": "weekly-reviewer",
+    "latex-writer": "latex-writer",
+    "latex": "latex-writer",
+    "tex-writer": "latex-writer",
+    "tex": "latex-writer",
+    "panning-for-gold": "panning-for-gold",
+    "panning": "panning-for-gold",
+    "pan-for-gold": "panning-for-gold",
+    "gold": "panning-for-gold",
 }
 
 
@@ -237,8 +247,9 @@ class AgentDelegator:
         self,
         agent_type: str,
         description: str,
-        project_id: int | None = None,
+        project_id: int | str | None = None,
         backend: str = "auto",
+        journaler_context: str = "",
     ) -> str:
         """Execute a task via the selected backend and return the result as a string.
 
@@ -247,6 +258,8 @@ class AgentDelegator:
             description: Task description text.
             project_id: Optional Django project ID for context enrichment.
             backend: "auto", "mlx", or "claude". Overrides default_backend for this call.
+            journaler_context: Optional markdown block (loaded files, corpus excerpts)
+                assembled by the Journaler before delegation.
 
         Returns:
             Formatted result string for display in the Journaler chat.
@@ -288,7 +301,7 @@ class AgentDelegator:
         )
 
         try:
-            result = worker.execute(task, context="")
+            result = worker.execute(task, context=journaler_context)
         except Exception as exc:
             logger.error(f"Agent delegation failed: {exc}")
             return f"Agent execution failed: {exc}"
@@ -313,7 +326,7 @@ class AgentDelegator:
         agent_type: str,
         description: str,
         journal_dir: Path,
-        project_id: int | None = None,
+        project_id: int | str | None = None,
     ) -> str:
         """Write an agent task to today's org journal as a fallback.
 

@@ -1,0 +1,30 @@
+% preamble-minimal.tex
+% Minimal compilable preamble for quick drafts or skeleton scaffolds.
+% Use with: /agent latex-writer --template preamble-minimal
+% Intentionally lean — add packages only as the document content requires them.
+
+\documentclass[12pt,letterpaper]{article}
+
+% --- Layout ---
+\usepackage[margin=1in]{geometry}
+
+% --- Links ---
+\usepackage[hidelinks]{hyperref}
+
+% --- Tables ---
+\usepackage{booktabs}
+
+% --- SI units ---
+\usepackage{siunitx}
+
+% --- References ---
+\usepackage{natbib}
+\bibliographystyle{plainnat}
+
+% Placeholder command (remove before final delivery)
+\usepackage{xcolor}
+\newcommand{\placeholder}[1]{\textbf{\textcolor{red}{[INSERT: #1]}}}
+
+\title{TITLE}
+\author{AUTHOR}
+\date{\today}

@@ -10,8 +10,11 @@ from urllib.parse import urlparse
 
 from rich.console import Console
 from rich.logging import RichHandler
+from rich.markdown import Markdown
 from rich.markup import escape
+from rich.panel import Panel
 from rich.table import Table
+from rich.text import Text
 
 from engineering_hub.config.loader import find_config_file
 from engineering_hub.config.settings import Settings
@@ -697,6 +700,38 @@ def cmd_mcp_server(args: argparse.Namespace) -> int:
     return 0
 
 
+def _build_status_bar(engine: ConversationEngine, model_label: str) -> Panel:
+    """Render a one-line status panel for the journaler chat loop."""
+    status = engine.get_status()
+    raw_pct = status["utilization"]
+    pct_int = int(raw_pct.rstrip("%"))
+    filled = round(pct_int / 10)
+    gauge = "▓" * filled + "░" * (10 - filled)
+    color = "red" if pct_int >= 80 else ("yellow" if pct_int >= 60 else "green")
+    topic = status["current_topic"] or "—"
+    turns = status["history_turns"]
+    files = len(engine.list_loaded_files())
+
+    t = Text(overflow="ellipsis", no_wrap=True)
+    t.append(f" Model: {model_label}", style="cyan")
+    t.append(" │ ", style="dim")
+    t.append(f"Context: {raw_pct} {gauge}", style=color)
+    t.append(" │ ", style="dim")
+    t.append(f"Turns: {turns}", style="white")
+    t.append(" │ ", style="dim")
+    t.append(f"Topic: {topic}", style="magenta")
+    t.append(" │ ", style="dim")
+    t.append(f"Files: {files} ", style="blue")
+    return Panel(t, height=3, padding=(0, 0))
+
+
+def _print_chat_markdown(console: Console, text: str) -> None:
+    """Render Markdown (GFM tables, headings, code fences) for chat/agent output."""
+    if not text.strip():
+        return
+    console.print(Markdown(text))
+
+
 def _handle_chat_slash_command(
     raw: str,
     engine: ConversationEngine,
@@ -732,6 +767,7 @@ def _handle_chat_slash_command(
       /edit <heading> :: <text>  Append under a heading in the /open target.
       /exit, /quit               Leave the chat (same as bare exit, quit, or :q).
       /agent … /skills           Delegate to agent personalities (when delegator is configured).
+      /validate-latex <path>     Compile a .tex file with pdflatex and report errors/warnings.
       /export …                  Export conversation.jsonl to org (same flags as journaler export).
       /model                     Show model, or switch profile / path (see /help).
       /help                      Show available slash commands.
@@ -787,8 +823,8 @@ def _handle_chat_slash_command(
             return
         from engineering_hub.journaler.chat_server import _handle_agent_command
 
-        msg = _handle_agent_command(raw, delegator, journal_ctx)
-        chat_console.print(f"[green]{escape(msg)}[/green]")
+        msg = _handle_agent_command(raw, delegator, journal_ctx, engine=engine)
+        _print_chat_markdown(chat_console, msg)
         return
 
     if cmd == "/agent_browse":
@@ -829,8 +865,97 @@ def _handle_chat_slash_command(
         result = delegator.delegate(
             agent_type=selected_skill.agent_type,
             description=description,
+            journaler_context=engine.build_delegate_context(description),
         )
-        chat_console.print(f"[green]{escape(result)}[/green]")
+        _print_chat_markdown(chat_console, result)
+        return
+
+    if cmd == "/validate-latex":
+        if len(parts) < 2:
+            chat_console.print("[yellow]Usage: /validate-latex <path-to-.tex-file>[/yellow]")
+            return
+
+        raw_path = " ".join(parts[1:])
+        tex_path = Path(raw_path).expanduser()
+        if not tex_path.is_absolute() and not tex_path.exists():
+            # Try resolving relative to output_dir when available (delegator knows it)
+            if delegator is not None and hasattr(delegator, "_output_dir"):
+                candidate = delegator._output_dir / tex_path
+                if candidate.exists():
+                    tex_path = candidate
+
+        from engineering_hub.agents.latex_validator import LatexValidator
+
+        validator = LatexValidator()
+
+        if not validator.is_available():
+            chat_console.print(
+                "[red]pdflatex not found on PATH.[/red]\n"
+                "[dim]Install TeX Live (https://www.tug.org/texlive/) or "
+                "MacTeX (https://www.tug.org/mactex/) to enable LaTeX validation.[/dim]"
+            )
+            return
+
+        if not tex_path.exists():
+            chat_console.print(f"[red]File not found: {escape(str(tex_path))}[/red]")
+            return
+
+        if tex_path.suffix.lower() != ".tex":
+            chat_console.print(
+                f"[yellow]Expected a .tex file, got '{tex_path.suffix}'. "
+                "Proceeding anyway…[/yellow]"
+            )
+
+        chat_console.print(f"[dim]Compiling {escape(tex_path.name)} with pdflatex…[/dim]")
+
+        result = validator.validate(tex_path)
+
+        if result.success:
+            pdf_note = f" → {escape(str(result.pdf_path))}" if result.pdf_path else ""
+            chat_console.print(f"[green]LaTeX compiled successfully{pdf_note}[/green]")
+            if result.warnings:
+                chat_console.print(
+                    f"[yellow]{len(result.warnings)} warning(s):[/yellow]\n"
+                    + result.formatted_warnings()
+                )
+        else:
+            chat_console.print(
+                f"[red]Compile failed — {len(result.errors)} error(s):[/red]\n"
+                + result.formatted_errors()
+            )
+            if result.warnings:
+                chat_console.print(
+                    f"[yellow]{len(result.warnings)} warning(s):[/yellow]\n"
+                    + result.formatted_warnings(max_warnings=3)
+                )
+
+            # Offer auto-fix via the agent if delegator is configured
+            if delegator is not None:
+                try:
+                    answer = input("Attempt automatic fix with the latex-writer agent? [y/N] ").strip().lower()
+                except (KeyboardInterrupt, EOFError):
+                    answer = ""
+                if answer in ("y", "yes"):
+                    chat_console.print("[dim]Running agent correction loop…[/dim]")
+                    worker = getattr(delegator, "_worker", None)
+                    if worker is None:
+                        chat_console.print(
+                            "[yellow]Auto-fix requires an AgentWorker on the delegator "
+                            "(delegator._worker). Skipping.[/yellow]"
+                        )
+                    else:
+                        fixed = validator.fix_with_agent(tex_path, result, worker)
+                        if fixed.success:
+                            pdf_note = f" → {escape(str(fixed.pdf_path))}" if fixed.pdf_path else ""
+                            chat_console.print(
+                                f"[green]Fixed and compiled successfully{pdf_note}[/green]"
+                            )
+                        else:
+                            chat_console.print(
+                                f"[red]Auto-fix could not resolve all errors "
+                                f"({len(fixed.errors)} remaining):[/red]\n"
+                                + fixed.formatted_errors()
+                            )
         return
 
     if cmd == "/export":
@@ -890,8 +1015,10 @@ def _handle_chat_slash_command(
             "  [cyan]/budget[/cyan]                    Show token budget breakdown\n"
             "  [cyan]/topic[/cyan]                     Show currently detected conversation topic\n"
             "  [cyan]/agent <type> <desc>[/cyan]      Delegate to a named agent (see README)\n"
-            "  [cyan]/agent_browse[/cyan]              Browse and pick an agent skill interactively\n"
+            "  [cyan]/agent_browse[/cyan]              Browse and pick an agent skill\n"
             "  [cyan]/skills[/cyan]                    List agent delegation skills / personas\n"
+            "  [cyan]/validate-latex <path>[/cyan]    Compile a .tex file and report errors\n"
+            "                                 (prompts to auto-fix via agent on failure)\n"
             "  [cyan]/export[/cyan]                    Export transcript (`/export --help`)\n"
             + write_cmds +
             "  [cyan]/exit[/cyan], [cyan]/quit[/cyan]          Leave chat (or type exit, quit, :q)\n"
@@ -1039,6 +1166,104 @@ def _handle_chat_slash_command(
             for p in matches:
                 chat_console.print(f"  [cyan]{p}[/cyan]")
             chat_console.print()
+        return
+
+    if cmd == "/capture_list":
+        from engineering_hub.capture.loader import (
+            _default_capture_templates_dir,
+            load_capture_templates,
+        )
+        ct_dir = _default_capture_templates_dir()
+        templates = load_capture_templates(ct_dir)
+        if not templates:
+            chat_console.print("[dim]No capture templates found.[/dim]")
+        else:
+            table = Table(title="Capture Templates")
+            table.add_column("Name", style="cyan")
+            table.add_column("Key", style="yellow")
+            table.add_column("Description")
+            table.add_column("Fields", justify="right")
+            for tpl in templates.values():
+                table.add_row(
+                    tpl.display_name, tpl.key,
+                    tpl.description[:50], str(len(tpl.fields)),
+                )
+            chat_console.print(table)
+        return
+
+    if cmd == "/capture_browse":
+        from engineering_hub.capture.loader import (
+            _default_capture_templates_dir,
+            load_capture_templates,
+        )
+        from engineering_hub.journaler.file_browser import browse_capture_templates
+
+        ct_dir = _default_capture_templates_dir()
+        templates = load_capture_templates(ct_dir)
+        if not templates:
+            chat_console.print("[dim]No capture templates to browse.[/dim]")
+            return
+
+        selected = browse_capture_templates(list(templates.values()))
+        if selected is None:
+            chat_console.print("[dim]Cancelled.[/dim]")
+            return
+
+        from engineering_hub.capture.applicator import apply_template, prompt_for_fields
+
+        chat_console.print(f"[bold]Applying: {selected.display_name}[/bold]")
+        values = prompt_for_fields(selected.fields)
+
+        roam_dir = org_roam_dir or Path.home() / "org-roam"
+
+        ok, msg = apply_template(selected, roam_dir, values, journal_dir=journal_dir)
+        if ok:
+            chat_console.print(f"[green]{msg}[/green]")
+        else:
+            chat_console.print(f"[red]{msg}[/red]")
+        return
+
+    if cmd == "/capture":
+        from engineering_hub.capture.applicator import apply_template, prompt_for_fields
+        from engineering_hub.capture.loader import (
+            _default_capture_templates_dir,
+            load_capture_templates,
+        )
+
+        ct_dir = _default_capture_templates_dir()
+        templates = load_capture_templates(ct_dir)
+
+        if len(parts) < 2:
+            chat_console.print("[yellow]Usage: /capture <name> [field=value ...][/yellow]")
+            if templates:
+                names = ", ".join(sorted(templates.keys()))
+                chat_console.print(f"  Available: {names}")
+            return
+
+        tpl_name = parts[1]
+        if tpl_name not in templates:
+            chat_console.print(f"[red]Template '{tpl_name}' not found.[/red]")
+            if templates:
+                names = ", ".join(sorted(templates.keys()))
+                chat_console.print(f"  Available: {names}")
+            return
+
+        tpl = templates[tpl_name]
+        preset: dict[str, str] = {}
+        for kv in parts[2:]:
+            if "=" in kv:
+                k, v = kv.split("=", 1)
+                preset[k] = v
+
+        values = prompt_for_fields(tpl.fields, preset)
+
+        roam_dir = org_roam_dir or Path.home() / "org-roam"
+
+        ok, msg = apply_template(tpl, roam_dir, values, journal_dir=journal_dir)
+        if ok:
+            chat_console.print(f"[green]{msg}[/green]")
+        else:
+            chat_console.print(f"[red]{msg}[/red]")
         return
 
     if cmd == "/task":
@@ -1346,7 +1571,14 @@ def cmd_journaler(args: argparse.Namespace) -> int:
         return 0
 
     elif sub == "chat":
-        from engineering_hub.journaler.chat_repl import configure_chat_readline, prompt_line
+        from engineering_hub.journaler.chat_repl import (
+            COMMAND_CATALOG,
+            _PALETTE_SENTINEL,
+            configure_chat_readline,
+            prompt_line,
+            set_pending_insertion,
+        )
+        from engineering_hub.journaler.file_browser import browse_commands
         from engineering_hub.journaler.delegator import build_delegator
         from engineering_hub.journaler.engine import ConversationEngine
         from engineering_hub.journaler.prompts import (
@@ -1412,11 +1644,13 @@ def cmd_journaler(args: argparse.Namespace) -> int:
 
         transcript_path = config.state_dir / "conversation.jsonl"
         max_hist = config.max_conversation_history
+        model_label = spec.profile_name or Path(spec.model_path).name
         console.print(
             "[green]Journaler ready. "
             "Type your questions (Ctrl-C, /exit, or exit to leave).[/green]\n"
             "[dim]Tip: /agent and /skills for agent personas; /model to switch profile; "
             "/load for files; /load_browse to browse; /help for commands.[/dim]\n"
+            "[dim]Ctrl+P opens the command palette. Tab completes slash commands.[/dim]\n"
             "[dim]Context: /status, /budget, /topic — "
             "Clear: /clear, /clear --summarize, /clear --hard[/dim]\n"
             "[dim]Input: Up/Down recall previous lines (saved under .journaler). "
@@ -1424,6 +1658,7 @@ def cmd_journaler(args: argparse.Namespace) -> int:
             f"Longer model memory: raise journaler.max_conversation_history "
             f"(now {max_hist}).[/dim]\n"
         )
+        console.print(_build_status_bar(engine, model_label))
         log = logging.getLogger(__name__)
         try:
             while True:
@@ -1432,6 +1667,11 @@ def cmd_journaler(args: argparse.Namespace) -> int:
                 except (KeyboardInterrupt, EOFError):
                     raise
                 if not user_input:
+                    continue
+                if user_input.lower() == _PALETTE_SENTINEL:
+                    selected = browse_commands(COMMAND_CATALOG)
+                    if selected:
+                        set_pending_insertion(selected)
                     continue
                 if user_input.lower() in ("exit", "quit", ":q"):
                     break
@@ -1458,9 +1698,10 @@ def cmd_journaler(args: argparse.Namespace) -> int:
                             f"[red]Command failed:[/red] {escape(str(exc))}\n"
                             "[dim]Type /help for commands. You can keep chatting.[/dim]\n"
                         )
+                    console.print(_build_status_bar(engine, model_label))
                     continue
                 try:
-                    response = engine.chat(user_input)
+                    raw_response = engine.chat(user_input)
                 except Exception as exc:
                     log.exception("Journaler chat turn failed")
                     console.print(
@@ -1468,7 +1709,44 @@ def cmd_journaler(args: argparse.Namespace) -> int:
                         "[dim]You can try again, or type /exit to leave.[/dim]\n"
                     )
                     continue
-                console.print(f"\n[bold]Journaler:[/bold] {escape(response)}\n")
+
+                from engineering_hub.journaler.chat_server import (
+                    _extract_dispatch,
+                    _handle_agent_command,
+                )
+
+                response, dispatch_cmd = _extract_dispatch(raw_response)
+                console.print("\n[bold]Journaler:[/bold]")
+                _print_chat_markdown(console, response)
+                console.print()
+
+                if dispatch_cmd and ctx is not None:
+                    console.print(
+                        f"[cyan]Proposed dispatch:[/cyan] {escape(dispatch_cmd)}\n"
+                    )
+                    try:
+                        confirm = input("Run it? [y/N]: ").strip().lower()
+                    except (KeyboardInterrupt, EOFError):
+                        confirm = ""
+                    if confirm == "y":
+                        console.print("[dim]Running agent…[/dim]")
+                        try:
+                            agent_result = _handle_agent_command(
+                                dispatch_cmd, delegator, ctx, engine=engine
+                            )
+                        except Exception as exc:
+                            log.exception("Agent dispatch failed")
+                            agent_result = f"Agent dispatch failed: {exc}"
+                        console.print()
+                        _print_chat_markdown(console, agent_result)
+                        console.print()
+                        engine.inject_turn(
+                            user=dispatch_cmd, assistant=agent_result
+                        )
+                    else:
+                        console.print("[dim]Dispatch cancelled.[/dim]\n")
+
+                console.print(_build_status_bar(engine, model_label))
         except (KeyboardInterrupt, EOFError):
             pass
         console.print("\n[dim]Chat ended.[/dim]")
@@ -1818,6 +2096,271 @@ def cmd_template(args: argparse.Namespace) -> int:
     return 1
 
 
+def cmd_capture(args: argparse.Namespace) -> int:
+    """Hub capture template management commands."""
+    sub = getattr(args, "capture_command", None)
+    if sub is None:
+        console.print(
+            "[yellow]Usage: engineering-hub capture {list|apply|create|import|export-elisp|sync}[/yellow]"
+        )
+        return 1
+
+    settings = load_settings(args.config)
+
+    from engineering_hub.capture.applicator import apply_template, prompt_for_fields
+    from engineering_hub.capture.elisp_generator import generate_elisp
+    from engineering_hub.capture.elisp_parser import parse_emacs_config
+    from engineering_hub.capture.loader import (
+        load_capture_templates,
+        save_capture_template,
+    )
+    from engineering_hub.capture.models import (
+        AgentDispatchSpec,
+        CaptureTemplate,
+        DispatchTrigger,
+        FieldSpec,
+        FieldType,
+        HeadingSpec,
+        TemplateType,
+    )
+
+    templates_dir = settings.resolved_capture_templates_dir
+
+    if sub == "list":
+        hub_templates = load_capture_templates(templates_dir)
+        emacs_templates: list[CaptureTemplate] = []
+        if settings.emacs_config_path.exists():
+            emacs_templates = parse_emacs_config(settings.emacs_config_path)
+
+        table = Table(title="Capture Templates")
+        table.add_column("Name", style="cyan")
+        table.add_column("Key", style="yellow")
+        table.add_column("Type", style="dim")
+        table.add_column("Description")
+        table.add_column("Fields", justify="right")
+        table.add_column("Source", style="dim")
+
+        for tpl in hub_templates.values():
+            table.add_row(
+                tpl.display_name,
+                tpl.key,
+                tpl.template_type.value,
+                tpl.description[:60],
+                str(len(tpl.fields)),
+                "yaml",
+            )
+
+        for tpl in emacs_templates:
+            table.add_row(
+                tpl.display_name,
+                tpl.key,
+                tpl.template_type.value,
+                tpl.description[:60],
+                str(len(tpl.fields)),
+                "emacs",
+            )
+
+        console.print(table)
+        console.print(
+            f"\n[dim]{len(hub_templates)} hub template(s), "
+            f"{len(emacs_templates)} Emacs template(s)[/dim]"
+        )
+        return 0
+
+    elif sub == "apply":
+        all_templates = load_capture_templates(templates_dir)
+        name = args.template_name
+        if name not in all_templates:
+            console.print(f"[red]Error:[/red] Template '{name}' not found.")
+            console.print("  Available: " + ", ".join(sorted(all_templates.keys())))
+            return 1
+
+        tpl = all_templates[name]
+        console.print(f"[bold]Applying capture template: {tpl.display_name}[/bold]")
+
+        preset: dict[str, str] = {}
+        for kv in (args.field_values or []):
+            if "=" in kv:
+                k, v = kv.split("=", 1)
+                preset[k] = v
+
+        values = prompt_for_fields(tpl.fields, preset)
+
+        org_roam_dir = settings.org_journal_dir.parent
+        journal_dir = settings.org_journal_dir
+
+        ok, msg = apply_template(tpl, org_roam_dir, values, journal_dir=journal_dir)
+        if ok:
+            console.print(f"[green]{msg}[/green]")
+            return 0
+        else:
+            console.print(f"[red]Error:[/red] {msg}")
+            return 1
+
+    elif sub == "create":
+        console.print("[bold]Create a new hub capture template[/bold]\n")
+
+        name = input("Template name (slug, e.g. 'meeting-notes'): ").strip()
+        if not name:
+            console.print("[red]Name is required.[/red]")
+            return 1
+
+        display_name = input(f"Display name [{name}]: ").strip() or name
+        key = input("Emacs key binding (e.g. 'mn'): ").strip()
+        description = input("Description: ").strip()
+
+        ttype = input("Type (roam-capture / org-capture) [roam-capture]: ").strip()
+        template_type = TemplateType(ttype) if ttype else TemplateType.ROAM_CAPTURE
+
+        target_dir = input("Target directory (relative to org-roam, e.g. 'projects/'): ").strip()
+        title_pattern = input("Title pattern (use ${field} placeholders) [${title}]: ").strip() or "${title}"
+
+        tags_raw = input("Filetags (comma-separated): ").strip()
+        filetags = [t.strip() for t in tags_raw.split(",") if t.strip()] if tags_raw else []
+
+        # Fields
+        fields: list[FieldSpec] = []
+        console.print("\n[bold]Define prompted fields (empty name to finish):[/bold]")
+        while True:
+            fname = input("  Field name: ").strip()
+            if not fname:
+                break
+            fprompt = input(f"  Prompt [{fname}]: ").strip() or fname
+            ftype_raw = input("  Type (text/number/date/choice) [text]: ").strip()
+            ftype = FieldType(ftype_raw) if ftype_raw else FieldType.TEXT
+            fdefault = input("  Default value: ").strip()
+            fchoices_raw = input("  Choices (comma-separated, for choice type): ").strip()
+            fchoices = [c.strip() for c in fchoices_raw.split(",") if c.strip()] if fchoices_raw else []
+            fields.append(FieldSpec(name=fname, prompt=fprompt, type=ftype, default=fdefault, choices=fchoices))
+
+        # Headings
+        headings: list[HeadingSpec] = []
+        console.print("\n[bold]Define headings (empty title to finish):[/bold]")
+        while True:
+            htitle = input("  Heading title: ").strip()
+            if not htitle:
+                break
+            hbody = input("  Body text (optional): ").strip()
+            headings.append(HeadingSpec(title=htitle, level=1, body=hbody))
+
+        # Agent dispatch
+        agent_dispatch = None
+        if input("\nAdd agent dispatch? (y/n) [n]: ").strip().lower() == "y":
+            atype = input("  Agent type (e.g. 'research'): ").strip()
+            adesc = input("  Description template (use ${field} placeholders): ").strip()
+            atrigger = input("  Trigger (on_capture/manual/weekly) [manual]: ").strip()
+            agent_dispatch = AgentDispatchSpec(
+                agent_type=atype,
+                description_template=adesc,
+                on=DispatchTrigger(atrigger) if atrigger else DispatchTrigger.MANUAL,
+            )
+
+        tpl = CaptureTemplate(
+            name=name,
+            display_name=display_name,
+            key=key,
+            description=description,
+            template_type=template_type,
+            target_dir=target_dir,
+            title_pattern=title_pattern,
+            filetags=filetags,
+            fields=fields,
+            headings=headings,
+            agent_dispatch=agent_dispatch,
+        )
+
+        path = save_capture_template(tpl, templates_dir)
+        console.print(f"\n[green]Template saved to: {path}[/green]")
+        return 0
+
+    elif sub == "import":
+        config_path = settings.emacs_config_path
+        if not config_path.exists():
+            console.print(f"[red]Error:[/red] Emacs config not found: {config_path}")
+            return 1
+
+        console.print(f"[bold]Importing from: {config_path}[/bold]")
+        emacs_templates = parse_emacs_config(config_path)
+
+        if not emacs_templates:
+            console.print("[dim]No capture templates found in config.el[/dim]")
+            return 0
+
+        table = Table(title="Templates Found")
+        table.add_column("Key", style="yellow")
+        table.add_column("Name")
+        table.add_column("Type", style="dim")
+        for tpl in emacs_templates:
+            table.add_row(tpl.key, tpl.display_name, tpl.template_type.value)
+        console.print(table)
+
+        if input(f"\nSave {len(emacs_templates)} template(s) to {templates_dir}? (y/n): ").strip().lower() != "y":
+            console.print("[dim]Cancelled.[/dim]")
+            return 0
+
+        for tpl in emacs_templates:
+            save_capture_template(tpl, templates_dir)
+            console.print(f"  [green]Saved:[/green] {tpl.name}.yaml")
+
+        console.print(f"\n[bold green]Imported {len(emacs_templates)} template(s).[/bold green]")
+        return 0
+
+    elif sub == "export-elisp":
+        all_templates = load_capture_templates(templates_dir)
+        if not all_templates:
+            console.print("[dim]No hub templates to export.[/dim]")
+            return 0
+
+        elisp = generate_elisp(list(all_templates.values()))
+
+        if args.output:
+            out_path = Path(args.output).expanduser()
+            out_path.write_text(elisp, encoding="utf-8")
+            console.print(f"[green]Elisp written to: {out_path}[/green]")
+        else:
+            print(elisp)
+
+        return 0
+
+    elif sub == "sync":
+        config_path = settings.emacs_config_path
+        console.print("[bold]Capture template sync[/bold]")
+
+        # Import from Emacs
+        emacs_templates: list[CaptureTemplate] = []
+        if config_path.exists():
+            emacs_templates = parse_emacs_config(config_path)
+            console.print(f"  Emacs: {len(emacs_templates)} template(s) found")
+
+        # Load hub templates
+        hub_templates = load_capture_templates(templates_dir)
+        console.print(f"  Hub:   {len(hub_templates)} template(s) loaded")
+
+        # Merge: Emacs templates that don't exist in hub get imported
+        imported = 0
+        for tpl in emacs_templates:
+            if tpl.name not in hub_templates:
+                save_capture_template(tpl, templates_dir)
+                console.print(f"  [green]+[/green] Imported: {tpl.name}")
+                imported += 1
+
+        # Export all hub templates to elisp
+        all_templates = load_capture_templates(templates_dir)
+        elisp = generate_elisp(list(all_templates.values()))
+
+        elisp_path = templates_dir / "generated-capture-templates.el"
+        elisp_path.write_text(elisp, encoding="utf-8")
+        console.print(f"\n  Elisp exported to: {elisp_path}")
+        console.print(
+            f"\n[bold green]Sync complete.[/bold green] "
+            f"{imported} imported, {len(all_templates)} total."
+        )
+        return 0
+
+    console.print("[yellow]Unknown capture command.[/yellow]")
+    return 1
+
+
 def cmd_memory(args: argparse.Namespace) -> int:
     """Query or inspect the local memory database."""
     setup_logging(args.verbose)
@@ -2111,6 +2654,41 @@ def main() -> int:
         help="Override output file path (default: outputs/reviews/weekly-YYYY-WNN.md)",
     )
 
+    # capture command
+    capture_parser = subparsers.add_parser(
+        "capture", help="Hub capture template management (org-roam integration)"
+    )
+    capture_sub = capture_parser.add_subparsers(dest="capture_command")
+
+    capture_sub.add_parser("list", help="List all hub and Emacs capture templates")
+
+    capture_apply_p = capture_sub.add_parser(
+        "apply", help="Apply a capture template (prompt for fields, create org node)"
+    )
+    capture_apply_p.add_argument("template_name", help="Template name (e.g. 'contracting-hours')")
+    capture_apply_p.add_argument(
+        "field_values", nargs="*", metavar="field=value",
+        help="Pre-fill fields (e.g. client=Acme hours=3)",
+    )
+
+    capture_sub.add_parser("create", help="Interactive wizard to create a new capture template")
+
+    capture_sub.add_parser(
+        "import", help="Import capture templates from Emacs config.el"
+    )
+
+    capture_export_p = capture_sub.add_parser(
+        "export-elisp", help="Generate Emacs Lisp from hub capture templates"
+    )
+    capture_export_p.add_argument(
+        "-o", "--output", type=str, default=None,
+        help="Write elisp to file instead of stdout",
+    )
+
+    capture_sub.add_parser(
+        "sync", help="Round-trip: import from Emacs, merge with hub YAML, export elisp"
+    )
+
     # template command
     template_parser = subparsers.add_parser(
         "template", help="Report template analysis and drafting"
@@ -2328,6 +2906,7 @@ def main() -> int:
         "run-once": cmd_run_once,
         "init": cmd_init,
         "mcp-server": cmd_mcp_server,
+        "capture": cmd_capture,
         "template": cmd_template,
         "journaler": cmd_journaler,
         "docker": cmd_docker,

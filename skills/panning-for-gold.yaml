@@ -1,0 +1,98 @@
+name: panning-for-gold
+display_name: Panning for Gold
+agent_type: panning-for-gold
+
+# Original skill by Jared Irish v2.0.0; adapted for Engineering Hub Journaler delegation.
+
+description: |
+  Use when processing voice transcripts, brain dumps, stream-of-consciousness notes, or raw
+  multi-topic captures. Extract every idea thread (two-pass), evaluate high-signal items, and
+  synthesize a gold-found inventory. Trigger on transcripts, exports, “process this”, “pan for gold”,
+  “brain dump”, “what did I say”, or multi-topic markdown.
+
+when_to_use:
+  - Voice transcripts (multi-speaker, timestamped) or meeting exports
+  - Stream-of-consciousness notes or pasted ChatGPT/Gemini/Claude exports
+  - User asks to process raw capture, pan for gold, or list what was said
+  - Multi-topic markdown that needs thread extraction before triage
+
+invocation_examples:
+  - "/agent panning-for-gold Process attached lunch meeting transcript; summary at docs/meetings/2026-04-09-lunch-summary.md --project 12"
+  - "/agent panning-for-gold Brain dump in paste: extract all threads, then propose ACT NOW vs PARK --project 7"
+  - "/agent panning-for-gold Two-pass pan on docs/meetings/2026-04-09-acme-transcript.md"
+  - "/agent panning pan for gold in today's voice export"
+
+parameters:
+  project_id:
+    description: Optional Django project ID for context (links, scope, standards).
+    required: false
+  description:
+    description: |
+      Source paths, paste markers, or instructions: raw file location, summary path (read first),
+      speaker context, and whether to run speaker cleanup (Phase 0.5) for multi-speaker audio.
+    required: true
+
+output:
+  format: markdown
+  output_dir: panning
+  structure:
+    - Phase 0 raw save path (if applicable)
+    - Phase 1 merged inventory (two-pass)
+    - Phase 2 evaluation plan or inline evaluations
+    - Phase 3 gold-found synthesis
+    - Optional capture bullets for org-roam / external PKM
+
+# Full reference (ignored by Journaler YAML loader; for humans / Cursor / prompt engineering).
+# PKM capture: map original “Open Brain” phases to org-roam, ACT NOW journal tasks, or your capture tool.
+extended_guide: |
+  ## Critical Rules (production)
+
+  1. SAVE EVERYTHING TO PERMANENT FILES. Phase 1 inventory, Phase 2 evaluations, and Phase 3 synthesis ALL get saved under the workspace docs tree. Never rely on agent memory alone.
+  2. SUMMARIES FIRST, TRANSCRIPT SECOND. If a summary/notes file exists alongside a transcript, use the summary as the primary extraction source. Only read the full transcript for exact quotes and verification passes.
+  3. EVALUATORS WRITE TO FILES. Every background evaluator MUST write its evaluation to a permanent file as part of its task. Do not depend on collecting agent return values only.
+  4. SYNTHESIS HAPPENS INLINE IN THE MAIN AGENT. Do not delegate synthesis-only to another agent. If evaluators disappear, synthesize from the inventory and any evaluation files you can read.
+  5. TWO PASSES ON TRANSCRIPTS. Always run Phase 1 twice (summary + targeted reads, then verification). Present merged inventory.
+
+  ## Phase 0.5 (multi-speaker)
+
+  Auto speaker labels from recorders are often wrong (environment changes fragment labels). Ask who was present and setting first. If label count > 2× expected speakers, do anchor lines + scene-based re-attribution; batch MEDIUM/LOW guesses for one user correction pass. Re-extract if mis-attribution changes meaning materially.
+
+  ## Lessons log (from original skill)
+
+  | Date | Lesson | Change |
+  |------|--------|--------|
+  | 2026-03-13 | Background evaluators lost to compaction | Critical rules 1–4; evaluators write to disk; synthesis inline |
+  | 2026-03-13 | Full transcript re-read when summary existed | Summary-first + grep for quotes |
+  | 2026-03-13 | Phase 1 not saved | Save inventory file immediately |
+  | 2026-03-18 | Fragmented speaker labels misled attribution | Phase 0.5 speaker cleanup |
+  | 2026-03-18 | Wrong labels swapped pain vs pitch | Anchors + scenes + re-extract decision |
+  | 2026-03-18 | Under-extraction | Default over-extract; Phase 2 triages |
+
+  ## Red flags: rushing
+
+  - “Just small talk” — relationship signals and intros live here.
+  - “Not actionable” — not everything must be a ticket to be valuable.
+  - “Only tech ideas” — tech bias is a common failure mode.
+  - “I'll summarize this section” — likely skimming; read carefully.
+  - “Personal/wellness irrelevant” — energy and relationships are part of the system.
+
+  ## Red flags: wasting tokens
+
+  - Full transcript re-read when a summary exists.
+  - More than five deep evaluator passes without re-triage.
+  - Delegating synthesis-only to a sub-agent.
+  - Reading whole file for one quote — use ripgrep/patterns.
+  - Whole-file context when first/last chunks often bracket the novelty.
+
+  ## Common mistakes
+
+  1. Filtering by your assumptions about “actionable.”
+  2. Speed over thoroughness on brain dumps.
+  3. Collapsing related but distinct threads.
+  4. Ignoring meta-observations about workflow.
+  5. Not asking if threads were missed.
+  6. Not saving intermediate artifacts.
+  7. Whole-transcript read for a single quote.
+  8. Dispatching agents and hoping results return without files.
+  9. Trusting auto speaker labels.
+  10. Stingy first pass — default to over-extraction; let Phase 2 prioritize.

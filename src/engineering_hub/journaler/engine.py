@@ -472,6 +472,23 @@ class ConversationEngine:
         self.budget.corpus_injection_tokens = 0
         return response
 
+    def inject_turn(self, user: str, assistant: str) -> None:
+        """Inject a pre-computed (user, assistant) exchange into history and the log.
+
+        Used to persist agent dispatch results that bypassed ``chat()`` (e.g.
+        confirmed DISPATCH sentinel executions) so they appear in rolling context
+        and ``conversation.jsonl``.
+        """
+        now = datetime.now().isoformat(timespec="seconds")
+        self.history.add("user", user)
+        self.history.add("assistant", assistant)
+        self.budget.history_tokens = self.history.total_tokens
+        self._log_turn("user", user, now)
+        self._log_turn("assistant", assistant, now)
+        archived = self.history.flush_archive()
+        if archived:
+            self._log_archived_turns(archived)
+
     def clear(self, strategy: ClearStrategy) -> str:
         """Execute a manual clear command. Returns a status message."""
         last_scan = ""
@@ -501,26 +518,49 @@ class ConversationEngine:
             "current_topic": self.topic_tracker.current_topic,
         }
 
-    def generate_briefing(self, briefing_context: str, briefing_prompt: str) -> str:
+    def generate_briefing(
+        self,
+        briefing_context: str,
+        briefing_prompt: str,
+        max_tokens: int | None = None,
+    ) -> str:
         """Generate a morning briefing using a separate prompt.
 
         Uses a richer context and a dedicated prompt template.
         Does NOT pollute the chat history — briefing is a one-shot generation.
+
+        Args:
+            briefing_context: Unused legacy parameter (context is already
+                embedded in *briefing_prompt* by ``format_briefing_prompt``).
+            briefing_prompt: Fully-formatted prompt including context.
+            max_tokens: Override generation budget.  Falls back to
+                ``self._max_tokens`` when *None*.
         """
+        gen_tokens = max_tokens if max_tokens is not None else self._max_tokens
         messages = [
             {
                 "role": "system",
                 "content": (
-                    "You are the Journaler — an always-on engineering assistant. "
-                    "Generate a concise, actionable morning briefing."
+                    "You are the Journaler — an always-on engineering assistant "
+                    "embedded in Jake's acoustic engineering consulting workflow. "
+                    "You have deep familiarity with his org-roam workspace, "
+                    "ongoing projects (ASTM/ISO standards compliance, test "
+                    "protocols, client reports), and the agent delegation system "
+                    "(research, technical-writer, standards-checker agents).\n\n"
+                    "Generate a thorough, actionable morning briefing. Your goal "
+                    "is not just to summarize — it is to *reason about project "
+                    "trajectories* and suggest concrete paths forward. When you "
+                    "see recurring topics or stale tasks, diagnose likely causes "
+                    "and recommend next actions. Distinguish quick wins from deep "
+                    "work blocks and flag items that can be delegated to agents."
                 ),
             },
             {
                 "role": "user",
-                "content": f"{briefing_prompt}\n\n{briefing_context}",
+                "content": briefing_prompt,
             },
         ]
-        return self._backend.chat(messages, self._max_tokens)
+        return self._backend.chat(messages, gen_tokens)
 
     def get_history_summary(self) -> str:
         """Return a brief summary of recent conversation for status display."""
@@ -542,6 +582,43 @@ class ConversationEngine:
         for label, content in self._loaded_files.items():
             blocks.append(f"### {label}\n```\n{content}\n```")
         return "\n".join(blocks)
+
+    def build_delegate_context(self, task_description: str) -> str:
+        """Assemble reference material for delegated agent tasks.
+
+        Includes files the user loaded via ``/load`` in this Journaler session,
+        plus semantic-search excerpts from ``corpus.db`` when a corpus service
+        is configured (same RAG path as chat turns).
+        """
+        parts: list[str] = []
+        loaded = self._loaded_files_section().strip()
+        if loaded:
+            parts.append(
+                "## Files loaded in Journaler chat\n\n"
+                "The user loaded these into the Journaler session before delegating. "
+                "Treat them as primary reference for the task unless they conflict "
+                "with stated requirements.\n\n"
+            )
+            parts.append(loaded)
+
+        cs = self._corpus_service
+        query = (task_description or "").strip()
+        if cs is not None and cs.is_available() and query:
+            try:
+                results = cs.search(query=query)
+            except Exception as exc:
+                logger.warning("Delegate corpus search failed (non-fatal): %s", exc)
+                results = []
+            if results:
+                parts.append(
+                    "\n## Reference corpus (corpus.db)\n\n"
+                    "Excerpts from the vector-indexed PDF reference library, retrieved "
+                    "for this task. Prefer these over generic knowledge when they apply; "
+                    "cite ``source_file`` and page when quoting.\n\n"
+                )
+                parts.append(cs.format_for_context(results))
+
+        return "\n".join(parts).strip()
 
     def _sync_loaded_files_budget(self) -> None:
         self.budget.loaded_files_tokens = estimate_tokens(self._loaded_files_section())

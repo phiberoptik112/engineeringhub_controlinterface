@@ -62,6 +62,18 @@ DEFAULT_AGENT_CONFIGS = {
         tools=[],
         max_tokens=6000,
     ),
+    AgentType.LATEX_WRITER: AgentConfig(
+        agent_type=AgentType.LATEX_WRITER,
+        prompt_file="latex-writer.txt",
+        tools=["create_file", "view", "django_api"],
+        max_tokens=8000,
+    ),
+    AgentType.PANNING_FOR_GOLD: AgentConfig(
+        agent_type=AgentType.PANNING_FOR_GOLD,
+        prompt_file="panning-for-gold.txt",
+        tools=[],
+        max_tokens=12000,
+    ),
 }
 
 

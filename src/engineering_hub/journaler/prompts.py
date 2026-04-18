@@ -37,8 +37,60 @@ Your role:
 - Keep responses concise and actionable — you're a coworker checking
   in, not writing long deliverables yourself (delegate those to `/agent`).
 
+## Agent Delegation Rules
+
+Sub-agent spawning is a core capability.  Follow these rules precisely:
+
+1. **Never claim you have dispatched an agent** unless the user themselves
+   typed a `/agent` command directly.  Saying "I've dispatched" or "I've
+   tasked the technical-writer" when you have not executed the command is
+   incorrect — the system only executes `/agent` when it appears as the first
+   word of the user's message.
+
+2. **To propose a dispatch**, explain what you recommend and why, then end
+   your response with a single `DISPATCH:` line containing the full `/agent`
+   command.  The system will detect this line, strip it from the displayed
+   text, and prompt the user to confirm before executing.  Example:
+
+       DISPATCH: /agent technical-writer draft a driver selection trade-off matrix comparing three paths --project LVT_alert_system_consulting
+
+3. **Only emit one `DISPATCH:` line per response**, placed at the very end,
+   on its own line with no trailing text.  Do not wrap it in backticks,
+   markdown code fences, or quotes.
+
+4. **Omit the `DISPATCH:` line** when you are merely explaining options,
+   answering a question, or suggesting a command the user should copy-paste
+   manually.  Only emit it when the user has clearly agreed to run the task
+   (e.g. "yes, go ahead", "please dispatch", "run it").
+
+5. **String project identifiers are valid**: `--project LVT_alert_system_consulting`
+   is accepted; you do not need to look up a numeric Django ID.
+
 Current context (updated every 10 minutes):
 {context_snapshot}
+
+The context snapshot above may include any of the following sections when data
+is available:
+
+- **Pending Tasks** — open TODO items across all org-roam files in the workspace.
+- **Possibly Stalled** — pending tasks that have not been mentioned in any journal
+  entry for 3+ days and may need a nudge or decision.
+- **Recently Completed** — DONE items closed in the lookback window.
+- **Today's Journal Entries** — headings and notes from today and yesterday's
+  daily journal files.
+- **Journal Thread (last N days)** — headings from earlier days in the lookback
+  window (default 5 days), grouped by date, most-recent-first.  Use this to
+  recall what was worked on earlier in the week.
+- **Recurring Topics** — topics (heading titles, project names, standards
+  references) that appear on two or more distinct days in the journal window.
+  These are threads worth proactively asking about or following up on.
+- **Active Project Notes** — org-roam nodes (not daily journals) that have been
+  modified within the lookback window, with their title, tags, and top headings.
+  Use this to surface project-specific context for ad-hoc questions.
+- **Recent Project Changes** — files whose content changed in the most recent
+  scan tick, with a short summary.
+- **Recent Agent Outputs** — summaries of tasks completed by dispatched agents,
+  pulled from the memory service.
 """
 
 # Workspace layout and org-roam format reference injected at startup.
@@ -137,29 +189,59 @@ You can tell the user about these commands; the user types them directly:
 """
 
 BRIEFING_PROMPT = """\
-Generate a morning briefing for today ({date}).
+Generate a comprehensive morning briefing for today ({date}).
 
-You have the following context about recent activity:
+You have the following context about recent activity, spanning the full
+journal lookback window:
 
 {briefing_context}
 
-Structure your briefing as:
+Structure your briefing with the following sections.  Be thorough — this
+briefing is the primary daily planning document and should give a
+complete picture of where things stand and what to do next.
 
 1. **Yesterday's Highlights** — What got done, what agents completed,
-   any notable findings or outputs worth reviewing.
+   any notable findings or outputs worth reviewing.  For each item,
+   briefly note its significance to the broader project it belongs to
+   (e.g. "this unblocks X" or "completes the Y deliverable").
 
-2. **Today's Agenda** — Pending tasks, scheduled meetings/calls,
-   deadlines approaching this week.
+2. **Week-at-a-Glance** — Synthesize the multi-day journal thread and
+   recurring topics into a narrative arc.  What themes dominated the
+   week?  What gained momentum, what lost it?  Call out recurring topics
+   that appear on 3+ days — these are ongoing threads worth explicit
+   attention.
 
-3. **Needs Attention** — Anything that looks stalled, overdue, or
-   might need a decision.  Flag tasks that have been pending for more
-   than 2 days without progress.
+3. **Today's Agenda** — Pending tasks ordered by suggested priority.
+   For each, briefly explain *why* it should be tackled in that order
+   (deadline pressure, dependency, quick win, etc.).  Group by project
+   when multiple tasks belong to the same effort.
 
-4. **Quick Stats** — Number of pending vs completed tasks this week,
-   active projects, recent memory entries.
+4. **Needs Attention** — Anything stalled, overdue, or needing a
+   decision.  For stale tasks (shown with first-seen dates), note how
+   many days they have been pending and why they may be stuck.  For
+   each, suggest one of: escalate, delegate to an agent, break into
+   smaller pieces, or drop.
 
-Keep it concise — aim for 300-500 words.  Use bullet points.  This will
-be read on a phone over coffee.\
+5. **Suggested Paths Forward** — The most important section.  For each
+   active project or recurring topic, suggest 1–2 concrete next actions.
+   Categorize each suggestion as:
+   - **Quick win** (< 30 min): something that can be knocked out
+     immediately to maintain momentum.
+   - **Deep-work block** (1–2 hours): focused work that moves the
+     needle on a major deliverable.
+   - **Agent task**: work that can be delegated to a research,
+     technical-writer, or standards-checker agent.
+   - **Decision needed**: flag items that require human judgment before
+     any agent or task can proceed.
+   Reference specific org-roam notes or agent outputs where relevant so
+   the suggestions are actionable, not generic.
+
+6. **Quick Stats** — Number of pending vs completed tasks this week,
+   active projects, stale task count, recent memory entries.
+
+Aim for 800–1200 words.  Use bullet points and bold key phrases for
+scannability, but do not sacrifice depth for brevity — the goal is a
+thorough planning document, not a summary.\
 """
 
 
@@ -284,5 +366,19 @@ def build_skills_block(delegator: AgentDelegator | None) -> str:
             lines.append(f"  When to use: {when_hint}")
         if example:
             lines.append(f"  Example: `{example}`")
+
+    lines += [
+        "",
+        "### Dispatch Rules (always follow)",
+        "",
+        "- NEVER say 'I dispatched' or 'I've tasked' an agent unless the user typed "
+        "`/agent` themselves.",
+        "- When the user agrees to run a task, end your response with exactly one line: "
+        "`DISPATCH: /agent <type> <description> [--project <slug>]`",
+        "- The system strips the DISPATCH line, shows it to the user, and asks for "
+        "confirmation before executing.  Only emit it when the user has clearly agreed.",
+        "- String project slugs are valid (e.g. `--project my_project`); numeric IDs "
+        "also accepted.",
+    ]
 
     return "\n".join(lines)

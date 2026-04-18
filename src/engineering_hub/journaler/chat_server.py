@@ -41,12 +41,19 @@ from engineering_hub.journaler.model_profiles import journaler_slash_model_comma
 
 logger = logging.getLogger(__name__)
 
+# Matches a DISPATCH sentinel line the LLM emits to propose an agent execution.
+# Must appear as its own line: "DISPATCH: /agent <type> <description> ..."
+_DISPATCH_SENTINEL_RE = re.compile(
+    r"^DISPATCH:\s*(/agent\s+\S+.+)$",
+    re.IGNORECASE | re.MULTILINE,
+)
+
 # Regex to parse: /agent <type> <description> [--project <id>] [--backend <name>]
 _AGENT_CMD_RE = re.compile(
     r"^/agent\s+(?P<agent_type>\S+)\s+(?P<description>.+?)$",
     re.IGNORECASE | re.DOTALL,
 )
-_PROJECT_FLAG_RE = re.compile(r"--project\s+(\d+)", re.IGNORECASE)
+_PROJECT_FLAG_RE = re.compile(r"--project\s+(\S+)", re.IGNORECASE)
 _BACKEND_FLAG_RE = re.compile(r"--backend\s+(mlx|claude)", re.IGNORECASE)
 
 
@@ -155,12 +162,34 @@ def _make_handler(
                         )
                 elif mlow.startswith("/agent "):
                     response = _handle_agent_command(
-                        message, delegator, context
+                        message, delegator, context, engine=engine
                     )
                 elif mlow == "/skills":
                     response = _handle_skills_command(delegator)
                 else:
-                    response = engine.chat(message)
+                    raw_response = engine.chat(message)
+                    response, dispatch_cmd = _extract_dispatch(raw_response)
+                    if dispatch_cmd:
+                        # Auto-execute the proposed agent dispatch: the HTTP
+                        # client's user already confirmed intent in their message.
+                        logger.info(
+                            "Auto-executing DISPATCH sentinel from LLM: %s",
+                            dispatch_cmd[:80],
+                        )
+                        agent_result = _handle_agent_command(
+                            dispatch_cmd, delegator, context, engine=engine
+                        )
+                        engine.inject_turn(
+                            user=dispatch_cmd, assistant=agent_result
+                        )
+                        elapsed = time.monotonic() - t0
+                        self._send_json({
+                            "response": response,
+                            "agent_result": agent_result,
+                            "dispatched": True,
+                            "elapsed_seconds": round(elapsed, 2),
+                        })
+                        return
 
                 elapsed = time.monotonic() - t0
 
@@ -257,10 +286,34 @@ def _make_handler(
 # ---------------------------------------------------------------------------
 
 
+def _extract_dispatch(response: str) -> tuple[str, str | None]:
+    """Scan an LLM response for an embedded DISPATCH sentinel.
+
+    The LLM emits a line of the form::
+
+        DISPATCH: /agent technical-writer <description> [--project <id>]
+
+    when it wants to propose an agent execution for user confirmation.
+
+    Returns:
+        A ``(clean_response, dispatch_cmd)`` tuple.  ``clean_response`` has the
+        sentinel line stripped and trailing whitespace trimmed.  ``dispatch_cmd``
+        is the ``/agent …`` portion, or ``None`` when no sentinel was found.
+    """
+    m = _DISPATCH_SENTINEL_RE.search(response)
+    if not m:
+        return response, None
+
+    dispatch_cmd = m.group(1).strip()
+    clean = _DISPATCH_SENTINEL_RE.sub("", response).rstrip()
+    return clean, dispatch_cmd
+
+
 def _handle_agent_command(
     message: str,
     delegator: AgentDelegator | None,
     context: JournalContext,
+    engine: ConversationEngine | None = None,
 ) -> str:
     """Parse and execute a /agent command.
 
@@ -278,10 +331,14 @@ def _handle_agent_command(
     raw_description = m.group("description").strip()
 
     # Extract and strip flags from the description
-    project_id: int | None = None
+    project_id: int | str | None = None
     pm = _PROJECT_FLAG_RE.search(raw_description)
     if pm:
-        project_id = int(pm.group(1))
+        raw_id = pm.group(1)
+        try:
+            project_id = int(raw_id)
+        except ValueError:
+            project_id = raw_id
         raw_description = _PROJECT_FLAG_RE.sub("", raw_description).strip()
 
     backend = "auto"
@@ -312,11 +369,16 @@ def _handle_agent_command(
             )
         return f"Could not queue task: {msg_text}"
 
+    journaler_context = ""
+    if engine is not None:
+        journaler_context = engine.build_delegate_context(description)
+
     return delegator.delegate(
         agent_type=agent_type,
         description=description,
         project_id=project_id,
         backend=backend,
+        journaler_context=journaler_context,
     )
 
 
