@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING
 from engineering_hub.agents.prompts import PromptLoader
 from engineering_hub.container.docker_executor import DockerExecutor
 from engineering_hub.core.models import ParsedTask, TaskResult
+from engineering_hub.diagnostics.prompt_addendum import DIAGNOSTIC_CONTEXT_AUDIT_ADDENDUM
 
 if TYPE_CHECKING:
     from engineering_hub.agents.worker import AgentWorker
@@ -63,6 +64,10 @@ class TaskRouter:
     def _execute_in_container(self, task: ParsedTask, context: str) -> TaskResult:
         assert self._docker_executor is not None
         system_prompt = self._prompt_loader.get_prompt(task.agent_type)
+        if self._local_worker.diagnostic_context_audit:
+            system_prompt = (
+                system_prompt.rstrip() + "\n\n" + DIAGNOSTIC_CONTEXT_AUDIT_ADDENDUM
+            )
         user_message = self._local_worker._build_user_message(task, context)
 
         logger.info(f"Routing to Docker container: {task.description[:60]}...")

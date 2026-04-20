@@ -9,6 +9,7 @@ from engineering_hub.agents.backends import AnthropicBackend, LLMBackend
 from engineering_hub.agents.prompts import PromptLoader
 from engineering_hub.agents.registry import AgentRegistry
 from engineering_hub.agents.style_loader import LatexStyle, StyleLoader
+from engineering_hub.diagnostics.prompt_addendum import DIAGNOSTIC_CONTEXT_AUDIT_ADDENDUM
 from engineering_hub.core.constants import AgentType
 from engineering_hub.core.exceptions import AgentExecutionError, LLMBackendError
 from engineering_hub.core.models import ParsedTask, TaskResult
@@ -27,10 +28,12 @@ class AgentWorker:
         max_tokens: int = 4096,
         styles_dir: Path | None = None,
         templates_dir: Path | None = None,
+        diagnostic_context_audit: bool = False,
     ) -> None:
         self._backend = backend
         self.max_tokens = max_tokens
         self.output_dir = output_dir or Path("outputs")
+        self.diagnostic_context_audit = diagnostic_context_audit
 
         self._prompt_loader = PromptLoader(prompts_dir or Path("prompts"))
         self._registry = AgentRegistry()
@@ -59,6 +62,7 @@ class AgentWorker:
             max_tokens=max_tokens,
             styles_dir=styles_dir,
             templates_dir=templates_dir,
+            diagnostic_context_audit=False,
         )
 
     def execute(self, task: ParsedTask, context: str) -> TaskResult:
@@ -91,6 +95,11 @@ class AgentWorker:
                     return list_styles_result
                 system_prompt, cleaned_description = self._apply_style_override(
                     system_prompt, task.description
+                )
+
+            if self.diagnostic_context_audit:
+                system_prompt = (
+                    system_prompt.rstrip() + "\n\n" + DIAGNOSTIC_CONTEXT_AUDIT_ADDENDUM
                 )
 
             user_message = self._build_user_message(

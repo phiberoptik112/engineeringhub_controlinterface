@@ -29,6 +29,9 @@ _CHECKBOX_RE = re.compile(r"\[\s\]")
 # Heading used for agent feedback inside the org file
 _MESSAGES_HEADING = "* Engineering Hub Messages"
 
+_COMPLETED_AGENT_HEADING = "* Completed Agent Tasks"
+_STATUS_PENDING_RE = re.compile(r":STATUS:\s+PENDING\b", re.IGNORECASE)
+
 
 class OrgTaskWriter:
     """Writes task status updates and agent messages back to ``.org`` journal files.
@@ -56,23 +59,29 @@ class OrgTaskWriter:
         blocked_reason: str | None = None,
     ) -> None:
         """Rewrite the checkbox line for *task* in its ``.org`` file."""
-        if task.journal_date is None:
+        org_path: Path | None = None
+        if task.source_path:
+            org_path = Path(task.source_path).expanduser().resolve()
+        elif task.journal_date:
+            org_path = self.journal_dir / f"{task.journal_date}.org"
+        else:
             return
 
-        org_path = self.journal_dir / f"{task.journal_date}.org"
         if not org_path.exists():
+            return
+
+        if task.source_path and new_status == TaskStatus.COMPLETED:
+            self._complete_pending_file_task(org_path, task)
             return
 
         lines = org_path.read_text(encoding="utf-8").splitlines(keepends=True)
 
         if task.start_line >= len(lines):
-            # Line number stale — attempt a rescan by content
             task_line_idx = self._find_task_line(lines, task.raw_block)
             if task_line_idx is None:
                 return
         else:
             task_line_idx = task.start_line
-            # Verify the line still looks like our task; rescan if not
             if not self._line_matches_task(lines[task_line_idx], task):
                 found = self._find_task_line(lines, task.raw_block)
                 if found is None:
@@ -125,8 +134,9 @@ class OrgTaskWriter:
             content=content,
         )
 
-        # Write to the file where the task originated, if it exists
-        if task.journal_date:
+        if task.source_path:
+            org_path = Path(task.source_path).expanduser().resolve()
+        elif task.journal_date:
             org_path = self.journal_dir / f"{task.journal_date}.org"
         else:
             today = datetime.now().date().isoformat()
@@ -137,6 +147,61 @@ class OrgTaskWriter:
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
+
+    def _complete_pending_file_task(self, org_path: Path, task: ParsedTask) -> None:
+        """Mark DONE, check the box, and move the ``**`` block under Completed."""
+        raw_lines = org_path.read_text(encoding="utf-8").splitlines()
+        cb_idx = task.start_line
+        if cb_idx >= len(raw_lines):
+            found = self._find_task_line(raw_lines, task.raw_block)
+            if found is None:
+                return
+            cb_idx = found
+
+        h_start = cb_idx
+        while h_start >= 0 and not raw_lines[h_start].startswith("** "):
+            h_start -= 1
+        if h_start < 0:
+            h_start = max(0, cb_idx - 1)
+
+        h_end = len(raw_lines)
+        for j in range(h_start + 1, len(raw_lines)):
+            line = raw_lines[j]
+            if line.startswith("** "):
+                h_end = j
+                break
+            if line.strip() == _COMPLETED_AGENT_HEADING:
+                h_end = j
+                break
+
+        block_lines = raw_lines[h_start:h_end]
+        block_text = "\n".join(block_lines)
+        block_text = _STATUS_PENDING_RE.sub(":STATUS: DONE", block_text)
+        blines = block_text.split("\n")
+        for i, ln in enumerate(blines):
+            if f"@{task.agent}:" in ln and "[ ]" in ln:
+                blines[i] = self._mark_completed(ln)
+                break
+        block_text = "\n".join(blines).rstrip() + "\n"
+
+        new_lines = raw_lines[:h_start] + raw_lines[h_end:]
+
+        insert_at = len(new_lines)
+        found_heading = False
+        for i, line in enumerate(new_lines):
+            if line.strip() == _COMPLETED_AGENT_HEADING:
+                insert_at = i + 1
+                found_heading = True
+                break
+        if not found_heading:
+            new_lines.append(_COMPLETED_AGENT_HEADING)
+            insert_at = len(new_lines)
+
+        chunk = block_text.split("\n")
+        to_insert = chunk + [""]
+        new_lines[insert_at:insert_at] = to_insert
+
+        org_path.write_text("\n".join(new_lines).rstrip() + "\n", encoding="utf-8")
 
     def _append_message_to_file(self, org_path: Path, message: AgentMessage) -> None:
         """Append *message* to the Engineering Hub Messages section of *org_path*."""

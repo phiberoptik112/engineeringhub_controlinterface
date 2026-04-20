@@ -10,8 +10,9 @@ from __future__ import annotations
 
 import json
 import logging
+import uuid
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -30,6 +31,7 @@ from engineering_hub.journaler.context_manager import (
     estimate_tokens,
     execute_clear,
 )
+from engineering_hub.journaler.task_planner_models import TaskPlannerSession
 
 SUPPORTED_EXTENSIONS: frozenset[str] = frozenset(
     {".md", ".txt", ".org", ".py", ".yaml", ".yml", ".json", ".tex", ".csv", ".toml", ".rst"}
@@ -375,6 +377,11 @@ class ConversationEngine:
         )
         self._pressure_config = cfg
         self._roam_edit_target: Path | None = None
+
+        self.session_id = str(uuid.uuid4())
+        self.session_opened_at = datetime.now(timezone.utc)
+        self.task_planner = TaskPlannerSession(self.session_id, self.session_opened_at)
+        self.pinned_state: dict[str, Any] = {"task_planner": self.task_planner}
 
     def get_roam_edit_target(self) -> Path | None:
         """Session target for ``/edit`` (set via ``/open`` in journaler chat)."""

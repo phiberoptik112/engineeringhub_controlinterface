@@ -69,6 +69,7 @@ class ChatServer:
         start_time: datetime | None = None,
         delegator: AgentDelegator | None = None,
         model_context: JournalerChatModelContext | None = None,
+        pending_tasks_file: Path | None = None,
     ) -> None:
         self.engine = engine
         self.context = context
@@ -77,6 +78,11 @@ class ChatServer:
         self.start_time = start_time or datetime.now()
         self.delegator = delegator
         self.model_context = model_context
+        self.pending_tasks_file = (
+            pending_tasks_file.expanduser().resolve()
+            if pending_tasks_file is not None
+            else (context.workspace_dir / ".journaler" / "pending-tasks.org").resolve()
+        )
         self._server: ThreadingHTTPServer | None = None
         self._thread: threading.Thread | None = None
 
@@ -88,6 +94,7 @@ class ChatServer:
             self.start_time,
             self.delegator,
             self.model_context,
+            self.pending_tasks_file,
         )
         self._server = ThreadingHTTPServer((self.host, self.port), handler)
         self._thread = threading.Thread(
@@ -110,8 +117,15 @@ def _make_handler(
     start_time: datetime,
     delegator: AgentDelegator | None = None,
     model_context: JournalerChatModelContext | None = None,
+    pending_tasks_file: Path | None = None,
 ) -> type[BaseHTTPRequestHandler]:
     """Create a request handler class with access to the engine and context."""
+
+    resolved_pending = (
+        pending_tasks_file.expanduser().resolve()
+        if pending_tasks_file is not None
+        else (context.workspace_dir / ".journaler" / "pending-tasks.org").resolve()
+    )
 
     class Handler(BaseHTTPRequestHandler):
         def do_POST(self) -> None:
@@ -166,7 +180,101 @@ def _make_handler(
                     )
                 elif mlow == "/skills":
                     response = _handle_skills_command(delegator)
+                elif mlow.startswith("/tasks") or mlow.startswith("/queue"):
+                    from engineering_hub.journaler.task_slash import (
+                        handle_tasks_slash_command,
+                    )
+
+                    response = handle_tasks_slash_command(
+                        message, engine, resolved_pending
+                    )
                 else:
+                    from datetime import datetime, timezone
+
+                    from engineering_hub.journaler.task_intent_extractor import (
+                        classify_journaler_intent,
+                    )
+                    from engineering_hub.journaler.task_planner_models import (
+                        ProposedTask,
+                    )
+
+                    settings_obj = (
+                        model_context.settings if model_context is not None else None
+                    )
+                    mode = (
+                        (settings_obj.journaler_default_task_mode or "immediate")
+                        if settings_obj is not None
+                        else "immediate"
+                    ).lower()
+
+                    if mode != "propose" and delegator is not None:
+                        kind, payload = classify_journaler_intent(engine, message)
+                        desc = (payload.get("description") or "").strip()
+                        if kind == "immediate_task" and desc:
+                            agent = str(payload.get("agent_type") or "research")
+                            cmd = f"/agent {agent} {desc}"
+                            pid = payload.get("project_id")
+                            if pid is not None:
+                                cmd += f" --project {pid}"
+                            agent_result = _handle_agent_command(
+                                cmd, delegator, context, engine=engine
+                            )
+                            response = f"**@{agent}**\n\n{agent_result}"
+                            engine.inject_turn(message, response)
+                            elapsed = time.monotonic() - t0
+                            self._send_json({
+                                "response": response,
+                                "agent_result": agent_result,
+                                "dispatched": True,
+                                "elapsed_seconds": round(elapsed, 2),
+                            })
+                            return
+                        if kind == "queued_task" and desc:
+                            agent = str(payload.get("agent_type") or "research")
+                            now = datetime.now(timezone.utc)
+                            kws = payload.get("keywords") or []
+                            if isinstance(kws, str):
+                                kws = [kws]
+                            paths = payload.get("input_paths") or []
+                            if not isinstance(paths, list):
+                                paths = []
+                            op = payload.get("output_path")
+                            pt = ProposedTask(
+                                agent_type=agent,
+                                description=desc,
+                                session_id=engine.session_id,
+                                session_timestamp=engine.session_opened_at,
+                                proposed_at=now,
+                                keywords=[str(x) for x in kws][:8],
+                                project_id=payload.get("project_id"),
+                                input_paths=[str(x) for x in paths],
+                                output_path=str(op) if op else None,
+                                context_flags=[],
+                                status="proposed",
+                                confidence=float(payload.get("confidence", 0.0)),
+                                clarification_needed=bool(
+                                    payload.get("clarification_needed", False)
+                                ),
+                            )
+                            engine.task_planner.add_proposal(pt)
+                            response = (
+                                f"Queued task proposal (not saved yet):\n\n"
+                                f"- @{agent}: {desc}\n"
+                            )
+                            if pt.output_path:
+                                response += f"- Suggested output: `{pt.output_path}`\n"
+                            response += (
+                                "\nUse `/tasks confirm` and `/tasks commit` for "
+                                "pending-tasks.org."
+                            )
+                            engine.inject_turn(message, response)
+                            elapsed = time.monotonic() - t0
+                            self._send_json({
+                                "response": response,
+                                "elapsed_seconds": round(elapsed, 2),
+                            })
+                            return
+
                     raw_response = engine.chat(message)
                     response, dispatch_cmd = _extract_dispatch(raw_response)
                     if dispatch_cmd:

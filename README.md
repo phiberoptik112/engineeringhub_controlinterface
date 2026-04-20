@@ -6,14 +6,14 @@ A persistent, agent-first workspace enabling collaboration between engineers and
 
 Engineering Hub provides two complementary modes of AI collaboration:
 
-1. **Orchestrator** (task-driven) -- watches your org-roam journal for `@agent:` task lines, dispatches work to specialized agents via Claude API, local MLX models, or an Ollama server, and writes results back to the workspace. Optionally runs agent tasks in **Docker containers** for isolation.
+1. **Orchestrator** (task-driven) -- watches your org-roam **daily journal** and the Journaler-owned **`pending-tasks.org`** queue for `@agent:` task lines, dispatches work to specialized agents via Claude API, local MLX models, or an Ollama server, and writes results back to the workspace. Optionally runs agent tasks in **Docker containers** for isolation.
 2. **Journaler** (ambient) -- a persistent daemon that runs a local ~32B model via MLX, continuously monitors your org-roam workspace, delivers morning briefings, and responds to ad-hoc questions through **`engineering-hub journaler chat`** (interactive) and an **HTTP** chat endpoint when the daemon is running.
 
-They coexist cleanly: the Orchestrator processes explicit tasks while the Journaler maintains ambient awareness. The Journaler can read the full org-roam workspace, write back to daily journals, create org-roam nodes via slash commands, and — now — **delegate tasks directly to any agent personality inline** using the `/agent` command, with a choice of local MLX or Claude API execution.
+They coexist cleanly: the Orchestrator processes explicit tasks while the Journaler maintains ambient awareness. The Journaler can read the full org-roam workspace, write to daily journals and roam nodes via slash commands where appropriate, and **delegate agent work** using **`/agent`**, **natural-language turns** (in **immediate** mode), or an **overnight queue** (`/queue`, `/tasks`) that writes only to **`pending-tasks.org`** — not to your daily journal. Delegation uses local MLX or Claude API execution.
 
 ### Key Features
 
-- **Org-roam Integration**: Tasks live in daily `.org` journal files using `- [ ] @agent:` syntax
+- **Org-roam Integration**: Tasks live in daily `.org` journal files using `- [ ] @agent:` syntax, and optionally in **`.journaler/pending-tasks.org`** (Journaler queue) under `* Pending Agent Tasks`
 - **Specialized Agents**: Research, technical-writer, standards-checker, and more with domain expertise
 - **Django Integration**: Pulls project context, standards, and files from the consultingmanager API
 - **File Watching**: Monitors workspace for changes and automatically dispatches agent tasks
@@ -22,13 +22,15 @@ They coexist cleanly: the Orchestrator processes explicit tasks while the Journa
 - **Docker Containers**: Isolate agent task execution in ephemeral containers with resource limits and network controls
 - **Journaler Daemon**: Always-on ambient listener with morning briefings, HTTP chat, and Slack integration — optional **model profiles**, Qwen3 **thinking mode**, CLI `--profile` / `--model`, and **`/model`** to switch checkpoints without losing chat history
 - **Agent Delegation**: **`journaler chat`** and the daemon’s HTTP `/chat` both use the same setup: an **AgentDelegator**, YAML **skills** summaries injected into the system prompt (personas, when-to-use hints, examples), and **`/agent`** / **`/skills`** slash commands — execution is local MLX or Claude API, selectable per-command via `journaler.agent_backend` and `--backend`
+- **Task planner & overnight queue**: **`/queue`** and **`/tasks`** manage proposals and commits to **`pending-tasks.org`**; **`journaler.default_task_mode`** chooses **immediate** (inline / classifier-driven delegation) vs **propose** (`DISPATCH:` + confirmation). Morning briefings include a short summary of recent queue activity when present
 - **Skills System**: Extensible `skills/` directory of YAML files defines each agent personality's capabilities; drop a new `.yaml` to add a delegation skill without code changes
 - **Context Management**: Token-aware conversation history with automatic compression, topic-shift archival, end-of-day reset, and manual `/clear` controls — keeps the local model coherent across a full workday
 - **Org-Roam Write Skill**: Journaler chat can write properly-formatted org-roam files — add TODOs, mark tasks done, append notes to today's journal (`/note`), set a session target on any roam note (`/open`), append under a heading there (`/edit`), search by title (`/find`), and create new nodes — via slash commands
-- **Journaler Export**: CLI `journaler export` reads the persisted chat transcript (`conversation.jsonl`) and writes org-roam-friendly output — raw per-turn org, optional MLX **summary + open TODOs**, append to a note (`--note` / `--find-title`), or create a new roam node (`--new-node`)
+- **Journaler Export**: CLI `journaler export` reads the persisted chat transcript (`conversation.jsonl`) and writes org-roam-friendly output to **stdout** by default (raw per-turn org, optional MLX **summary + open TODOs**); use `--note`, `--find-title`, `-o`, or `--new-node` for file targets. In **`journaler chat`**, bare **`/export`** writes under **`conversation_exports/`** in the configured org-roam root unless you pass one of those targets.
 - **Context File Loading**: Inject files or directories into the Journaler's live context (`/load`) or the persistent memory store (`engineering-hub load`)
 - **Vector Memory**: Local semantic memory (`memory.db`) with Ollama embeddings for past-task and ingest retrieval
 - **PDF Reference Corpus**: Optional ingested reference corpus (`corpus.db` from **libraryfiles-corpus**) injected as RAG into **Journaler chat** turns and **Orchestrator** agent tasks (separate from workspace memory)
+- **Context pipeline diagnostic**: Opt-in **`engineering-hub diagnostic context-pipeline`** command (and matching config/env flags) persist full formatted agent context, heuristic checklists, optional corpus audit excerpts, and agent outputs under `outputs/diagnostics/context-pipeline/<run_id>/` — see [diagnostics/RUNBOOK.md](diagnostics/RUNBOOK.md)
 
 ## Requirements
 
@@ -82,6 +84,10 @@ engineering-hub start
 
 # Or process pending tasks once and exit
 engineering-hub run-once
+
+# Context pipeline diagnostic (synthetic tasks from YAML; persists context + optional LLM output)
+engineering-hub diagnostic context-pipeline --dry-run-context-only -v   # no model calls
+engineering-hub diagnostic context-pipeline -v                          # full run (needs llm_provider + credentials)
 ```
 
 ### 5. Run the Journaler
@@ -140,7 +146,7 @@ engineering-hub journaler --model mlx-community/Qwen3-30B-A3B-Instruct-2507-4bit
 
 `journaler export --summarize` loads the Journaler MLX model once (same `--profile` / `--model` flags as other journaler commands). Raw export does not load a model.
 
-In **`journaler chat`**, **`/export`** runs the same pipeline: if you do not pass `-o`, `--note`, `--new-node`, or `--find-title`, the org body is printed into the session (use `-o` … for large transcripts).
+In **`journaler chat`**, **`/export`** uses the same export pipeline as the CLI; if you do not pass `-o`, `--note`, `--new-node`, or `--find-title`, it writes a new org-roam node under **`conversation_exports/`** at the root of your configured org-roam tree (the parent of `journal.org_journal_dir`). Use `-o` or **`--new-node`** when you want a different path or title.
 
 ### 6. Load Files into Context
 
@@ -153,11 +159,13 @@ In **`journaler chat`**, **`/export`** runs the same pipeline: if you do not pas
 /load_browse                    Interactive file browser (arrow keys, multi-select)
 /files                          List currently loaded files (with sizes)
 /files clear                    Remove all loaded files from context
-/export                         Export conversation.jsonl to org in-session (see below)
+/export                         Export transcript to `<org-roam>/conversation_exports/` (see below)
 /export -o ~/path/to/out.org    Same flags as `engineering-hub journaler export`
 /export --help                  Full `/export` flag list
 /agent technical-writer ...     Delegate inline (see Agent Delegation below)
 /agent_browse                   Browse and pick an agent skill interactively
+/tasks …                        Overnight queue: list, confirm, commit, rollback (see below)
+/queue <description>            Propose one task for the queue (then /tasks confirm && commit)
 /skills                         List delegation skills / personas from skills/*.yaml
 /open today                     Set /edit target to today's journal (or /open <path>, /open <title>)
 /edit_browse                    Browse org-roam files to set /edit target
@@ -209,6 +217,10 @@ engineeringhub_controlinterface/
 │   │   ├── org_parser.py    # Focused org-mode parser (read)
 │   │   ├── org_writer.py    # Org-roam write utilities (write/create/find)
 │   │   ├── prompts.py       # System prompt + workspace layout + skills block templates
+│   │   ├── task_committer.py # pending-tasks.org append + rollback
+│   │   ├── task_intent_extractor.py # MLX JSON classifier (immediate vs queue vs chat)
+│   │   ├── task_planner_models.py   # ProposedTask, TaskPlannerSession
+│   │   ├── task_slash.py    # /tasks and /queue handlers
 │   │   ├── slack.py         # Slack webhook poster
 │   │   └── models.py        # ContextSnapshot, ScanState, OrgEntry
 │   ├── mcp/             # FastMCP server integration
@@ -240,9 +252,9 @@ The Journaler is a persistent daemon that runs a local ~32B model on Apple Silic
 - **Knows** the workspace layout and org-roam format conventions — injected into the system prompt when the conversation engine starts so the model can reason about file locations and produce valid org syntax
 - **Loads agent personas** from `skills/*.yaml`: a concise **skills block** (display name, description, when-to-use, example `/agent` lines) is appended to the system prompt for **both** `journaler start` and **`journaler chat`**. On the daemon, each scheduled org-roam scan refreshes the rolling context snapshot **and re-attaches** that skills block so personas are not dropped mid-run
 - **Uses** `journaler.agent_backend`, optional `journaler.skills_dir`, and optional `journaler.anthropic_api_key` (else `anthropic.api_key` / `ENGINEERING_HUB_ANTHROPIC_API_KEY`) for delegation — same resolution for daemon and interactive chat
-- **Generates** a morning briefing at a configurable time (default 9:00 AM)
+- **Generates** a morning briefing at a configurable time (default 9:00 AM), with an extra **pending-tasks.org** summary when recent queue timestamps appear in that file
 - **Responds** to ad-hoc questions via an HTTP chat endpoint on `localhost:18790`
-- **Writes** to daily journals and org-roam nodes via slash commands in the interactive chat session
+- **Writes** to daily journals and org-roam nodes via slash commands where intended; **overnight queue** tasks go only to **`pending-tasks.org`** (see **`/tasks`** / **`/queue`**)
 - **Posts** briefings and alerts to Slack via incoming webhooks (optional)
 
 ### Configuration
@@ -273,6 +285,10 @@ journaler:
   agent_backend: "mlx"   # "mlx" | "claude" | "auto" (see Agent Delegation below)
   # anthropic_api_key: "" # optional Journaler-only override; else top-level anthropic.api_key / ENGINEERING_HUB_ANTHROPIC_API_KEY
   # skills_dir: "~/org-roam/engineering-hub/skills"  # default: skills/ at repo root (resolved from YAML)
+
+  # Overnight queue (Orchestrator scans this file in org mode alongside daily journals)
+  # pending_tasks_file: "~/path/to/pending-tasks.org"  # default: workspace_dir/.journaler/pending-tasks.org
+  # default_task_mode: "immediate"   # "immediate" (classifier may auto-delegate) or "propose" (DISPATCH + confirm)
 
   # Context management (all values below are defaults — omit to use defaults)
   context_management:
@@ -328,7 +344,7 @@ journaler:
 Switching models at runtime (without restarting):
 
 - **Interactive chat:** `/model` (status), `/model reasoning` (named profile), `/model path <hf-id-or-path>` (one-off path).
-- **HTTP chat (daemon):** send the same text as the JSON `message`, e.g. `{"message": "/model reasoning"}`. The delegator’s local MLX backend stays in sync so `/agent --backend mlx` uses the newly loaded weights.
+- **HTTP chat (daemon):** send the same text as the JSON `message`, e.g. `{"message": "/model reasoning"}`. Slash commands **`/agent`**, **`/tasks`**, **`/queue`**, **`/skills`**, and **`/model`** are handled the same way as in interactive chat (where applicable). The delegator’s local MLX backend stays in sync so `/agent --backend mlx` uses the newly loaded weights.
 
 Reloading a model loads weights again (seconds to tens of seconds, large RAM use). Conversation history is kept.
 
@@ -448,11 +464,11 @@ While in `engineering-hub journaler chat`, any input starting with `/` is handle
 | `/files` | List all files currently loaded, with character counts |
 | `/files clear` | Remove all loaded files from context |
 
-**Export transcript** (same behavior as `engineering-hub journaler export`)
+**Export transcript** (same pipeline as `engineering-hub journaler export`; default file target differs in chat)
 
 | Command | Description |
 | --- | --- |
-| `/export` | Export `.journaler/conversation.jsonl` to raw org in the chat |
+| `/export` | Export `.journaler/conversation.jsonl` to a new `.org` file under `<org-roam>/conversation_exports/` |
 | `/export …` | Flags: `--jsonl`, `--summarize`, `-o` / `--output`, `--note`, `--heading`, `--find-title`, `--new-node` (shell-style quoting supported) |
 | `/export --help` | Print usage |
 
@@ -463,6 +479,8 @@ While in `engineering-hub journaler chat`, any input starting with `/` is handle
 | `/agent <type> <desc> [--project <id>] [--backend mlx\|claude]` | Delegate a task to a named agent and get the result inline. Types: `research`, `technical-writer`, `standards-checker`, `technical-reviewer`, `weekly-reviewer`, `latex-writer` |
 | `/agent_browse` | Interactive skill picker — arrow keys to browse agents, Enter to select, then type a task description |
 | `/skills` | List all available agent delegation skills with descriptions and examples |
+| `/tasks` | Show session queue proposals, or use `/tasks confirm`, `/tasks commit`, `/tasks reject N`, `/tasks edit N <text>`, `/tasks clear`, `/tasks rollback [N \| --all]` |
+| `/queue <description>` | Shorthand to propose one overnight task (defaults agent to `research` until you edit/confirm); then `/tasks confirm` and `/tasks commit` |
 
 **Org-roam write operations**
 
@@ -486,13 +504,24 @@ While in `engineering-hub journaler chat`, any input starting with `/` is handle
 | --- | --- |
 | `/help` | Show the full list of available slash commands |
 
-Tasks added with `/task` use the `- [ ] @agent:` format understood by the Orchestrator, so they will be picked up and dispatched automatically. `/agent` tasks run immediately and return their output in the current chat turn. **`/model`** in interactive chat reloads the MLX weights but **keeps the delegator’s adapter in sync**, so `/agent --backend mlx` continues to use the active checkpoint (same behavior as HTTP `/chat`). **`/export`** matches **`journaler export`** but is only available in interactive **`journaler chat`** (not on the HTTP `/chat` endpoint — use the CLI there). `/open` and `/edit` apply only in **`journaler chat`** as well. Loaded files are appended to the system prompt as fenced blocks and persist for the life of the chat session only.
+Tasks added with `/task` use the `- [ ] @agent:` format understood by the Orchestrator, so they will be picked up and dispatched automatically. **`/tasks commit`** writes confirmed proposals to **`pending-tasks.org`** (path: `journaler.pending_tasks_file`, default **`workspace_dir/.journaler/pending-tasks.org`**), which the Orchestrator also scans in org mode. `/agent` runs immediately and returns output in the chat turn.
+
+With **`journaler.default_task_mode: immediate`** (default), ordinary messages that describe agent work may be **classified** and **delegated inline** (no `/agent` prefix) unless you use explicit **queue** language (“run later”, “queue for tonight”, …) or **`/queue`**. With **`default_task_mode: propose`**, that auto-path is off; the model uses **`DISPATCH:`** lines and you confirm before the agent runs (interactive chat prompts **Run it? [y/N]**; HTTP `/chat` still auto-runs a `DISPATCH` after the model responds, as before).
+
+**`/model`** in interactive chat reloads the MLX weights but **keeps the delegator’s adapter in sync**, so `/agent --backend mlx` continues to use the active checkpoint (same behavior as HTTP `/chat`). **`/export`**, **`/open`**, **`/edit`**, and the **`/load_browse`** / **`/agent_browse`** / **`/edit_browse`** TUIs are only in interactive **`journaler chat`**; the HTTP endpoint handles **`/model`**, **`/agent`**, **`/tasks`**, **`/queue`**, and **`/skills`**. Loaded files are appended to the system prompt as fenced blocks and persist for the life of the chat session only.
 
 To persist files for long-term retrieval across sessions, use `engineering-hub load` instead (see [Load Files into Context](#6-load-files-into-context)).
 
 ### Agent Delegation
 
 The Journaler can delegate tasks directly to any named agent personality and return the result inline in the chat conversation — no need to write a journal task and wait for the overnight Orchestrator run.
+
+**Modes (see `journaler.default_task_mode` in config):**
+
+- **`immediate`** — Prefer inline execution: a small structured classifier may route suitable user messages to **`AgentDelegator`** automatically. Explicit **queue** phrasing or **`/queue`** adds a **proposal** to the session planner instead (confirm with **`/tasks`** before **`commit`**).
+- **`propose`** — Same as the earlier **DISPATCH** flow: the model suggests **`DISPATCH: /agent …`** and you confirm before running (interactive CLI); corpus and loaded files still apply to **`/agent`** and to delegated runs.
+
+**Overnight queue:** Use **`/queue <description>`** or natural language that clearly defers work, then **`/tasks confirm`** and **`/tasks commit`** to append to **`pending-tasks.org`**. Roll back with **`/tasks rollback`**. The Orchestrator picks up unchecked items there on its next scan; completed tasks are moved under **`* Completed Agent Tasks`** in that file when the run finishes.
 
 #### The `/agent` command
 
@@ -510,7 +539,7 @@ The Journaler can delegate tasks directly to any named agent personality and ret
 
 The default backend is controlled by `journaler.agent_backend` in config (`"mlx"` uses the local model; set `"auto"` if you want Claude when a key is present, otherwise MLX). The `--backend` flag overrides this per-command.
 
-For **draft reports, protocols, executive summaries, and other client-facing Markdown deliverables**, use the **`technical-writer`** persona. The default Journaler system prompt and workspace layout tell the ambient model to suggest practical routes: immediate **`/agent technical-writer …`**, queue **`/task`** / journal lines with `@technical-writer:`, optional **`--project <id>`** for Django context, and **`/skills`** for full persona text. Delegated technical-writer runs use `prompts/technical-writer.txt`; saved artifacts often land under **`outputs/docs/`**.
+For **draft reports, protocols, executive summaries, and other client-facing Markdown deliverables**, use the **`technical-writer`** persona. The default Journaler system prompt and workspace layout describe **available agents**, **immediate vs queue** behavior, and practical routes: **`/agent technical-writer …`**, natural-language delegation in **immediate** mode, queue **`/task`** / journal lines with `@technical-writer:`, **`/queue`** + **`/tasks commit`** for **`pending-tasks.org`**, optional **`--project <id>`** for Django context, and **`/skills`** for full persona text. Delegated technical-writer runs use `prompts/technical-writer.txt`; saved artifacts often land under **`outputs/docs/`**.
 
 **Examples:**
 
@@ -671,7 +700,7 @@ The Journaler writes to `<workspace_dir>/.journaler/`:
 └── daily_summaries/     # End-of-day conversation summaries (YYYY-MM-DD.md)
 ```
 
-`conversation.jsonl` is append-only and serves as the permanent audit trail. Archived and compressed turns are written here even after the in-memory history is cleared, so any day's conversation can be reconstructed from the log. Use **`engineering-hub journaler export`** to turn this file into org-mode: by default a deterministic **raw** transcript (headings plus `#+begin_src text` blocks per turn); with **`--summarize`**, a single model pass adds **`* Summary`** and **`* Open TODOs`** (`- [ ]` items). Target an existing file with **`--note`** or **`--find-title`** (substring match on `#+title:` under `org_journal_dir`'s parent), or **`--new-node`** to create a new org-roam node under that roam directory. Override the transcript path with **`--jsonl`**. See **`engineering-hub journaler export --help`** for all flags.
+`conversation.jsonl` is append-only and serves as the permanent audit trail. Archived and compressed turns are written here even after the in-memory history is cleared, so any day's conversation can be reconstructed from the log. Use **`engineering-hub journaler export`** to turn this file into org-mode: by default a deterministic **raw** transcript (headings plus `#+begin_src text` blocks per turn) on **stdout**; with **`--summarize`**, a single model pass adds **`* Summary`** and **`* Open TODOs`** (`- [ ]` items). In **`journaler chat`**, bare **`/export`** (no `-o` / `--note` / `--find-title` / `--new-node`) writes a new roam node under **`conversation_exports/`** instead of printing into the session. Target an existing file with **`--note`** or **`--find-title`** (substring match on `#+title:` under `org_journal_dir`'s parent), or **`--new-node`** to create a new org-roam node under that roam directory. Override the transcript path with **`--jsonl`**. See **`engineering-hub journaler export --help`** for all flags.
 
 ### PDF reference corpus (vector DB / RAG)
 
@@ -736,7 +765,7 @@ Corpus query = task **description** + optional **context**:
 
 ## Orchestrator: Task-Driven Agents
 
-The Orchestrator watches your workspace for `@agent:` task lines and dispatches them to specialized agents.
+The Orchestrator watches your workspace for `@agent:` task lines — in **org mode**, both **daily journals** and the Journaler file **`pending-tasks.org`** (headings **`Overnight Agent Tasks`** / **`Pending Agent Tasks`** per config) — and dispatches them to specialized agents.
 
 ### Task Format (org-roam mode)
 
@@ -749,6 +778,8 @@ In your daily `.org` journal files under a `* Overnight Agent Tasks` heading:
 - [X] @research: Already completed task (skipped)
 ```
 
+The Journaler maintains a separate queue file (default **`workspace_dir/.journaler/pending-tasks.org`**) with a **`* Pending Agent Tasks`** section. Tasks committed from **`journaler chat`** via **`/tasks commit`** use the same `- [ ] @agent:` checkbox line shape; the Orchestrator does not need changes to dispatch them. Optional **`:PROPERTIES:`** drawers (e.g. **`:SESSION_ID:`**) are for Journaler bookkeeping and rollback.
+
 ### Agent Types
 
 | Agent | Purpose |
@@ -758,6 +789,36 @@ In your daily `.org` journal files under a `* Overnight Agent Tasks` heading:
 | `standards-checker` | Verify compliance with ASTM/ISO standards |
 | `technical-reviewer` | Review technical documents for accuracy |
 | `latex-writer` | Produce compilable `.tex` source files with named style/template selection |
+
+### Context pipeline diagnostic
+
+Use this to verify what the Orchestrator actually passes into agents (Django block, memory/corpus/template sections) without relying on console DEBUG scrollback — DEBUG logs still only summarize retrieval; the harness **writes the full formatted string** to disk.
+
+**CLI** (default task file: [diagnostics/context_pipeline_tasks.yaml](diagnostics/context_pipeline_tasks.yaml)):
+
+```bash
+engineering-hub diagnostic context-pipeline --tasks diagnostics/context_pipeline_tasks.yaml --max-tasks 10 -v
+engineering-hub diagnostic context-pipeline --dry-run-context-only -v
+engineering-hub diagnostic context-pipeline --context-audit-prompt -v   # append CONTEXT AUDIT block to system prompts
+```
+
+Global `-v` / `--verbose` enables DEBUG logging for the rest of the hub. Use `--docker` / `--no-docker` / `--llm-provider` like `run-once`.
+
+**Artifacts** (per run): `{workspace_dir}/outputs/diagnostics/context-pipeline/<run_id>/` — each task folder contains `formatted_context.txt`, `task.json`, `checklist.json`, optional `corpus_audit_excerpt.jsonl`, and after execution `result.json` / `agent_response.md`. Run root has `summary.json`.
+
+**While running `start` / `run-once`** (same artifact layout for each dispatched task), enable in `config.yaml`:
+
+```yaml
+diagnostics:
+  context_pipeline:
+    enabled: true
+    context_audit_prompt: false   # optional: same as --context-audit-prompt
+    debug_context_max_chars: 50000
+```
+
+Environment overrides: `ENGINEERING_HUB_CONTEXT_PIPELINE_DIAGNOSTIC_ENABLED`, `ENGINEERING_HUB_DIAGNOSTIC_CONTEXT_AUDIT_PROMPT`.
+
+Operator playbook (parallel Cursor sub-agents, optional evaluator JSON): [diagnostics/RUNBOOK.md](diagnostics/RUNBOOK.md).
 
 ## Docker Container Execution
 
@@ -895,6 +956,8 @@ See [config/config.example.yaml](config/config.example.yaml) for all available o
 - `docker.ollama_host` - Ollama URL as seen from inside containers (default: `http://ollama:11434`)
 - `journal.org_journal_dir` - Daily `YYYY-MM-DD.org` directory (Journaler uses this path directly; parent is the roam root for searches)
 - `journaler.*` - Journaler daemon settings (model, scan interval, briefing, chat, Slack)
+- `journaler.pending_tasks_file` - Org file for **`/tasks commit`** output (default: `workspace_dir/.journaler/pending-tasks.org`); Orchestrator scans it in org mode with daily journals
+- `journaler.default_task_mode` - **`immediate`** (default: classifier may auto-delegate) or **`propose`** (**`DISPATCH:`** + confirm in CLI)
 - `journaler.scan_org_roam_tree` - When false, scan only `journal.org_journal_dir` and `journaler.watch_dirs` (default: true)
 - `journaler.watch_dirs` - Extra org directories to include in scans
 - `journaler.journal_lookback_days` / `journaler.journal_max_files` - Window for parsing daily journals (defaults: 5 / 5)
@@ -909,6 +972,10 @@ See [config/config.example.yaml](config/config.example.yaml) for all available o
 - `corpus.enabled` - Enable PDF reference corpus RAG (requires `libraryfiles-corpus` and `corpus.db`)
 - `corpus.db_path` - Path to `corpus.db` from libraryfiles-corpus ingest
 - `corpus.search_k` / `corpus.threshold` - Max chunks and minimum similarity for corpus hits (defaults: 5 / 0.40)
+- `diagnostics.context_pipeline.enabled` - Persist formatted context + results for each Orchestrator task under `outputs/diagnostics/context-pipeline/<run_id>/` (default: false)
+- `diagnostics.context_pipeline.context_audit_prompt` - Append temporary CONTEXT AUDIT block to agent system prompts (default: false); env: `ENGINEERING_HUB_DIAGNOSTIC_CONTEXT_AUDIT_PROMPT`
+- `diagnostics.context_pipeline.debug_context_max_chars` - Truncation cap for the extra DEBUG log of formatted context when diagnostics are enabled (default: 50000)
+- CLI: `engineering-hub diagnostic context-pipeline` — run a YAML task suite with `--dry-run-context-only`, `--tasks`, `--max-tasks`, `--context-audit-prompt` (see [diagnostics/RUNBOOK.md](diagnostics/RUNBOOK.md))
 
 ## License
 

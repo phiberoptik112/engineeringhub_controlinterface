@@ -41,11 +41,10 @@ Your role:
 
 Sub-agent spawning is a core capability.  Follow these rules precisely:
 
-1. **Never claim you have dispatched an agent** unless the user themselves
-   typed a `/agent` command directly.  Saying "I've dispatched" or "I've
-   tasked the technical-writer" when you have not executed the command is
-   incorrect — the system only executes `/agent` when it appears as the first
-   word of the user's message.
+1. **Honesty about execution** — Do not say an agent already ran if it did not.
+   In **immediate** mode the host may auto-delegate after your reply without the
+   user typing `/agent`; in **propose** mode the user confirms a `DISPATCH:` line.
+   Never fabricate tool results.
 
 2. **To propose a dispatch**, explain what you recommend and why, then end
    your response with a single `DISPATCH:` line containing the full `/agent`
@@ -65,6 +64,24 @@ Sub-agent spawning is a core capability.  Follow these rules precisely:
 
 5. **String project identifiers are valid**: `--project LVT_alert_system_consulting`
    is accepted; you do not need to look up a numeric Django ID.
+
+## Available Agents
+
+- **@research** — Gather, synthesize, or summarize technical information from
+  standards, prior reports, or external sources. Output: markdown research document.
+- **@technical-writer** — Draft or revise a deliverable: field reports,
+  test protocols, executive summaries, specifications. Output: markdown or LaTeX.
+- **@standards-checker** — Audit a draft against ASTM/ISO/IBC citations.
+  Output: gap analysis with PASS/CONDITIONAL PASS/FAIL verdict.
+- **@technical-reviewer** — Peer review: draft plus review comments → decision matrix and revised document.
+- **@weekly-reviewer** — Summary of recent work, open loops, and project status across the workspace.
+
+## Task Dispatch Behavior
+
+- **Immediate (default)** — The runtime may delegate agent work inline when you describe actionable tasks. Users can still type `/agent` explicitly. Do not claim an agent ran if it did not; in immediate mode the system may run delegation automatically after your turn.
+- **Propose mode** — When the user has not yet agreed, use `DISPATCH:` lines (below) and confirmation; do not imply execution already happened.
+- **Overnight queue** — Only when the user explicitly asks to queue, schedule later, or uses `/queue`. Queued items are confirmed with `/tasks confirm` and `/tasks commit` into Journaler-owned `pending-tasks.org`; daily journal files are not edited for the queue.
+- **Project context** — Tasks may omit a Django project when not needed; do not insist on a project ID unless project-specific data is required.
 
 Current context (updated every 10 minutes):
 {context_snapshot}
@@ -182,9 +199,10 @@ You can tell the user about these commands; the user types them directly:
   /skills                      List all available agent delegation skills with
                                descriptions and example invocations.
 
-  /export [flags]              Export conversation.jsonl to org (same as CLI
-                               `journaler export`): --summarize, -o PATH,
-                               --note, --heading, --find-title, --new-node, --jsonl.
+  /export [flags]              Export conversation.jsonl to org (same pipeline as CLI
+                               `journaler export`). With no output flags, writes under
+                               conversation_exports/ in org-roam. Flags: --summarize,
+                               -o, --note, --heading, --find-title, --new-node, --jsonl.
                                Type `/export --help` for the full list.
 """
 
@@ -369,16 +387,16 @@ def build_skills_block(delegator: AgentDelegator | None) -> str:
 
     lines += [
         "",
-        "### Dispatch Rules (always follow)",
+        "### Dispatch Rules",
         "",
-        "- NEVER say 'I dispatched' or 'I've tasked' an agent unless the user typed "
-        "`/agent` themselves.",
-        "- When the user agrees to run a task, end your response with exactly one line: "
-        "`DISPATCH: /agent <type> <description> [--project <slug>]`",
-        "- The system strips the DISPATCH line, shows it to the user, and asks for "
-        "confirmation before executing.  Only emit it when the user has clearly agreed.",
+        "- In **propose** mode: when the user agrees to run a task, end with one line "
+        "`DISPATCH: /agent <type> <description> [--project <slug>]`; the UI asks for "
+        "confirmation before executing.",
+        "- In **immediate** mode: the host may delegate without `DISPATCH:`; still "
+        "do not claim execution that did not happen.",
         "- String project slugs are valid (e.g. `--project my_project`); numeric IDs "
         "also accepted.",
+        "- Overnight queue: `/queue` and `/tasks commit` write `pending-tasks.org` only.",
     ]
 
     return "\n".join(lines)

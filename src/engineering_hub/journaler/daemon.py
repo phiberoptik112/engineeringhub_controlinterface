@@ -92,6 +92,9 @@ class JournalerConfig:
     journal_lookback_days: int = 5
     journal_max_files: int = 5
 
+    # Journaler-owned overnight queue file (Orchestrator scans via OrgTaskParser extra_files).
+    pending_tasks_file: Path | None = None
+
     # Periodic deep scan: force-reparses the full journal window regardless of mtime.
     # Set to 0 to disable.
     deep_scan_interval_min: int = 60
@@ -154,6 +157,9 @@ def run_daemon(config: JournalerConfig, settings: Settings | None = None) -> Non
     briefing_template = load_briefing_prompt(config.state_dir)
 
     # Init context scanner
+    pending_ctx = config.pending_tasks_file
+    if pending_ctx is None:
+        pending_ctx = config.workspace_dir / ".journaler" / "pending-tasks.org"
     context = JournalContext(
         org_roam_dir=config.org_roam_dir,
         journal_dir=config.journal_dir,
@@ -164,6 +170,7 @@ def run_daemon(config: JournalerConfig, settings: Settings | None = None) -> Non
         scan_org_roam_tree=config.scan_org_roam_tree,
         journal_lookback_days=config.journal_lookback_days,
         journal_max_files=config.journal_max_files,
+        pending_tasks_file=pending_ctx,
     )
 
     # Init MLX backend (model loads here — takes ~10-30s for 32B)
@@ -244,6 +251,9 @@ def run_daemon(config: JournalerConfig, settings: Settings | None = None) -> Non
     if config.chat_enabled:
         from engineering_hub.journaler.chat_server import ChatServer
 
+        pending_pf = config.pending_tasks_file
+        if pending_pf is None:
+            pending_pf = config.workspace_dir / ".journaler" / "pending-tasks.org"
         chat_server = ChatServer(
             engine=engine,
             context=context,
@@ -252,6 +262,7 @@ def run_daemon(config: JournalerConfig, settings: Settings | None = None) -> Non
             start_time=start_time,
             delegator=delegator,
             model_context=runtime_model,
+            pending_tasks_file=pending_pf,
         )
 
     # Schedule recurring tasks
@@ -346,6 +357,9 @@ def generate_briefing_now(
     briefing_template = load_briefing_prompt(config.state_dir)
 
     if context is None:
+        ptf = config.pending_tasks_file
+        if ptf is None:
+            ptf = config.workspace_dir / ".journaler" / "pending-tasks.org"
         context = JournalContext(
             org_roam_dir=config.org_roam_dir,
             journal_dir=config.journal_dir,
@@ -356,6 +370,7 @@ def generate_briefing_now(
             scan_org_roam_tree=config.scan_org_roam_tree,
             journal_lookback_days=config.journal_lookback_days,
             journal_max_files=config.journal_max_files,
+            pending_tasks_file=ptf,
         )
         context.scan()
 

@@ -23,6 +23,7 @@ class Settings(BaseSettings):
         env_file_encoding="utf-8",
         env_prefix="ENGINEERING_HUB_",
         extra="ignore",
+        populate_by_name=True,
     )
 
     # Django API settings
@@ -100,7 +101,7 @@ class Settings(BaseSettings):
 
     # Org headings to scan for agent tasks
     org_task_sections: list[str] = Field(
-        default_factory=lambda: ["Overnight Agent Tasks"],
+        default_factory=lambda: ["Overnight Agent Tasks", "Pending Agent Tasks"],
         description="Org heading names whose list items are parsed as agent tasks",
     )
 
@@ -370,6 +371,14 @@ class Settings(BaseSettings):
         ge=1,
         description="Max number of recent daily journal files to parse for context/tasks",
     )
+    journaler_pending_tasks_file: Path | None = Field(
+        default=None,
+        description="Journaler-owned org file for overnight agent queue (default: workspace .journaler/pending-tasks.org)",
+    )
+    journaler_default_task_mode: str = Field(
+        default="immediate",
+        description='Journaler routing: "immediate" (default) or "propose" (DISPATCH confirm flow)',
+    )
 
     # Report template settings
     templates_dir: Path | None = Field(
@@ -387,6 +396,22 @@ class Settings(BaseSettings):
     emacs_config_path: Path = Field(
         default=Path.home() / ".doom.d" / "config.el",
         description="Path to Emacs config.el for capture template import/export",
+    )
+
+    # Context pipeline diagnostic (opt-in; see engineering-hub diagnostic context-pipeline)
+    context_pipeline_diagnostic_enabled: bool = Field(
+        default=False,
+        description="When True, persist formatted context and outputs under outputs/diagnostics/context-pipeline/<run_id>/",
+    )
+    diagnostic_context_audit_prompt: bool = Field(
+        default=False,
+        description="Append CONTEXT AUDIT block to agent system prompts (diagnostic only). "
+        "Env: ENGINEERING_HUB_DIAGNOSTIC_CONTEXT_AUDIT_PROMPT.",
+    )
+    diagnostic_debug_context_max_chars: int = Field(
+        default=50_000,
+        ge=4_000,
+        description="Max chars of formatted context logged at DEBUG when diagnostics are enabled.",
     )
 
     # PDF reference corpus settings
@@ -477,6 +502,13 @@ class Settings(BaseSettings):
     def journaler_briefing_output_dir(self) -> Path:
         """Path to the Journaler briefing output directory."""
         return self.journaler_state_dir / "briefings"
+
+    @property
+    def resolved_journaler_pending_tasks_file(self) -> Path:
+        """Org file the Journaler writes for queued overnight tasks."""
+        if self.journaler_pending_tasks_file is not None:
+            return Path(self.journaler_pending_tasks_file).expanduser().resolve()
+        return (self.workspace_dir / ".journaler" / "pending-tasks.org").resolve()
 
     @property
     def resolved_journaler_model_path(self) -> str:
@@ -705,6 +737,14 @@ class Settings(BaseSettings):
                 flat_config["journaler_journal_lookback_days"] = j["journal_lookback_days"]
             if j.get("journal_max_files") is not None:
                 flat_config["journaler_journal_max_files"] = j["journal_max_files"]
+            if j.get("pending_tasks_file"):
+                flat_config["journaler_pending_tasks_file"] = Path(
+                    j["pending_tasks_file"]
+                ).expanduser()
+            if j.get("default_task_mode"):
+                flat_config["journaler_default_task_mode"] = str(
+                    j["default_task_mode"]
+                ).strip()
 
         if "templates" in config:
             tpl = config["templates"]
@@ -728,6 +768,22 @@ class Settings(BaseSettings):
                 flat_config["corpus_search_k"] = corpus["search_k"]
             if corpus.get("threshold") is not None:
                 flat_config["corpus_search_threshold"] = corpus["threshold"]
+
+        if "diagnostics" in config:
+            diag = config["diagnostics"]
+            if isinstance(diag, dict):
+                cp = diag.get("context_pipeline")
+                if isinstance(cp, dict):
+                    if cp.get("enabled") is not None:
+                        flat_config["context_pipeline_diagnostic_enabled"] = cp["enabled"]
+                    if cp.get("context_audit_prompt") is not None:
+                        flat_config["diagnostic_context_audit_prompt"] = cp[
+                            "context_audit_prompt"
+                        ]
+                    if cp.get("debug_context_max_chars") is not None:
+                        flat_config["diagnostic_debug_context_max_chars"] = cp[
+                            "debug_context_max_chars"
+                        ]
 
         def _is_empty(v: object) -> bool:
             if v is None or v == "":

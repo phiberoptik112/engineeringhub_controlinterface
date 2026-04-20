@@ -36,6 +36,8 @@ COMMAND_CATALOG: list[CommandEntry] = [
     CommandEntry("/find", "<title fragment>", "Search org-roam files by title", "File Ops"),
     # Agent Delegation
     CommandEntry("/agent", "<type> <description>", "Delegate to an agent persona", "Agent Delegation"),
+    CommandEntry("/tasks", "[confirm|commit|rollback|…]", "Overnight task queue (pending-tasks.org)", "Agent Delegation"),
+    CommandEntry("/queue", "<description>", "Propose a task for the overnight queue", "Agent Delegation"),
     CommandEntry("/skills", "", "List available agent personas", "Agent Delegation"),
     CommandEntry("/agent_browse", "", "Interactive skill picker for agent delegation", "Agent Delegation"),
     CommandEntry("/validate-latex", "<path>", "Compile a .tex file and report errors", "Agent Delegation"),
@@ -50,7 +52,12 @@ COMMAND_CATALOG: list[CommandEntry] = [
     CommandEntry("/done", "<fragment>", "Mark a matching TODO as done", "Org-Roam Write"),
     CommandEntry("/note", "<heading> :: <text>", "Append text under a heading in today's journal", "Org-Roam Write"),
     # Export
-    CommandEntry("/export", "[--format raw|--summarize] [-o <path>]", "Export conversation to org", "Export"),
+    CommandEntry(
+        "/export",
+        "[--format raw|--summarize] [-o <path>] …",
+        "Export transcript to org-roam (default: conversation_exports/)",
+        "Export",
+    ),
     # Session
     CommandEntry("/help", "", "Show available slash commands", "Session"),
     CommandEntry("/exit", "", "Leave the chat session", "Session"),

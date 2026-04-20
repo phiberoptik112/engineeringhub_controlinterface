@@ -18,7 +18,10 @@ from rich.text import Text
 
 from engineering_hub.config.loader import find_config_file
 from engineering_hub.config.settings import Settings
-from engineering_hub.journaler.constants import DEFAULT_JOURNALER_MLX_MODEL_ID
+from engineering_hub.journaler.constants import (
+    DEFAULT_JOURNALER_MLX_MODEL_ID,
+    JOURNALER_CONVERSATION_EXPORT_DIRNAME,
+)
 from engineering_hub.journaler.engine import (
     SUPPORTED_EXTENSIONS,
     ConversationEngine,
@@ -47,6 +50,9 @@ class _ExportSlashHelp(Exception):
 def _export_slash_usage() -> str:
     return (
         "/export — same as `engineering-hub journaler export` (transcript → org).\n\n"
+        "With no -o / --note / --find-title / --new-node, exports are written under\n"
+        f"  <org-roam>/{JOURNALER_CONVERSATION_EXPORT_DIRNAME}/\n"
+        "as a new org-roam node (CLI `journaler export` still prints to stdout by default).\n\n"
         "Examples:\n"
         "  /export\n"
         "  /export --summarize\n"
@@ -151,12 +157,20 @@ def _execute_journaler_export(
     spec: object,
     log: Console,
     body_to_stdout: bool,
+    chat_default_roam_export: bool = False,
 ) -> int:
     """Shared implementation for `journaler export` CLI and `/export` in chat.
 
-    When *body_to_stdout* is False, the export body is printed with Rich markup
-    escaped (interactive chat). When True, raw body is written to sys.stdout
-    if no file/note/new-node target consumed it.
+    When *body_to_stdout* is True (CLI default), raw body is written to
+    ``sys.stdout`` if no file/note/new-node target consumed it.
+
+    When *chat_default_roam_export* is True and nothing else consumed the body,
+    writes a new node under the configured org-roam root, in the
+    ``conversation_exports`` subdirectory (see
+    :data:`~engineering_hub.journaler.constants.JOURNALER_CONVERSATION_EXPORT_DIRNAME`).
+
+    When *body_to_stdout* is False and *chat_default_roam_export* is False, the
+    export body is printed with Rich markup escaped (legacy behavior).
     """
     from engineering_hub.journaler.conversation_export import (
         build_summarize_prompt,
@@ -282,6 +296,18 @@ def _execute_journaler_export(
         wrote_file = True
 
     if not wrote_file:
+        if chat_default_roam_export:
+            export_dir = org_roam_dir / JOURNALER_CONVERSATION_EXPORT_DIRNAME
+            export_dir.mkdir(parents=True, exist_ok=True)
+            ok, msg = create_org_node(
+                export_dir,
+                "Journaler chat export",
+                filetags=["journaler-export"],
+                body=body,
+            )
+            color = "green" if ok else "red"
+            log.print(f"[{color}]{escape(msg)}[/{color}]")
+            return 0 if ok else 1
         if body_to_stdout:
             sys.stdout.write(body)
         else:
@@ -456,6 +482,9 @@ def cmd_status(args: argparse.Namespace) -> int:
             use_org_mode=settings.use_org_mode,
             org_task_sections=settings.org_task_sections,
             org_lookback_days=settings.org_lookback_days,
+            pending_tasks_file=settings.resolved_journaler_pending_tasks_file
+            if settings.use_org_mode
+            else None,
         )
         pending = manager.get_pending_tasks()
 
@@ -766,6 +795,7 @@ def _handle_chat_slash_command(
       /open [today|clear|<path>|<title>]  Set session org-roam target for /edit.
       /edit <heading> :: <text>  Append under a heading in the /open target.
       /exit, /quit               Leave the chat (same as bare exit, quit, or :q).
+      /tasks … /queue            Overnight queue in pending-tasks.org (confirm, commit, rollback).
       /agent … /skills           Delegate to agent personalities (when delegator is configured).
       /validate-latex <path>     Compile a .tex file with pdflatex and report errors/warnings.
       /export …                  Export conversation.jsonl to org (same flags as journaler export).
@@ -812,6 +842,20 @@ def _handle_chat_slash_command(
         from engineering_hub.journaler.chat_server import _handle_skills_command
 
         msg = _handle_skills_command(delegator)
+        chat_console.print(f"[green]{escape(msg)}[/green]")
+        return
+
+    if cmd in ("/tasks", "/queue"):
+        if export_settings is None:
+            chat_console.print(
+                "[yellow]/tasks requires workspace settings (pending_tasks_file).[/yellow]"
+            )
+            return
+        from engineering_hub.journaler.task_slash import handle_tasks_slash_command
+
+        msg = handle_tasks_slash_command(
+            raw, engine, export_settings.resolved_journaler_pending_tasks_file
+        )
         chat_console.print(f"[green]{escape(msg)}[/green]")
         return
 
@@ -979,6 +1023,7 @@ def _handle_chat_slash_command(
             spec=export_spec,
             log=chat_console,
             body_to_stdout=False,
+            chat_default_roam_export=True,
         )
         return
 
@@ -1546,6 +1591,7 @@ def cmd_journaler(args: argparse.Namespace) -> int:
         scan_org_roam_tree=settings.journaler_scan_org_roam_tree,
         journal_lookback_days=settings.journaler_journal_lookback_days,
         journal_max_files=settings.journaler_journal_max_files,
+        pending_tasks_file=settings.resolved_journaler_pending_tasks_file,
     )
 
     if sub == "start":
@@ -1601,6 +1647,7 @@ def cmd_journaler(args: argparse.Namespace) -> int:
             scan_org_roam_tree=config.scan_org_roam_tree,
             journal_lookback_days=config.journal_lookback_days,
             journal_max_files=config.journal_max_files,
+            pending_tasks_file=settings.resolved_journaler_pending_tasks_file,
         )
         ctx.scan()
 
@@ -1701,6 +1748,89 @@ def cmd_journaler(args: argparse.Namespace) -> int:
                     console.print(_build_status_bar(engine, model_label))
                     continue
                 try:
+                    from datetime import datetime, timezone
+
+                    from engineering_hub.journaler.chat_server import (
+                        _extract_dispatch,
+                        _handle_agent_command,
+                    )
+                    from engineering_hub.journaler.task_intent_extractor import (
+                        classify_journaler_intent,
+                    )
+                    from engineering_hub.journaler.task_planner_models import (
+                        ProposedTask,
+                    )
+
+                    mode = (settings.journaler_default_task_mode or "immediate").lower()
+                    routed = False
+                    if mode != "propose" and delegator is not None and ctx is not None:
+                        kind, payload = classify_journaler_intent(engine, user_input)
+                        desc = (payload.get("description") or "").strip()
+                        if kind == "immediate_task" and desc:
+                            agent = str(payload.get("agent_type") or "research")
+                            cmd = f"/agent {agent} {desc}"
+                            pid = payload.get("project_id")
+                            if pid is not None:
+                                cmd += f" --project {pid}"
+                            console.print("[dim]Delegating to agent…[/dim]")
+                            try:
+                                agent_result = _handle_agent_command(
+                                    cmd, delegator, ctx, engine=engine
+                                )
+                            except Exception as run_exc:
+                                log.exception("Agent dispatch failed")
+                                agent_result = f"Agent dispatch failed: {run_exc}"
+                            out = f"**@{agent}**\n\n{agent_result}"
+                            console.print("\n[bold]Journaler:[/bold]")
+                            _print_chat_markdown(console, out)
+                            console.print()
+                            engine.inject_turn(user_input, out)
+                            routed = True
+                        elif kind == "queued_task" and desc:
+                            agent = str(payload.get("agent_type") or "research")
+                            now = datetime.now(timezone.utc)
+                            kws = payload.get("keywords") or []
+                            if isinstance(kws, str):
+                                kws = [kws]
+                            paths = payload.get("input_paths") or []
+                            if not isinstance(paths, list):
+                                paths = []
+                            op = payload.get("output_path")
+                            pt = ProposedTask(
+                                agent_type=agent,
+                                description=desc,
+                                session_id=engine.session_id,
+                                session_timestamp=engine.session_opened_at,
+                                proposed_at=now,
+                                keywords=[str(x) for x in kws][:8],
+                                project_id=payload.get("project_id"),
+                                input_paths=[str(x) for x in paths],
+                                output_path=str(op) if op else None,
+                                context_flags=[],
+                                status="proposed",
+                                confidence=float(payload.get("confidence", 0.0)),
+                                clarification_needed=bool(
+                                    payload.get("clarification_needed", False)
+                                ),
+                            )
+                            engine.task_planner.add_proposal(pt)
+                            out = f"Queued task proposal (not saved yet):\n\n- @{agent}: {desc}\n"
+                            if pt.output_path:
+                                out += f"- Suggested output: `{pt.output_path}`\n"
+                            out += (
+                                "\nUse `/tasks confirm` and `/tasks commit` for "
+                                "pending-tasks.org."
+                            )
+                            console.print("\n[bold]Journaler:[/bold]")
+                            _print_chat_markdown(console, out)
+                            console.print()
+                            engine.inject_turn(user_input, out)
+                            routed = True
+
+                    if routed:
+                        console.print(_build_status_bar(engine, model_label))
+                        continue
+
                     raw_response = engine.chat(user_input)
                 except Exception as exc:
                     log.exception("Journaler chat turn failed")
@@ -1804,6 +1934,7 @@ def cmd_journaler(args: argparse.Namespace) -> int:
             scan_org_roam_tree=config.scan_org_roam_tree,
             journal_lookback_days=config.journal_lookback_days,
             journal_max_files=config.journal_max_files,
+            pending_tasks_file=settings.resolved_journaler_pending_tasks_file,
         )
         snapshot = ctx.scan()
         console.print(f"  Last scan: {snapshot.last_scan}")
@@ -2361,6 +2492,47 @@ def cmd_capture(args: argparse.Namespace) -> int:
     return 1
 
 
+def cmd_diagnostic(args: argparse.Namespace) -> int:
+    if args.diagnostic_command == "context-pipeline":
+        return cmd_diagnostic_context_pipeline(args)
+    return 1
+
+
+def cmd_diagnostic_context_pipeline(args: argparse.Namespace) -> int:
+    """Run synthetic tasks through ContextManager + optional AgentWorker; write artifacts."""
+    setup_logging(args.verbose)
+    settings = _apply_cli_overrides(load_settings(args.config), args)
+    settings = settings.model_copy(
+        update={
+            "context_pipeline_diagnostic_enabled": True,
+            "diagnostic_context_audit_prompt": getattr(
+                args, "context_audit_prompt", False
+            ),
+        }
+    )
+    tasks_path = Path(args.tasks).expanduser().resolve()
+    if not tasks_path.is_file():
+        console.print(f"[red]Error:[/red] Tasks file not found: {tasks_path}")
+        return 1
+    if not args.dry_run_context_only:
+        if err := _validate_llm_settings(settings):
+            return err
+
+    from engineering_hub.diagnostics.runner import run_context_pipeline_diagnostic
+
+    code, run_root = run_context_pipeline_diagnostic(
+        settings,
+        tasks_path,
+        max_tasks=args.max_tasks,
+        dry_run_context_only=args.dry_run_context_only,
+    )
+    console.print(
+        f"[bold green]Diagnostic run complete.[/bold green] "
+        f"Artifacts under:\n  {run_root}"
+    )
+    return code
+
+
 def cmd_memory(args: argparse.Namespace) -> int:
     """Query or inspect the local memory database."""
     setup_logging(args.verbose)
@@ -2893,12 +3065,67 @@ def main() -> int:
     search_p.add_argument("query", help="Search query")
     search_p.add_argument("--k", type=int, default=5, help="Max results")
 
+    diag_parser = subparsers.add_parser(
+        "diagnostic",
+        help="Diagnostic utilities (context pipeline, etc.)",
+    )
+    diag_sub = diag_parser.add_subparsers(dest="diagnostic_command", required=True)
+    _repo_root = Path(__file__).resolve().parents[2]
+    cp_parser = diag_sub.add_parser(
+        "context-pipeline",
+        help="Run context pipeline tasks; write formatted context, checklist, and optional agent output",
+    )
+    cp_parser.add_argument(
+        "--tasks",
+        type=Path,
+        default=_repo_root / "diagnostics" / "context_pipeline_tasks.yaml",
+        help="YAML file with a top-level 'tasks' list",
+    )
+    cp_parser.add_argument(
+        "--max-tasks",
+        type=int,
+        default=10,
+        help="Maximum number of tasks to run from the file",
+    )
+    cp_parser.add_argument(
+        "--dry-run-context-only",
+        action="store_true",
+        help="Build and persist context only (no LLM calls)",
+    )
+    cp_parser.add_argument(
+        "--context-audit-prompt",
+        action="store_true",
+        dest="context_audit_prompt",
+        help="Append CONTEXT AUDIT diagnostic block to agent system prompts",
+    )
+    cp_parser.add_argument(
+        "--docker",
+        action="store_true",
+        default=None,
+        help="Run agent tasks in Docker (overrides docker.enabled)",
+    )
+    cp_parser.add_argument(
+        "--no-docker",
+        action="store_false",
+        dest="docker",
+        help="Force local agent execution",
+    )
+    cp_parser.add_argument(
+        "--llm-provider",
+        dest="llm_provider_override",
+        choices=["anthropic", "mlx", "ollama"],
+        help="Override llm_provider from config",
+    )
+
     args = parser.parse_args()
     setup_logging(args.verbose)
 
     if args.command is None:
         parser.print_help()
         return 0
+
+    if args.command == "diagnostic":
+        return cmd_diagnostic(args)
 
     commands = {
         "start": cmd_start,

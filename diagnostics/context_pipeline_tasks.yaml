@@ -1,0 +1,38 @@
+# Synthetic tasks for `engineering-hub diagnostic context-pipeline`.
+# Mix agents and project_id (null = minimal context path in ContextManager).
+
+tasks:
+  - agent: research
+    description: "Summarize ASTM E336-17a field measurement requirements for STC testing and note common failure modes."
+    project_id: 1
+    context: "Focus on single-family residential party walls."
+
+  - agent: research
+    description: "What are the key differences between ASTM E90 and ASTM E336 for airborne sound insulation testing?"
+    project_id: none
+
+  - agent: technical-writer
+    description: "Draft a one-page field measurement plan outline for the listed scope items, referencing applicable standards."
+    project_id: 1
+    deliverable: "outputs/docs/diagnostic-field-plan-outline.md"
+
+  - agent: standards-checker
+    description: "Check whether the scope items are consistent with the listed ASTM editions for building acoustics."
+    project_id: 1
+
+  - agent: technical-reviewer
+    description: "Review the referenced draft for technical consistency with scope and standards; list gaps only."
+    project_id: 1
+
+  - agent: standards-checker
+    description: "List verification steps for claims about impact insulation class (IIC) per project standards."
+    project_id: 1
+
+  - agent: research
+    description: "Compare two hypothetical report outlines for clarity and standards alignment (brief table)."
+    project_id: 1
+
+  - agent: research
+    description: "Recommend mitigation options for HVAC noise in open-plan offices given the project client and status."
+    project_id: 1
+    context: "Assume budget-sensitive options first."

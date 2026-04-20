@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from collections import defaultdict
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -55,6 +56,7 @@ class JournalContext:
         scan_org_roam_tree: bool = True,
         journal_lookback_days: int = 5,
         journal_max_files: int = 5,
+        pending_tasks_file: Path | None = None,
     ) -> None:
         self.org_roam_dir = org_roam_dir
         self.journal_dir = journal_dir
@@ -65,6 +67,7 @@ class JournalContext:
         self.scan_org_roam_tree = scan_org_roam_tree
         self.journal_lookback_days = max(0, journal_lookback_days)
         self.journal_max_files = max(1, journal_max_files)
+        self._pending_tasks_file = pending_tasks_file
 
         self.state_file = state_dir / "state.json"
         self.cache_file = state_dir / "context_cache.json"
@@ -536,6 +539,58 @@ class JournalContext:
 
         return "\n".join(lines)
 
+    def _resolved_pending_tasks_path(self) -> Path:
+        if self._pending_tasks_file is not None:
+            return self._pending_tasks_file.expanduser().resolve()
+        return (self.workspace_dir / ".journaler" / "pending-tasks.org").resolve()
+
+    def _format_pending_queue_for_briefing(self) -> str:
+        """Summarize Journaler queue entries from the last ~36h for briefing context."""
+        path = self._resolved_pending_tasks_path()
+        if not path.is_file():
+            return ""
+        text = path.read_text(encoding="utf-8", errors="replace")
+        today = date.today()
+        yday = today - timedelta(days=1)
+        markers = (today.isoformat(), yday.isoformat())
+        if not any(m in text for m in markers):
+            return ""
+
+        chunks = text.split("** ")
+        hits: list[str] = []
+        for chunk in chunks[1:]:
+            block = "** " + chunk
+            if ":STATUS: PENDING" not in block and ":STATUS: DONE" not in block:
+                continue
+            if not any(m in block for m in markers):
+                continue
+            first_line = block.splitlines()[0].strip()
+            status_m = re.search(r":STATUS:\s*(\S+)", block, re.IGNORECASE)
+            st = status_m.group(1) if status_m else "?"
+            hits.append(f"- ({st}) {first_line[:120]}")
+
+        if not hits:
+            lines_out = [
+                "### Journaler overnight queue (pending-tasks.org)",
+                f"_Path: `{path}` — recent session markers found; no extractable blocks._",
+                "",
+            ]
+            return "\n".join(lines_out)
+
+        lines_out = [
+            "### Journaler overnight queue (pending-tasks.org)",
+            f"_Path: `{path}` — entries with timestamps touching {yday} or {today}:_",
+        ]
+        lines_out.extend(hits[:12])
+        if len(hits) > 12:
+            lines_out.append(f"_… +{len(hits) - 12} more_")
+        lines_out.append(
+            "_Compare with “Recent Agent Outputs” below (memory) for completed work._"
+        )
+        lines_out.append("")
+
+        return "\n".join(lines_out)
+
     def get_briefing_context(self) -> str:
         """Richer context for morning briefings — includes multi-day journal
         thread, recurring topics, active roam nodes, stale tasks, yesterday's
@@ -549,6 +604,10 @@ class JournalContext:
             f"Date: {s.today_date}",
             "",
         ]
+
+        pq = self._format_pending_queue_for_briefing()
+        if pq:
+            lines.append(pq)
 
         # Yesterday's journal: scan yesterday's file directly for full content
         yesterday = date.today() - timedelta(days=1)

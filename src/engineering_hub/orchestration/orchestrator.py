@@ -21,6 +21,11 @@ from engineering_hub.corpus_service_factory import build_corpus_service_from_set
 from engineering_hub.django.client import DjangoClient
 from engineering_hub.memory.service import MemoryService
 from engineering_hub.notes.manager import SharedNotesManager
+from engineering_hub.diagnostics.artifacts import (
+    new_diagnostic_run_id,
+    persist_task_diagnostic_bundle,
+    write_task_result_artifacts,
+)
 from engineering_hub.orchestration.dispatcher import TaskDispatcher
 from engineering_hub.orchestration.watcher import FileWatcher
 
@@ -41,6 +46,8 @@ class Orchestrator:
         """
         self.settings = settings
         self._shutdown_event = threading.Event()
+        self._diagnostic_run_id: str | None = None
+        self._diagnostic_task_seq: int = 0
 
         # Initialize components
         self._init_components()
@@ -54,6 +61,11 @@ class Orchestrator:
             notes_path = self.settings.notes_file
 
         # Notes manager (org, journal, or legacy mode) — task dispatch window
+        _pending = (
+            self.settings.resolved_journaler_pending_tasks_file
+            if self.settings.use_org_mode
+            else None
+        )
         self.notes_manager = SharedNotesManager(
             notes_path,
             use_journal_mode=self.settings.use_journal_mode,
@@ -61,6 +73,7 @@ class Orchestrator:
             use_org_mode=self.settings.use_org_mode,
             org_task_sections=self.settings.org_task_sections,
             org_lookback_days=self.settings.org_lookback_days,
+            pending_tasks_file=_pending,
         )
 
         # Separate notes manager with a wider lookback for context enrichment
@@ -71,6 +84,7 @@ class Orchestrator:
             use_org_mode=self.settings.use_org_mode,
             org_task_sections=self.settings.org_task_sections,
             org_lookback_days=self.settings.org_context_lookback_days,
+            pending_tasks_file=_pending,
         )
 
         # Django client
@@ -114,6 +128,7 @@ class Orchestrator:
             prompts_dir=self.settings.prompts_dir,
             output_dir=self.settings.output_dir,
             max_tokens=self.settings.max_tokens,
+            diagnostic_context_audit=self.settings.diagnostic_context_audit_prompt,
         )
 
         # Task router (local or Docker container execution)
@@ -178,8 +193,40 @@ class Orchestrator:
         # Build context for the task
         context = self.context_manager.format_for_agent(task)
 
+        diag_dir: Path | None = None
+        if self.settings.context_pipeline_diagnostic_enabled:
+            if self._diagnostic_run_id is None:
+                self._diagnostic_run_id = new_diagnostic_run_id()
+            run_root = (
+                self.settings.output_dir
+                / "diagnostics"
+                / "context-pipeline"
+                / self._diagnostic_run_id
+            )
+            run_root.mkdir(parents=True, exist_ok=True)
+            idx = self._diagnostic_task_seq
+            self._diagnostic_task_seq += 1
+            diag_dir, _ = persist_task_diagnostic_bundle(
+                run_root, idx, task, context, self.settings
+            )
+            cap = self.settings.diagnostic_debug_context_max_chars
+            snippet = (
+                context
+                if len(context) <= cap
+                else context[:cap] + "\n[truncated]"
+            )
+            logger.debug(
+                "Formatted context for task %s (%d chars):\n%s",
+                task.task_id,
+                len(context),
+                snippet,
+            )
+
         # Execute via router (local or Docker container)
         result = self.task_router.execute(task, context)
+
+        if diag_dir is not None:
+            write_task_result_artifacts(diag_dir, result)
 
         if result.success:
             self._capture_task_result(task, result)
