@@ -250,6 +250,9 @@ class AgentDelegator:
         project_id: int | str | None = None,
         backend: str = "auto",
         journaler_context: str = "",
+        anthropic_web_search: bool = False,
+        anthropic_web_search_tool_version: str = "web_search_20250305",
+        anthropic_web_search_max_uses: int = 3,
     ) -> str:
         """Execute a task via the selected backend and return the result as a string.
 
@@ -273,7 +276,7 @@ class AgentDelegator:
             )
 
         try:
-            agent_enum = AgentType(resolved_type)
+            AgentType(resolved_type)
         except ValueError:
             return f"Agent type '{resolved_type}' is not registered in the system."
 
@@ -301,7 +304,15 @@ class AgentDelegator:
         )
 
         try:
-            result = worker.execute(task, context=journaler_context)
+            result = worker.execute_with_options(
+                task,
+                context=journaler_context,
+                anthropic_web_search=(
+                    anthropic_web_search and worker is self._anthropic_worker
+                ),
+                anthropic_web_search_tool_version=anthropic_web_search_tool_version,
+                anthropic_web_search_max_uses=anthropic_web_search_max_uses,
+            )
         except Exception as exc:
             logger.error(f"Agent delegation failed: {exc}")
             return f"Agent execution failed: {exc}"
@@ -360,6 +371,14 @@ class AgentDelegator:
         """Return the canonical agent type string for a given name/alias, or None."""
         return _AGENT_ALIASES.get(name.lower())
 
+    def aliases_for_agent(self, agent_type: str) -> list[str]:
+        """Return aliases that resolve to ``agent_type`` for routing prompts."""
+        return [
+            alias
+            for alias, resolved in sorted(_AGENT_ALIASES.items())
+            if resolved == agent_type
+        ]
+
     def is_known_agent(self, name: str) -> bool:
         """Return True if the name resolves to a known agent type."""
         return name.lower() in _AGENT_ALIASES
@@ -367,6 +386,11 @@ class AgentDelegator:
     def list_skills(self) -> list[SkillDef]:
         """Return all loaded skill definitions."""
         return list(self._skills.values())
+
+    def will_use_anthropic_backend(self, backend: str) -> bool:
+        """Return True if a backend request resolves to the Claude worker."""
+        worker = self._select_worker(backend)
+        return worker is not None and worker is self._anthropic_worker
 
     def skills_summary(self) -> str:
         """Return a formatted string of available skills for system prompt injection."""

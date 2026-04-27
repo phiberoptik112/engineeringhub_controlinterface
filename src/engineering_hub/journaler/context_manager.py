@@ -16,7 +16,7 @@ from __future__ import annotations
 import logging
 import re
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
 from typing import Callable
@@ -116,7 +116,7 @@ class ConversationHistory:
     engine on each call cycle.
     """
 
-    def __init__(self, max_turns: int = 20, max_tokens: int = 10_000) -> None:
+    def __init__(self, max_turns: int = 40, max_tokens: int = 20_000) -> None:
         self.max_turns = max_turns
         self.max_tokens = max_tokens
         self.turns: deque[ConversationTurn] = deque()
@@ -210,7 +210,7 @@ class ContextCompressor:
     def __init__(
         self,
         engine_call: Callable[[str, int], str],
-        pressure_threshold: float = 0.70,
+        pressure_threshold: float = 0.85,
         keep_recent: int = 3,
         target_summary_tokens: int = 500,
     ) -> None:
@@ -402,7 +402,11 @@ def execute_clear(
         turn_count = len(history.turns)
         history._archive.extend(list(history.turns))
         history.turns.clear()
-        scan_note = f" Context snapshot retained (last scan: {last_scan_time})." if last_scan_time else ""
+        scan_note = (
+            f" Context snapshot retained (last scan: {last_scan_time})."
+            if last_scan_time
+            else ""
+        )
         return f"Cleared {turn_count} conversation turns.{scan_note}"
 
     elif strategy == ClearStrategy.HARD:
@@ -427,17 +431,24 @@ def execute_clear(
 class PressureConfig:
     """Thresholds and settings for automatic context management."""
 
-    compress_at: float = 0.70
-    emergency_trim_at: float = 0.90
-    auto_clear_on_topic_shift: bool = True
+    compress_at: float = 0.85
+    emergency_trim_at: float = 0.95
+    auto_clear_on_topic_shift: bool = False
     notify_user_on_action: bool = True
     end_of_day_time: str = "00:00"
     inactivity_clear_minutes: int = 120
-    capture_daily_to_memory: bool = False
+    capture_daily_to_memory: bool = True
+    conversation_relation_threshold: float = 0.55
+    conversation_relation_k: int = 5
+    conversation_relation_excerpt_chars: int = 1000
+    past_session_search_k: int = 5
+    past_session_excerpt_chars: int = 1200
     reserved_for_generation: int = 2000
     model_context_window: int = 32768
-    max_history_turns: int = 20
-    max_history_tokens: int = 10_000
+    max_history_turns: int = 40
+    max_history_tokens: int = 20_000
+    compression_keep_recent: int = 8
+    compression_summary_tokens: int = 800
 
 
 class ContextPressureManager:
@@ -468,14 +479,14 @@ class ContextPressureManager:
         actions: list[str] = []
 
         self.budget.history_tokens = self.history.total_tokens
-        pressure = self.budget.pressure
+        utilization = self.budget.utilization
 
-        if pressure == "moderate":
+        if 0.50 <= utilization < self.config.compress_at:
             logger.debug(
                 f"Context pressure: moderate ({self.budget.utilization:.0%})"
             )
 
-        elif pressure == "high":
+        elif utilization < self.config.emergency_trim_at:
             if self.compressor.should_compress(self.budget):
                 result = self.compressor.compress(self.history)
                 if result.compressed:
@@ -485,7 +496,7 @@ class ContextPressureManager:
                     )
                     self.budget.history_tokens = self.history.total_tokens
 
-        elif pressure == "critical":
+        else:
             result = self.compressor.compress(self.history)
             if result.compressed:
                 actions.append(
@@ -493,8 +504,10 @@ class ContextPressureManager:
                 )
                 self.budget.history_tokens = self.history.total_tokens
 
-            if self.budget.pressure == "critical":
-                dropped = self._emergency_trim(keep=3)
+            if self.budget.utilization >= self.config.emergency_trim_at:
+                dropped = self._emergency_trim(
+                    keep=self.config.compression_keep_recent
+                )
                 if dropped:
                     actions.append(
                         f"[Emergency trim: dropped {dropped} old turns to recover space]"

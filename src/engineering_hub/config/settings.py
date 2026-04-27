@@ -3,6 +3,7 @@
 from pathlib import Path
 from typing import Any
 
+import yaml
 from pydantic import Field, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -296,7 +297,7 @@ class Settings(BaseSettings):
         description="Slack incoming webhook URL (or set JOURNALER_SLACK_WEBHOOK)",
     )
     journaler_max_conversation_history: int = Field(
-        default=20,
+        default=40,
         description="Number of conversation turns to keep in memory",
     )
     journaler_max_tokens: int = Field(
@@ -320,7 +321,7 @@ class Settings(BaseSettings):
         description="Repetition penalty for Journaler model",
     )
     journaler_load_max_context_fraction: float = Field(
-        default=0.40,
+        default=0.65,
         gt=0.0,
         le=1.0,
         description="Fraction of remaining context (after history, etc.) for each /load chunk",
@@ -336,7 +337,7 @@ class Settings(BaseSettings):
         description="When budget allows, prefer at least this many chars per /load (within token headroom)",
     )
     journaler_load_slack_tokens: int = Field(
-        default=256,
+        default=128,
         ge=0,
         description="Extra tokens subtracted from headroom when sizing /load (safety margin)",
     )
@@ -378,6 +379,24 @@ class Settings(BaseSettings):
     journaler_default_task_mode: str = Field(
         default="immediate",
         description='Journaler routing: "immediate" (default) or "propose" (DISPATCH confirm flow)',
+    )
+    journaler_conversation_lookback_days: int = Field(
+        default=7,
+        ge=0,
+        description="Number of past daily conversation summaries to include in the proactive context snapshot",
+    )
+    journaler_conversation_summary_excerpt_chars: int = Field(
+        default=800,
+        ge=200,
+        description="Characters per past daily conversation summary in Journaler context",
+    )
+    journaler_context_management: dict[str, Any] = Field(
+        default_factory=dict,
+        description="Raw journaler.context_management YAML values for PressureConfig",
+    )
+    journaler_org_link_on_relation: bool = Field(
+        default=True,
+        description="When True, write a cross-reference link into today's journal when a related past conversation is detected",
     )
 
     # Report template settings
@@ -430,6 +449,48 @@ class Settings(BaseSettings):
     corpus_search_threshold: float = Field(
         default=0.40,
         description="Minimum cosine similarity for corpus results (higher than memory threshold)",
+    )
+
+    # Agent web search settings (local-first, used by Journaler /agent)
+    agent_web_search_enabled: bool = Field(
+        default=False,
+        description="Enable web search context injection for delegated /agent tasks",
+    )
+    agent_web_search_provider: str = Field(
+        default="searxng",
+        description='Agent web search provider. Currently supported: "searxng".',
+    )
+    agent_web_search_searxng_url: str = Field(
+        default="http://localhost:8080",
+        description="Base URL for a local/self-hosted SearXNG instance",
+    )
+    agent_web_search_max_results: int = Field(
+        default=5,
+        ge=1,
+        description="Maximum web search results injected into /agent context",
+    )
+    agent_web_search_max_chars: int = Field(
+        default=12_000,
+        ge=1_000,
+        description="Maximum characters of formatted web results injected into /agent context",
+    )
+    agent_web_search_timeout_seconds: float = Field(
+        default=10.0,
+        gt=0.0,
+        description="Timeout in seconds for local web search requests",
+    )
+    agent_web_search_anthropic_backup_enabled: bool = Field(
+        default=False,
+        description="Allow Claude server-side web search when local search is unavailable",
+    )
+    agent_web_search_anthropic_tool_version: str = Field(
+        default="web_search_20250305",
+        description="Anthropic server-side web search tool version for fallback mode",
+    )
+    agent_web_search_anthropic_max_uses: int = Field(
+        default=3,
+        ge=1,
+        description="Maximum Anthropic server-side web searches in fallback mode",
     )
 
     @property
@@ -542,8 +603,6 @@ class Settings(BaseSettings):
 
         YAML values are used as defaults, environment variables override.
         """
-        import yaml
-
         if not config_path.exists():
             return cls()
 
@@ -745,6 +804,20 @@ class Settings(BaseSettings):
                 flat_config["journaler_default_task_mode"] = str(
                     j["default_task_mode"]
                 ).strip()
+            if j.get("conversation_lookback_days") is not None:
+                flat_config["journaler_conversation_lookback_days"] = int(
+                    j["conversation_lookback_days"]
+                )
+            if j.get("conversation_summary_excerpt_chars") is not None:
+                flat_config["journaler_conversation_summary_excerpt_chars"] = int(
+                    j["conversation_summary_excerpt_chars"]
+                )
+            if isinstance(j.get("context_management"), dict):
+                flat_config["journaler_context_management"] = j["context_management"]
+            if j.get("org_link_on_relation") is not None:
+                flat_config["journaler_org_link_on_relation"] = bool(
+                    j["org_link_on_relation"]
+                )
 
         if "templates" in config:
             tpl = config["templates"]
@@ -768,6 +841,36 @@ class Settings(BaseSettings):
                 flat_config["corpus_search_k"] = corpus["search_k"]
             if corpus.get("threshold") is not None:
                 flat_config["corpus_search_threshold"] = corpus["threshold"]
+
+        if "agent_web_search" in config:
+            web = config["agent_web_search"]
+            if isinstance(web, dict):
+                if web.get("enabled") is not None:
+                    flat_config["agent_web_search_enabled"] = web["enabled"]
+                if web.get("provider"):
+                    flat_config["agent_web_search_provider"] = web["provider"]
+                if web.get("searxng_url"):
+                    flat_config["agent_web_search_searxng_url"] = web["searxng_url"]
+                if web.get("max_results") is not None:
+                    flat_config["agent_web_search_max_results"] = web["max_results"]
+                if web.get("max_chars") is not None:
+                    flat_config["agent_web_search_max_chars"] = web["max_chars"]
+                if web.get("timeout_seconds") is not None:
+                    flat_config["agent_web_search_timeout_seconds"] = web[
+                        "timeout_seconds"
+                    ]
+                if web.get("anthropic_backup_enabled") is not None:
+                    flat_config["agent_web_search_anthropic_backup_enabled"] = web[
+                        "anthropic_backup_enabled"
+                    ]
+                if web.get("anthropic_tool_version"):
+                    flat_config["agent_web_search_anthropic_tool_version"] = web[
+                        "anthropic_tool_version"
+                    ]
+                if web.get("anthropic_max_uses") is not None:
+                    flat_config["agent_web_search_anthropic_max_uses"] = web[
+                        "anthropic_max_uses"
+                    ]
 
         if "diagnostics" in config:
             diag = config["diagnostics"]

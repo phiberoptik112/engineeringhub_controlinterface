@@ -11,15 +11,17 @@ from engineering_hub.journaler.engine import ConversationEngine
 
 logger = logging.getLogger(__name__)
 
-_INTENT_PROMPT = """You are a routing classifier for an engineering assistant. Output ONLY valid JSON, no markdown fences, no commentary.
+_INTENT_PROMPT = """You are a routing classifier for an engineering assistant.
+Output ONLY valid JSON, no markdown fences, no commentary.
 
 The JSON object must have:
 - "classification": one of "conversational", "immediate_task", "queued_task"
 
 If classification is "immediate_task" or "queued_task", also include:
-- "agent_type": string (research, technical-writer, standards-checker, technical-reviewer, weekly-reviewer)
+- "agent_type": string. Use the best matching available agent below, or
+  "auto" if the best agent is unclear.
 - "description": string — the concrete task for the agent
-- "project_id": number or null
+- "project_id": number, string, or null
 - "keywords": array of 2-4 short keyword strings (for queued_task)
 - "output_path": string or null (suggested path like outputs/research/topic.md)
 - "input_paths": array of strings (file paths or wikilinks, may be empty)
@@ -27,10 +29,20 @@ If classification is "immediate_task" or "queued_task", also include:
 - "clarification_needed": boolean
 
 STRICT RULES:
-- Use "queued_task" ONLY if the user clearly asks to queue, schedule overnight, run later, add to batch, or defer execution (e.g. "queue for tonight", "overnight", "run later", "don't run now", "add to the batch", "schedule").
-- Use "immediate_task" when the user wants agent work done now (draft, summarize, research, standards check, review) WITHOUT those queue signals.
-- Use "conversational" for greetings, thanks, general discussion, or questions that do not require delegating a deliverable to an agent.
+- Use "queued_task" ONLY if the user clearly asks to queue, schedule
+  overnight, run later, add to batch, or defer execution (e.g. "queue for
+  tonight", "overnight", "run later", "don't run now", "add to the batch",
+  "schedule").
+- Use "immediate_task" when the user wants agent work done now (draft,
+  summarize, research, standards check, review) WITHOUT those queue signals.
+- Use "conversational" for greetings, thanks, general discussion, or questions
+  that do not require delegating a deliverable to an agent.
 - If unsure between conversational and immediate_task, prefer "conversational".
+- Do not require the user to name a slash command or exact agent. Infer the
+  most likely agent from the requested work.
+
+Available agents:
+{agent_catalog}
 
 User message:
 """
@@ -52,6 +64,7 @@ def classify_journaler_intent(
     engine: ConversationEngine,
     user_message: str,
     *,
+    agent_catalog: str = "",
     max_tokens: int = 384,
 ) -> tuple[str, dict[str, Any]]:
     """Return (classification, payload dict). Payload empty for conversational."""
@@ -60,7 +73,17 @@ def classify_journaler_intent(
         return "conversational", {}
 
     try:
-        raw = engine._raw_complete(_INTENT_PROMPT + msg, max_tokens=max_tokens)
+        catalog = agent_catalog.strip() or (
+            "- research: gather and synthesize information\n"
+            "- technical-writer: draft or revise deliverables\n"
+            "- standards-checker: audit against standards and codes\n"
+            "- technical-reviewer: review and critique technical work\n"
+            "- weekly-reviewer: summarize recent work and status"
+        )
+        raw = engine._raw_complete(
+            _INTENT_PROMPT.format(agent_catalog=catalog) + msg,
+            max_tokens=max_tokens,
+        )
         blob = _extract_json_object(raw)
         if not blob:
             return "conversational", {}
@@ -95,6 +118,6 @@ def classify_journaler_intent(
         try:
             payload["project_id"] = int(pid)
         except (TypeError, ValueError):
-            payload["project_id"] = None
+            payload["project_id"] = str(pid).strip() or None
 
     return kind, payload

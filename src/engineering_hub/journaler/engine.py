@@ -16,9 +16,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from engineering_hub.memory.service import MemoryResult, MemoryService
+
 if TYPE_CHECKING:
     from corpus.service import CorpusService
 
+from engineering_hub.actions.file_ingest import read_path_content_for_load
 from engineering_hub.core.exceptions import LLMBackendError
 from engineering_hub.journaler.context_manager import (
     ClearStrategy,
@@ -31,13 +34,102 @@ from engineering_hub.journaler.context_manager import (
     estimate_tokens,
     execute_clear,
 )
+from engineering_hub.journaler.session_retrieval import (
+    format_past_session_block,
+    references_past_session,
+    retrieve_past_sessions,
+)
 from engineering_hub.journaler.task_planner_models import TaskPlannerSession
+from engineering_hub.search import (
+    SearchProvider,
+    format_search_results_for_context,
+)
 
 SUPPORTED_EXTENSIONS: frozenset[str] = frozenset(
-    {".md", ".txt", ".org", ".py", ".yaml", ".yml", ".json", ".tex", ".csv", ".toml", ".rst"}
+    {
+        ".md",
+        ".txt",
+        ".org",
+        ".py",
+        ".yaml",
+        ".yml",
+        ".json",
+        ".tex",
+        ".csv",
+        ".toml",
+        ".rst",
+        ".docx",
+    }
 )
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Daily-summary relation helpers
+# ---------------------------------------------------------------------------
+
+def _format_relation_block(
+    hits: list[MemoryResult],
+    *,
+    excerpt_chars: int = 1000,
+) -> str:
+    """Format matched daily-summary hits as a context block for the model.
+
+    The block header is phrased as an explicit instruction so the model
+    calls out the relationship in its response rather than silently using
+    the context.
+    """
+    lines = [
+        "### Related Past Conversation",
+        "_You have found prior Journaler sessions that are semantically related_"
+        " _to the current question.  Begin your response by explicitly noting_"
+        " _the connection — cite the date and shared topic in one sentence before answering._",
+        "",
+    ]
+    for hit in hits:
+        date_str = (hit.created_at or "unknown")[:10]
+        excerpt = hit.content[:excerpt_chars].replace("\n", " ").strip()
+        if len(hit.content) > excerpt_chars:
+            excerpt += "..."
+        lines.append(f"**{date_str}** _{hit.similarity:.0%} match_")
+        lines.append(f"> {excerpt}")
+        lines.append("")
+    return "\n".join(lines)
+
+
+def _write_relation_link(journal_dir: Path, hit: MemoryResult) -> None:
+    """Append a cross-reference link to the current day's journal.
+
+    Creates a ``* Journaler Cross-References`` heading if it does not
+    exist, then appends a dated link so the org file accumulates a
+    lightweight relation graph over time.
+    """
+    from datetime import date as _date
+
+    from engineering_hub.journaler.org_writer import append_to_heading
+
+    today_path = journal_dir / f"{_date.today().isoformat()}.org"
+    if not today_path.exists():
+        return
+
+    related_date = (hit.created_at or "")[:10]
+    excerpt = hit.content[:120].replace("\n", " ").strip()
+    if len(hit.content) > 120:
+        excerpt += "..."
+    link_text = (
+        f"- [[journaler:{related_date}]] Related conversation ({hit.similarity:.0%}): {excerpt}"
+    )
+
+    try:
+        append_to_heading(
+            today_path,
+            "Journaler Cross-References",
+            link_text,
+            create_heading_if_missing=True,
+        )
+    except Exception as exc:
+        logger.warning("Failed to write relation link to journal (non-fatal): %s", exc)
 
 
 @dataclass(frozen=True)
@@ -48,10 +140,10 @@ class LoadFileBudgetConfig:
     :func:`~engineering_hub.journaler.context_manager.estimate_tokens`.
     """
 
-    max_context_fraction: float = 0.40
+    max_context_fraction: float = 0.65
     max_chars_absolute: int = 200_000
     min_chars: int = 1024
-    slack_tokens: int = 256
+    slack_tokens: int = 128
 
     def __post_init__(self) -> None:
         f = self.max_context_fraction
@@ -63,6 +155,16 @@ class LoadFileBudgetConfig:
             raise ValueError("min_chars must be >= 0")
         if self.slack_tokens < 0:
             raise ValueError("slack_tokens must be >= 0")
+
+
+@dataclass(frozen=True)
+class DelegateContextResult:
+    """Context plus retrieval status for a delegated `/agent` task."""
+
+    context: str
+    web_search_attempted: bool = False
+    web_search_succeeded: bool = False
+    web_search_error: str | None = None
 
 
 def _is_model_cached(model_id: str) -> bool:
@@ -333,11 +435,33 @@ class ConversationEngine:
         model_context_window: int = 32768,
         corpus_service: CorpusService | None = None,
         load_file_budget: LoadFileBudgetConfig | None = None,
+        memory_service: MemoryService | None = None,
+        journal_dir: Path | None = None,
+        relation_threshold: float = 0.55,
+        org_link_on_relation: bool = True,
+        web_search_provider: SearchProvider | None = None,
+        web_search_enabled: bool = False,
+        web_search_max_results: int = 5,
+        web_search_max_chars: int = 12_000,
+        web_search_anthropic_backup_enabled: bool = False,
+        web_search_anthropic_tool_version: str = "web_search_20250305",
+        web_search_anthropic_max_uses: int = 3,
     ) -> None:
         self._backend = backend
         self._system_prompt = system_prompt
         self._context_block = ""
         self._corpus_service = corpus_service
+        self._memory_service = memory_service
+        self._journal_dir = journal_dir
+        self._relation_threshold = relation_threshold
+        self._org_link_on_relation = org_link_on_relation
+        self._web_search_provider = web_search_provider
+        self._web_search_enabled = web_search_enabled
+        self._web_search_max_results = max(1, web_search_max_results)
+        self._web_search_max_chars = max(1_000, web_search_max_chars)
+        self._web_search_anthropic_backup_enabled = web_search_anthropic_backup_enabled
+        self._web_search_anthropic_tool_version = web_search_anthropic_tool_version
+        self._web_search_anthropic_max_uses = max(1, web_search_anthropic_max_uses)
         self._loaded_files: dict[str, str] = {}
         self._max_tokens = max_tokens
         self._log_dir = log_dir
@@ -366,6 +490,8 @@ class ConversationEngine:
         self.compressor = ContextCompressor(
             engine_call=self._raw_complete,
             pressure_threshold=cfg.compress_at,
+            keep_recent=cfg.compression_keep_recent,
+            target_summary_tokens=cfg.compression_summary_tokens,
         )
         self.topic_tracker = TopicTracker()
         self.pressure_manager = ContextPressureManager(
@@ -437,6 +563,50 @@ class ConversationEngine:
                     extra_suffix = cs.format_for_context(results)
             except Exception as exc:
                 logger.warning("Journaler corpus RAG failed (non-fatal): %s", exc)
+
+        if references_past_session(message):
+            try:
+                session_hits = retrieve_past_sessions(
+                    message,
+                    state_dir=self._log_dir,
+                    max_results=self._pressure_config.past_session_search_k,
+                    excerpt_chars=self._pressure_config.past_session_excerpt_chars,
+                )
+                session_block = format_past_session_block(session_hits)
+                if session_block:
+                    extra_suffix = (
+                        (extra_suffix + "\n\n" + session_block)
+                        if extra_suffix
+                        else session_block
+                    )
+            except Exception as exc:
+                logger.warning("Journaler past-session retrieval failed: %s", exc)
+
+        # Per-turn relation search: check daily summaries for related past conversations
+        if self._memory_service and message.strip():
+            try:
+                relation_hits = self._memory_service.search(
+                    message,
+                    source="journaler",
+                    threshold=self._relation_threshold,
+                    k=self._pressure_config.conversation_relation_k,
+                )
+                if relation_hits:
+                    relation_block = _format_relation_block(
+                        relation_hits,
+                        excerpt_chars=(
+                            self._pressure_config.conversation_relation_excerpt_chars
+                        ),
+                    )
+                    extra_suffix = (
+                        (extra_suffix + "\n\n" + relation_block)
+                        if extra_suffix
+                        else relation_block
+                    )
+                    if self._org_link_on_relation and self._journal_dir:
+                        _write_relation_link(self._journal_dir, relation_hits[0])
+            except Exception as exc:
+                logger.warning("Journaler relation search failed (non-fatal): %s", exc)
 
         if extra_suffix:
             self.budget.corpus_injection_tokens = estimate_tokens(extra_suffix)
@@ -590,13 +760,33 @@ class ConversationEngine:
             blocks.append(f"### {label}\n```\n{content}\n```")
         return "\n".join(blocks)
 
-    def build_delegate_context(self, task_description: str) -> str:
+    def build_delegate_context(
+        self,
+        task_description: str,
+        *,
+        web_search_enabled: bool | None = None,
+        web_search_required: bool = False,
+    ) -> str:
         """Assemble reference material for delegated agent tasks.
 
         Includes files the user loaded via ``/load`` in this Journaler session,
         plus semantic-search excerpts from ``corpus.db`` when a corpus service
         is configured (same RAG path as chat turns).
         """
+        return self.build_delegate_context_result(
+            task_description,
+            web_search_enabled=web_search_enabled,
+            web_search_required=web_search_required,
+        ).context
+
+    def build_delegate_context_result(
+        self,
+        task_description: str,
+        *,
+        web_search_enabled: bool | None = None,
+        web_search_required: bool = False,
+    ) -> DelegateContextResult:
+        """Assemble delegated task context and report web retrieval status."""
         parts: list[str] = []
         loaded = self._loaded_files_section().strip()
         if loaded:
@@ -625,7 +815,61 @@ class ConversationEngine:
                 )
                 parts.append(cs.format_for_context(results))
 
-        return "\n".join(parts).strip()
+        attempted = False
+        succeeded = False
+        error: str | None = None
+        use_web = self._web_search_enabled if web_search_enabled is None else web_search_enabled
+        if use_web and query:
+            attempted = True
+            provider = self._web_search_provider
+            if provider is None:
+                error = "No local web search provider is configured."
+            else:
+                try:
+                    web_results = provider.search(query, self._web_search_max_results)
+                    if web_results:
+                        parts.append(
+                            "\n"
+                            + format_search_results_for_context(
+                                web_results,
+                                query=query,
+                                max_chars=self._web_search_max_chars,
+                            )
+                        )
+                        succeeded = True
+                    else:
+                        error = "Local web search returned no results."
+                except Exception as exc:
+                    logger.warning("Delegate web search failed (non-fatal): %s", exc)
+                    error = str(exc)
+
+            if error and web_search_required:
+                parts.append(
+                    "\n## Web search unavailable\n\n"
+                    f"The user explicitly requested web search, but local retrieval failed: {error}"
+                )
+
+        return DelegateContextResult(
+            context="\n".join(parts).strip(),
+            web_search_attempted=attempted,
+            web_search_succeeded=succeeded,
+            web_search_error=error,
+        )
+
+    @property
+    def web_search_anthropic_backup_enabled(self) -> bool:
+        """Whether Claude server-side web search may back up failed local search."""
+        return self._web_search_anthropic_backup_enabled
+
+    @property
+    def web_search_anthropic_tool_version(self) -> str:
+        """Anthropic web search tool version for fallback mode."""
+        return self._web_search_anthropic_tool_version
+
+    @property
+    def web_search_anthropic_max_uses(self) -> int:
+        """Maximum Anthropic server-side web search uses in fallback mode."""
+        return self._web_search_anthropic_max_uses
 
     def _sync_loaded_files_budget(self) -> None:
         self.budget.loaded_files_tokens = estimate_tokens(self._loaded_files_section())
@@ -695,9 +939,11 @@ class ConversationEngine:
                 )
 
         try:
-            content = path.read_text(encoding="utf-8", errors="replace")
+            content = read_path_content_for_load(path)
         except OSError as exc:
             return False, f"Could not read {path.name}: {exc}"
+        except Exception as exc:
+            return False, f"Could not load {path.name}: {exc}"
 
         truncated = False
         if len(content) > max_chars:

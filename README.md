@@ -24,6 +24,7 @@ They coexist cleanly: the Orchestrator processes explicit tasks while the Journa
 - **Agent Delegation**: **`journaler chat`** and the daemon’s HTTP `/chat` both use the same setup: an **AgentDelegator**, YAML **skills** summaries injected into the system prompt (personas, when-to-use hints, examples), and **`/agent`** / **`/skills`** slash commands — execution is local MLX or Claude API, selectable per-command via `journaler.agent_backend` and `--backend`
 - **Task planner & overnight queue**: **`/queue`** and **`/tasks`** manage proposals and commits to **`pending-tasks.org`**; **`journaler.default_task_mode`** chooses **immediate** (inline / classifier-driven delegation) vs **propose** (`DISPATCH:` + confirmation). Morning briefings include a short summary of recent queue activity when present
 - **Skills System**: Extensible `skills/` directory of YAML files defines each agent personality's capabilities; drop a new `.yaml` to add a delegation skill without code changes
+- **Report Drafting Pipeline**: `/pipeline draft-section` chains technical-writer → standards-checker (loop-back) → technical-reviewer → latex-writer into a single command; receives pre-computed result tables from external scripts and produces a reviewed LaTeX section artifact — no calculation inside the pipeline
 - **Context Management**: Token-aware conversation history with automatic compression, topic-shift archival, end-of-day reset, and manual `/clear` controls — keeps the local model coherent across a full workday
 - **Org-Roam Write Skill**: Journaler chat can write properly-formatted org-roam files — add TODOs, mark tasks done, append notes to today's journal (`/note`), set a session target on any roam note (`/open`), append under a heading there (`/edit`), search by title (`/find`), and create new nodes — via slash commands
 - **Journaler Export**: CLI `journaler export` reads the persisted chat transcript (`conversation.jsonl`) and writes org-roam-friendly output to **stdout** by default (raw per-turn org, optional MLX **summary + open TODOs**); use `--note`, `--find-title`, `-o`, or `--new-node` for file targets. In **`journaler chat`**, bare **`/export`** writes under **`conversation_exports/`** in the configured org-roam root unless you pass one of those targets.
@@ -140,6 +141,12 @@ engineering-hub journaler export --summarize --note ~/org-roam/my-note.org   # l
 # Pick a named profile or HF id (applies to start, chat, briefing, download, export --summarize)
 engineering-hub journaler --profile reasoning chat
 engineering-hub journaler --model mlx-community/Qwen3-30B-A3B-Instruct-2507-4bit start
+
+# Run the report drafting pipeline for one section (no model needed for gathering)
+engineering-hub journaler pipeline draft-section \
+  --section "6.0 Noise Impacts" --project 42 --backend claude
+engineering-hub journaler pipeline draft-section \
+  --section "3.0 Existing Conditions" --project 42 --loop-limit 3
 ```
 
 `journaler download` uses the same resolution rules as the other subcommands, so run it with `--profile` / `--model` if you want to prefetch a non-default checkpoint.
@@ -173,7 +180,7 @@ In **`journaler chat`**, **`/export`** uses the same export pipeline as the CLI;
 /help                           Show all slash commands
 ```
 
-Supported extensions: `.md`, `.txt`, `.org`, `.py`, `.yaml`, `.yml`, `.json`, `.tex`, `.csv`, `.toml`, `.rst`. Each `/load` is capped from your `journaler.model_context_window`, current conversation/history usage, and optional `journaler.load_*` keys in config (documented under **Journaler → Configuration** below). Oversized files are truncated with a notice. Directory loads share one remaining budget across files (recomputed after each file). Loaded files appear in the model's system prompt on every turn, count toward `/budget` and context pressure, and are cleared when the session ends.
+Supported extensions: `.md`, `.txt`, `.org`, `.py`, `.yaml`, `.yml`, `.json`, `.tex`, `.csv`, `.toml`, `.rst`, `.docx` (converted to markdown for context). Each `/load` is capped from your `journaler.model_context_window`, current conversation/history usage, and optional `journaler.load_*` keys in config (documented under **Journaler → Configuration** below). Oversized files are truncated with a notice. Directory loads share one remaining budget across files (recomputed after each file). Loaded files appear in the model's system prompt on every turn, count toward `/budget` and context pressure, and are cleared when the session ends.
 
 **From the command line** — persist files into the long-term memory store for semantic search:
 
@@ -204,7 +211,7 @@ engineeringhub_controlinterface/
 │   │   ├── task_payload.py     # Serialisation for container payloads
 │   │   ├── task_runner.py      # Entry point that runs inside the container
 │   │   └── resource_limits.py  # Per-container CPU/memory/timeout limits
-│   ├── context/         # Context building and formatting for agents
+│   ├── context/         # Context building, formatting, and DataGatherer for agents
 │   ├── core/            # Data models, exceptions, constants
 │   ├── django/          # Django REST API client and cache
 │   ├── journaler/       # Journaler ambient listener daemon
@@ -226,7 +233,7 @@ engineeringhub_controlinterface/
 │   ├── mcp/             # FastMCP server integration
 │   ├── memory/          # Vector memory (SQLite + Ollama embeddings)
 │   ├── notes/           # Journal/org-roam parsing and task dispatch
-│   └── orchestration/   # Orchestrator, dispatcher, file watcher
+│   └── orchestration/   # Orchestrator, dispatcher, file watcher, AgentPipeline
 ├── config/
 │   └── config.example.yaml
 ├── prompts/             # Agent system prompts (used by Orchestrator and Journaler delegation)
@@ -273,6 +280,8 @@ journaler:
   # journal_lookback_days: 5
   # journal_max_files: 5
   # watch_dirs: []
+  # conversation_lookback_days: 7   # how many past daily summaries appear in the proactive snapshot
+  # org_link_on_relation: true      # write a cross-reference into today's journal on semantic match
   chat_enabled: true
   chat_host: "127.0.0.1"
   chat_port: 18790
@@ -298,7 +307,7 @@ journaler:
     notify_user_on_action: true    # prepend [Context compressed] notes to responses
     end_of_day_time: "00:00"       # daily conversation reset time
     inactivity_clear_minutes: 120  # auto-clear after 2h of silence
-    capture_daily_to_memory: false # write daily summaries to memory.db
+    capture_daily_to_memory: true  # write daily summaries to memory.db (required for relation detection)
     reserved_for_generation: 4096  # tokens held back for model output (≥ journaler.max_tokens)
 
   # Optional — slash /load size limits (see config.example.yaml for defaults)
@@ -383,6 +392,11 @@ curl -X POST http://localhost:18790/chat \
   -H "Content-Type: application/json" \
   -d '{"message": "/agent research IBC 1207.3 requirements --project 42 --backend claude"}'
 
+# Run the report drafting pipeline via the daemon
+curl -X POST http://localhost:18790/chat \
+  -H "Content-Type: application/json" \
+  -d '{"message": "/pipeline draft-section --section \"6.0 Noise Impacts\" --project 42 --backend claude"}'
+
 # Check daemon status
 curl http://localhost:18790/status
 
@@ -400,11 +414,36 @@ curl -X POST http://localhost:18790/chat \
 
 ### Daemon Management (macOS)
 
-The simplest approach is tmux:
+#### Using `tmux` (recommended for development and quick restarts)
 
+[`tmux`](https://github.com/tmux/tmux/wiki) is a terminal multiplexer that lets you run long-lived processes in the background, reattach to them later, and keep them running if your terminal closes (without needing to deal with full system startup scripts).
+
+Here's how you can manage the Journaler daemon with `tmux`:
+
+**Start the Journaler in a new tmux session:**
 ```bash
 tmux new-session -d -s journaler 'engineering-hub journaler start'
 ```
+- `-d` starts it detached (in the background).
+- `-s journaler` names the tmux session for easy reference.
+
+**Reattach to the tmux session to see logs or interact:**
+```bash
+tmux attach-session -t journaler
+```
+
+**Detach and leave it running:**  
+Press `Ctrl+b`, then `d` (this sends you back to your regular terminal, leaving the journaler running).
+
+**See all running tmux sessions:**
+```bash
+tmux ls
+```
+
+**Stopping the Journaler:**
+1. Reattach (`tmux attach-session -t journaler`)
+2. Press `Ctrl+C` to stop the command, then close the session with `exit`
+3. Or kill it directly: `tmux kill-session -t journaler`
 
 For always-on operation, use a launchd plist at `~/Library/LaunchAgents/com.engineeringhub.journaler.plist` with `KeepAlive` and `RunAtLoad` set to true.
 
@@ -420,6 +459,30 @@ The Journaler runs all day, and a 32B model's context window fills up over hours
 | **Topic-aware clear** | Topic shift detected (3 consecutive on-topic messages) | Archives the old topic, starts fresh with the new one |
 | **End-of-day reset** | Scheduled (default midnight) | Compresses the full day, saves to `daily_summaries/YYYY-MM-DD.md`, resets history |
 | **Manual clear** | `/clear` command | User-controlled: soft, compress-then-clear, or full reset |
+
+### Daily Summary Context Loop
+
+The daily summaries written at midnight feed back into every future session through two complementary paths:
+
+**Proactive path — snapshot injection (every 10-min tick)**
+
+The last `conversation_lookback_days` (default: 7) summaries from `daily_summaries/` are always included in the system prompt under `### Recent Conversation Summaries`. The model sees a temporal narrative of past sessions at all times — no embeddings required, zero latency.
+
+**Reactive path — per-turn semantic match**
+
+On every chat turn, the user's message is semantically searched against embedded daily summaries in the memory database (`source="journaler"`). When a match exceeds `conversation_relation_threshold` (default: 0.70), the matched summary is injected as a `### Related Past Conversation` block and the model is explicitly instructed to call out the relationship:
+
+```
+This relates to the April 15 conversation where we discussed [topic]...
+```
+
+If `org_link_on_relation: true` (default), a cross-reference link is automatically appended to today's journal under a `* Journaler Cross-References` heading, building a lightweight relation graph over time.
+
+**Morning briefing — Continuing Threads**
+
+The morning briefing gains a `### Continuing Threads` section: recurring topics from the org scan are cross-referenced against the memory database, surfacing past conversations that overlap with today's themes.
+
+> **Prerequisite:** The reactive path and briefing threads require `MemoryService` (Ollama running locally) and `capture_daily_to_memory: true` (now the default). The proactive file-based path works without embeddings.
 
 When the engine takes an automatic action (compression, topic shift), a bracketed note is prepended to the model's response:
 
@@ -477,6 +540,7 @@ While in `engineering-hub journaler chat`, any input starting with `/` is handle
 | Command | Description |
 | --- | --- |
 | `/agent <type> <desc> [--project <id>] [--backend mlx\|claude]` | Delegate a task to a named agent and get the result inline. Types: `research`, `technical-writer`, `standards-checker`, `technical-reviewer`, `weekly-reviewer`, `latex-writer` |
+| `/pipeline draft-section --section "<section>" [--project <id>] [--backend mlx\|claude] [--loop-limit <n>]` | Run the multi-stage report drafting pipeline — gathers pre-computed result files, drafts prose, audits compliance, reviews tone, and emits LaTeX; see [Report Drafting Pipeline](#report-drafting-pipeline) |
 | `/agent_browse` | Interactive skill picker — arrow keys to browse agents, Enter to select, then type a task description |
 | `/skills` | List all available agent delegation skills with descriptions and examples |
 | `/tasks` | Show session queue proposals, or use `/tasks confirm`, `/tasks commit`, `/tasks reject N`, `/tasks edit N <text>`, `/tasks clear`, `/tasks rollback [N \| --all]` |
@@ -526,7 +590,7 @@ The Journaler can delegate tasks directly to any named agent personality and ret
 #### The `/agent` command
 
 ```text
-/agent <type> <description> [--project <id>] [--backend mlx|claude]
+/agent <type> <description> [--project <id>] [--backend mlx|claude] [--web|--no-web]
 ```
 
 | Argument | Description |
@@ -536,8 +600,12 @@ The Journaler can delegate tasks directly to any named agent personality and ret
 | `--project <id>` | Optional Django project ID (stored on the task; does **not** load Orchestrator-style Django + PDF corpus into the delegated prompt — use journal `@agent:` + `[[django://project/id]]` for that) |
 | `--backend mlx` | Use the local MLX model (reuses the Journaler's loaded model — no extra RAM) |
 | `--backend claude` | Use the Claude API (requires `journaler.anthropic_api_key` or global `anthropic.api_key` / env) |
+| `--web` | Query the configured local web search provider (SearXNG by default) and inject bounded results into the delegated prompt |
+| `--no-web` | Disable web search for this invocation, even when `agent_web_search.enabled` is true |
 
 The default backend is controlled by `journaler.agent_backend` in config (`"mlx"` uses the local model; set `"auto"` if you want Claude when a key is present, otherwise MLX). The `--backend` flag overrides this per-command.
+
+Web search is local-first. The host process queries SearXNG, formats titles, URLs, snippets, and metadata as a `## Web search results (SearXNG)` context block, then the selected agent backend synthesizes from that block. With `--backend mlx --web`, reasoning stays on the resident MLX model; SearXNG only supplies retrieved snippets. If local search fails, `--web` stops the command unless `agent_web_search.anthropic_backup_enabled` is true and the selected backend resolves to Claude, in which case Anthropic server-side web search may be used as a fallback.
 
 For **draft reports, protocols, executive summaries, and other client-facing Markdown deliverables**, use the **`technical-writer`** persona. The default Journaler system prompt and workspace layout describe **available agents**, **immediate vs queue** behavior, and practical routes: **`/agent technical-writer …`**, natural-language delegation in **immediate** mode, queue **`/task`** / journal lines with `@technical-writer:`, **`/queue`** + **`/tasks commit`** for **`pending-tasks.org`**, optional **`--project <id>`** for Django context, and **`/skills`** for full persona text. Delegated technical-writer runs use `prompts/technical-writer.txt`; saved artifacts often land under **`outputs/docs/`**.
 
@@ -545,6 +613,8 @@ For **draft reports, protocols, executive summaries, and other client-facing Mar
 
 ```text
 /agent research IBC 1207.3 occupant comfort requirements --project 42
+/agent research Find current FAA guidance on vertiport noise --backend mlx --web
+/agent research Search current ASTM updates for E336 --web
 /agent technical-writer draft executive summary for noise assessment --project 25 --backend claude
 /agent standards-checker audit ASTM citations in draft report --backend mlx
 /agent weekly-reviewer summarize this week's work and open loops
@@ -673,6 +743,90 @@ If `template_file` points to a `.tex` file in `latex-templates/` (e.g. `template
 
 Outputs land under `outputs/latex/` with a `.tex` extension. If `pdflatex` is on your `$PATH`, compilation is attempted automatically and a one-line validation summary is appended to the agent response.
 
+### Report Drafting Pipeline
+
+The `/pipeline draft-section` command chains four specialized agents into a single automated workflow for drafting a section of a technical consulting report. All numeric calculations (dB levels, compliance margins, measurement averages) are performed by **external Python scripts or simulators before the pipeline is invoked**. The pipeline receives only finalized result tables and produces prose.
+
+#### Scope boundary
+
+| Responsibility | Owner |
+| --- | --- |
+| Field measurements, Leq/L90/L10 averages | External Python scripts |
+| CadnaA / simulation model output | External simulator |
+| dB calculations, compliance pass/fail math | External Python scripts |
+| Collecting and routing finalized tables | `DataGatherer` (`context/data_gatherer.py`) |
+| Drafting prose + flagging relevant metrics | `technical-writer` persona |
+| Auditing prose claims against standard limits | `standards-checker` persona |
+| Reviewing for professional tone | `technical-reviewer` persona |
+| Final LaTeX formatting | `latex-writer` persona |
+
+#### How it works
+
+1. **Gather** — `DataGatherer` scans `outputs/staging/project-{id}/` (files produced by `engineering-hub load` / ingest) and classifies them by keyword heuristic: regulatory criteria (HDOH, FAA, zoning limits), simulation output (CadnaA, predicted levels), equipment specs (SWL, manufacturer data), and field measurement results (Leq, L90, ambient). Files are read verbatim — no arithmetic.
+2. **Draft** — `technical-writer` receives the classified data bundle and drafts prose for the named section. It identifies which metrics are most relevant to the project's compliance goal but does not compute or modify any numeric values.
+3. **Audit (with loop-back)** — `standards-checker` audits the draft against the applicable regulatory limits. If it finds `NON-COMPLIANT` items, it returns specific corrections and the pipeline loops back to the writer with those audit notes (bounded by `--loop-limit`, default 2 retries). If compliance cannot be achieved within the retry limit, a `PIPELINE_FAILED_*.md` artifact is written under `outputs/pipeline/` for manual review.
+4. **Review** — `technical-reviewer` checks the compliant draft for professional tone, appropriate hedging language, and defensibility.
+5. **Format** — `latex-writer` renders the reviewed prose as a LaTeX section with proper `tabular` environments, column headers, and footnotes.
+
+The final artifact is written to `outputs/pipeline/pipeline_<slug>_<timestamp>.md` (Markdown intermediate) or `.tex` (after the LaTeX stage).
+
+#### Slash command
+
+```text
+/pipeline draft-section --section "6.0 Noise Impacts" --project 42
+/pipeline draft-section --section "3.0 Existing Conditions" --project 42 --backend claude --loop-limit 3
+```
+
+| Flag | Description |
+| --- | --- |
+| `--section "<label>"` | Report section identifier (required) |
+| `--project <id>` | Django project ID for staging directory lookup |
+| `--backend mlx\|claude` | Agent backend for all stages (default: `auto`) |
+| `--loop-limit <n>` | Maximum standards-checker retries (default: 2) |
+
+When no live delegator is configured (no API key, no MLX model loaded), the command queues a `@pipeline:` TODO to `pending-tasks.org` for the Orchestrator to pick up.
+
+#### CLI command
+
+```bash
+engineering-hub journaler pipeline draft-section \
+  --section "6.0 Noise Impacts" --project 42 --backend claude
+
+engineering-hub journaler pipeline draft-section \
+  --section "3.0 Existing Conditions" --project 42 --loop-limit 3
+```
+
+#### Preparing data files
+
+Place pre-computed result files in the project's staging directory before running the pipeline:
+
+```bash
+# Ingest a file so it appears in outputs/staging/project-42/
+engineering-hub load path/to/cadnaa_results.csv --project 42
+
+# Or copy files directly (CSV, Markdown, plain text, .tex)
+cp results/ambient_summary.csv outputs/staging/project-42/
+cp results/hdoh_criteria.md outputs/staging/project-42/
+```
+
+`DataGatherer` classifies files on the following first-match keyword order (most specific first):
+
+| Category | Example keywords |
+| --- | --- |
+| `regulatory` | `HDOH`, `FAA`, `ASHRAE`, `zoning`, `noise limit`, `dB limit`, `Class B` |
+| `simulation_output` | `CadnaA`, `predicted`, `propagation`, `receiver`, `noise map` |
+| `equipment_specs` | `SWL`, `sound power`, `manufacturer`, `HVAC`, `RTU`, `datasheet` |
+| `field_results` | `Leq`, `L90`, `L10`, `ambient`, `monitoring`, `dBA`, `octave band` |
+| `unclassified` | anything else |
+
+#### Diagnostic tasks
+
+The `diagnostics/context_pipeline_tasks.yaml` includes five pipeline-specific tasks that exercise each stage in isolation — including a deliberate `NON-COMPLIANT` standards-checker case to verify the loop-back path. Run with:
+
+```bash
+engineering-hub diagnostic context-pipeline --dry-run-context-only -v
+```
+
 ### Org-Roam Write Skill
 
 The Journaler's system prompt is enriched when the engine starts with a `## Workspace Layout` block that tells the model:
@@ -716,22 +870,23 @@ corpus:
 
 See [config/config.example.yaml](config/config.example.yaml) for the full commented block.
 
-#### How retrieval is wired (two paths)
+#### How retrieval is wired
 
 | Path | When it runs | Query text | Where chunks appear |
 | --- | --- | --- | --- |
 | **Journaler chat** (`journaler start` HTTP `/chat`, **`journaler chat`**) | Every normal user turn (not slash commands) | The **entire user message** is embedded and searched | Appended to the **system** prompt for that turn only (`ConversationEngine.chat`) |
+| **Inline `/agent` delegation** | Each `/agent` run when `corpus.enabled` is true and the corpus is available | The delegated task description | Added to the delegated `AgentWorker` context before the task block |
 | **Orchestrator agents** (`engineering-hub start`, `run-once`) | Each dispatched `@agent:` task after Django context is loaded | **`task.description`** plus optional **`task.context`** | Concatenated into the formatted context string after the memory block (`ContextManager` → `ContextFormatter`) |
 
-**Not covered by these paths:** morning **`journaler briefing`**, **`journaler export --summarize`** (single-shot completion), and **`/agent`** delegation (see below).
+**Not covered by these paths:** morning **`journaler briefing`** and **`journaler export --summarize`** (single-shot completion).
 
 #### `/agent` delegation and corpus
 
-Inline **`/agent`** uses `AgentWorker` with an **empty** formatted project context string. That means **no** Django block and **no** PDF corpus block inside the delegated call, even if you pass **`--project`**. The `--project` flag is still stored on the task (for output paths and future use), but it does not trigger `ContextManager.format_for_agent` today.
+Inline **`/agent`** now receives Journaler-loaded files and task-matched PDF corpus excerpts in its delegated context. The `--project` flag is still stored on the task (for output paths and future use), but it does not trigger full Orchestrator-style Django context via `ContextManager.format_for_agent`.
 
 **Practical implications:**
 
-- For **PDF RAG + persona in one shot**, ask in **plain chat** first (corpus injects automatically), then optionally **`/agent`** for structured output if the answer already sits in the visible thread.
+- For **PDF RAG + persona in one shot**, use **`/agent`** directly; the delegated task description is searched against the corpus.
 - For **Django + PDF RAG + agent prompt**, queue an **`@agent:`** line in the journal with **`[[django://project/<id>]]`** so the **Orchestrator** builds full context.
 
 #### Best practices
@@ -961,6 +1116,8 @@ See [config/config.example.yaml](config/config.example.yaml) for all available o
 - `journaler.scan_org_roam_tree` - When false, scan only `journal.org_journal_dir` and `journaler.watch_dirs` (default: true)
 - `journaler.watch_dirs` - Extra org directories to include in scans
 - `journaler.journal_lookback_days` / `journaler.journal_max_files` - Window for parsing daily journals (defaults: 5 / 5)
+- `journaler.conversation_lookback_days` - Number of past daily conversation summaries included in the proactive context snapshot every tick (default: 7; independent of `journal_lookback_days`)
+- `journaler.org_link_on_relation` - When true, write a cross-reference link into today's journal whenever a related past conversation is detected via semantic search (default: true)
 - `journaler.model_profile` - Name of the active entry in `journaler.models` (when the map is non-empty)
 - `journaler.models` - Optional map of named MLX profiles (`model_path`, `model_context_window`, sampling, `mlx_backend`, `enable_thinking`)
 - `journaler.model_context_window` - Context window for pressure math when not using per-profile values (default: 32768)
@@ -972,6 +1129,11 @@ See [config/config.example.yaml](config/config.example.yaml) for all available o
 - `corpus.enabled` - Enable PDF reference corpus RAG (requires `libraryfiles-corpus` and `corpus.db`)
 - `corpus.db_path` - Path to `corpus.db` from libraryfiles-corpus ingest
 - `corpus.search_k` / `corpus.threshold` - Max chunks and minimum similarity for corpus hits (defaults: 5 / 0.40)
+- `agent_web_search.enabled` - Enable local-first web result injection for `/agent` by default (default: false; `--web` forces it per command)
+- `agent_web_search.provider` - Web search provider for `/agent`; currently `searxng`
+- `agent_web_search.searxng_url` - Base URL for the SearXNG instance (default: `http://localhost:8080`)
+- `agent_web_search.max_results` / `agent_web_search.max_chars` - Result count and formatted context cap (defaults: 5 / 12000)
+- `agent_web_search.anthropic_backup_enabled` - Allow Claude server-side web search fallback when local search fails and the backend is Claude (default: false)
 - `diagnostics.context_pipeline.enabled` - Persist formatted context + results for each Orchestrator task under `outputs/diagnostics/context-pipeline/<run_id>/` (default: false)
 - `diagnostics.context_pipeline.context_audit_prompt` - Append temporary CONTEXT AUDIT block to agent system prompts (default: false); env: `ENGINEERING_HUB_DIAGNOSTIC_CONTEXT_AUDIT_PROMPT`
 - `diagnostics.context_pipeline.debug_context_max_chars` - Truncation cap for the extra DEBUG log of formatted context when diagnostics are enabled (default: 50000)

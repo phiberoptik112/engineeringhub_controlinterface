@@ -36,6 +36,12 @@ COMMAND_CATALOG: list[CommandEntry] = [
     CommandEntry("/find", "<title fragment>", "Search org-roam files by title", "File Ops"),
     # Agent Delegation
     CommandEntry("/agent", "<type> <description>", "Delegate to an agent persona", "Agent Delegation"),
+    CommandEntry(
+        "/pipeline",
+        'draft-section --section "<section>" [--project <id>] [--backend mlx|claude] [--loop-limit <n>]',
+        "Run multi-stage report drafting pipeline (writer→checker→reviewer→latex)",
+        "Agent Delegation",
+    ),
     CommandEntry("/tasks", "[confirm|commit|rollback|…]", "Overnight task queue (pending-tasks.org)", "Agent Delegation"),
     CommandEntry("/queue", "<description>", "Propose a task for the overnight queue", "Agent Delegation"),
     CommandEntry("/skills", "", "List available agent personas", "Agent Delegation"),

@@ -9,10 +9,10 @@ from engineering_hub.agents.backends import AnthropicBackend, LLMBackend
 from engineering_hub.agents.prompts import PromptLoader
 from engineering_hub.agents.registry import AgentRegistry
 from engineering_hub.agents.style_loader import LatexStyle, StyleLoader
-from engineering_hub.diagnostics.prompt_addendum import DIAGNOSTIC_CONTEXT_AUDIT_ADDENDUM
 from engineering_hub.core.constants import AgentType
 from engineering_hub.core.exceptions import AgentExecutionError, LLMBackendError
 from engineering_hub.core.models import ParsedTask, TaskResult
+from engineering_hub.diagnostics.prompt_addendum import DIAGNOSTIC_CONTEXT_AUDIT_ADDENDUM
 
 logger = logging.getLogger(__name__)
 
@@ -75,6 +75,18 @@ class AgentWorker:
         Returns:
             TaskResult with success status and outputs
         """
+        return self.execute_with_options(task, context)
+
+    def execute_with_options(
+        self,
+        task: ParsedTask,
+        context: str,
+        *,
+        anthropic_web_search: bool = False,
+        anthropic_web_search_tool_version: str = "web_search_20250305",
+        anthropic_web_search_max_uses: int = 3,
+    ) -> TaskResult:
+        """Execute a task with optional backend-specific execution options."""
         agent_type = task.agent_type
 
         if not self._registry.is_enabled(agent_type):
@@ -107,7 +119,17 @@ class AgentWorker:
             )
 
             logger.info(f"Executing {agent_type.value} agent for task: {task.description[:50]}...")
-            response = self._backend.complete(system_prompt, user_message, self.max_tokens)
+            if anthropic_web_search and isinstance(self._backend, AnthropicBackend):
+                logger.info("Using Anthropic server-side web search fallback for agent task")
+                response = self._backend.complete_with_web_search(
+                    system_prompt,
+                    user_message,
+                    self.max_tokens,
+                    tool_version=anthropic_web_search_tool_version,
+                    max_uses=anthropic_web_search_max_uses,
+                )
+            else:
+                response = self._backend.complete(system_prompt, user_message, self.max_tokens)
 
             output_path = self._write_output(task, response)
 
@@ -225,7 +247,7 @@ class AgentWorker:
         appended as a clearly labelled override block so the agent still sees it.
         """
         override_lines = [
-            f"<preamble_template>",
+            "<preamble_template>",
             f"% STYLE OVERRIDE: {style.display_name}",
             style.preamble_tex,
             "</preamble_template>",
@@ -234,7 +256,8 @@ class AgentWorker:
             override_lines += [
                 "",
                 "<section_structure_hint>",
-                "SECTION STRUCTURE HINT — apply in preference to the default output_format skeleton:",
+                "SECTION STRUCTURE HINT — apply in preference to the default "
+                "output_format skeleton:",
                 style.section_structure.strip(),
                 "</section_structure_hint>",
             ]
@@ -291,7 +314,8 @@ class AgentWorker:
                 [
                     "",
                     "Please complete this task based on the project context above.",
-                    "Output raw LaTeX source only — no markdown fences, no prose outside the document.",
+                    "Output raw LaTeX source only — no markdown fences, "
+                    "no prose outside the document.",
                 ]
             )
         else:

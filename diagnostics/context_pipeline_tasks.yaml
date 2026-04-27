@@ -36,3 +36,235 @@ tasks:
     description: "Recommend mitigation options for HVAC noise in open-plan offices given the project client and status."
     project_id: 1
     context: "Assume budget-sensitive options first."
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # Additional iterations for expanded agent coverage and edge-case testing
+  # ─────────────────────────────────────────────────────────────────────────────
+
+  # LATEX-WRITER: Tests template injection and structured document generation
+  - agent: latex-writer
+    description: "Generate a LaTeX table summarizing STC test results for three partition types with footnotes citing ASTM E90."
+    project_id: 1
+    deliverable: "outputs/docs/diagnostic-stc-results-table.tex"
+
+  - agent: latex-writer
+    description: "Draft a LaTeX appendix section listing all applicable standards from the project scope with edition dates."
+    project_id: 1
+    context: "Use tabular format with columns: Standard ID, Title, Edition, Applicability."
+
+  # WEEKLY-REVIEWER: Tests synthesis across multiple completed tasks
+  - agent: weekly-reviewer
+    description: "Summarize progress on acoustic testing deliverables from the past week and flag any blocked items."
+    project_id: 1
+
+  - agent: weekly-reviewer
+    description: "Identify recurring themes or technical questions across recent research tasks for this project."
+    project_id: 1
+    context: "Focus on standards interpretation issues."
+
+  # PANNING-FOR-GOLD: Tests large document synthesis and insight extraction
+  - agent: panning-for-gold
+    description: "Extract the three most actionable recommendations from the project's technical documentation set."
+    project_id: 1
+    context: "Prioritize recommendations that affect schedule or budget."
+
+  - agent: panning-for-gold
+    description: "Identify conflicting guidance between referenced standards in the project corpus."
+    project_id: 1
+
+  # TECHNICAL-WRITER: Additional edge cases for template/deliverable handling
+  - agent: technical-writer
+    description: "Draft an executive summary for a noise impact assessment referencing project scope and client requirements."
+    project_id: 1
+    deliverable: "outputs/docs/diagnostic-exec-summary.md"
+    context: "Keep under 500 words; emphasize compliance status."
+
+  - agent: technical-writer
+    description: "Create a measurement protocol checklist for ASTM E1007-16 impact sound testing."
+    project_id: none
+    deliverable: "outputs/docs/diagnostic-e1007-checklist.md"
+
+  # STANDARDS-CHECKER: Cross-standard conflict detection
+  - agent: standards-checker
+    description: "Identify any conflicts between ASTM E336-17a and ISO 16283-1 measurement procedures in the project context."
+    project_id: 1
+    context: "Note where simultaneous compliance is not possible."
+
+  - agent: standards-checker
+    description: "Verify that all referenced standards in the scope have current (non-withdrawn) editions."
+    project_id: 1
+
+  # TECHNICAL-REVIEWER: Input file edge cases and cross-referencing
+  - agent: technical-reviewer
+    description: "Review the project proposal for completeness against the final scope; note any missing deliverables."
+    project_id: 1
+
+  - agent: technical-reviewer
+    description: "Check that all claims in the draft report have traceable sources in the project file set."
+    project_id: 1
+    context: "Flag any unsourced numerical values."
+
+  # RESEARCH: Multi-project context (different project_id to test isolation)
+  - agent: research
+    description: "Summarize typical NRC rating requirements for ceiling tiles in healthcare facilities."
+    project_id: 2
+    context: "Reference FGI Guidelines if applicable."
+
+  - agent: research
+    description: "What are the measurement uncertainty requirements in ASTM E336-17a Section 11?"
+    project_id: none
+    context: "Include both Type A and Type B uncertainty considerations."
+
+  # Edge case: Minimal context with complex deliverable
+  - agent: technical-writer
+    description: "Draft a generic vibration isolation specification for rooftop HVAC equipment."
+    project_id: none
+    deliverable: "outputs/docs/diagnostic-generic-vibration-spec.md"
+    context: "Assume no project-specific constraints; write for general applicability."
+
+  # Edge case: Standards-checker without project context
+  - agent: standards-checker
+    description: "List the mandatory test conditions specified in ASTM E90-09 Section 8."
+    project_id: none
+
+  # Edge case: Research with corpus-heavy expectations
+  - agent: research
+    description: "Synthesize findings from available PDF references regarding flanking transmission paths in wood-frame construction."
+    project_id: 1
+    context: "Cite specific sections from corpus documents if available."
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # PIPELINE STAGES: Simulate the multi-stage drafting pipeline
+  # Each task exercises one stage in isolation with pre-computed tabular context.
+  # All numeric values in the context below are pre-computed by external scripts;
+  # the agents must not derive or modify any numbers.
+  # ─────────────────────────────────────────────────────────────────────────────
+
+  # Stage 1 — TECHNICAL-WRITER: Draft prose from pre-computed result tables
+  - agent: technical-writer
+    description: >
+      Draft section '6.0 Potential Noise Impacts' using the pre-computed result tables
+      provided in the context below. Identify which metrics are most relevant to the
+      project compliance goal and highlight them in the prose. Do not compute, modify,
+      or derive any numeric values — use the numbers exactly as supplied.
+    project_id: 1
+    deliverable: "outputs/docs/diagnostic-pipeline-tw-draft.md"
+    context: |
+      ## Pre-Processed Data Bundle — 6.0 Potential Noise Impacts
+
+      > All numeric values below were produced by external Python scripts or simulators.
+      > Do not compute, modify, or derive additional numbers from this data.
+
+      ### Field Measurement Results: `ambient_summary.csv`
+
+      ```
+      Period,Leq_dBA,L90_dBA,L10_dBA,Duration_hr
+      Daytime (7am-10pm),52.3,44.1,61.8,15
+      Nighttime (10pm-7am),43.7,38.2,50.4,9
+      ```
+
+      ### Simulation Output: `cadnaa_receiver_predictions.csv`
+
+      ```
+      Receiver,Distance_m,Predicted_Leq_dBA,Condition
+      R1 (North facade),18,54.1,Project operational
+      R2 (East facade),32,49.6,Project operational
+      R3 (South facade),45,46.3,Project operational
+      ```
+
+      ### Equipment Specifications: `hvac_equipment_specs.md`
+
+      ```
+      Equipment: Mitsubishi CITY MULTI PUHY-P250YJM-A
+      Sound Power Level (SWL): 78 dBA re 1 pW
+      Operating mode: Cooling
+      ```
+
+      ### Regulatory Criteria: `hdoh_noise_limits.md`
+
+      ```
+      Hawaii DOH HAR 11-46: Class B Residential
+      Daytime limit (7am-10pm): 60 dBA Leq
+      Nighttime limit (10pm-7am): 50 dBA Leq
+      ```
+
+  # Stage 2 — STANDARDS-CHECKER: Audit a draft for regulatory compliance
+  - agent: standards-checker
+    description: >
+      Audit the following draft of section '6.0 Potential Noise Impacts' for compliance
+      with HDOH HAR 11-46 Class B limits (60 dBA day / 50 dBA night). For each claim,
+      state whether it is COMPLIANT or NON-COMPLIANT and cite the relevant limit.
+      If any items are NON-COMPLIANT, list specific corrections required.
+    project_id: 1
+    context: |
+      ## Draft — Section 6.0 Potential Noise Impacts
+
+      Ambient noise levels at the project site range from 43.7 dBA Leq (nighttime)
+      to 52.3 dBA Leq (daytime), consistent with a Class B residential environment.
+      Acoustic modeling predicts that rooftop HVAC equipment will contribute 54.1 dBA
+      at the closest north facade receiver (R1, 18 m). This is below the HDOH daytime
+      limit of 60 dBA Leq. The nighttime prediction at R2 (49.6 dBA) remains below
+      the 50 dBA nighttime limit.
+
+  # Stage 2b — STANDARDS-CHECKER: Loop-back scenario (NON-COMPLIANT case)
+  - agent: standards-checker
+    description: >
+      Audit the following draft of section '6.0 Potential Noise Impacts' for compliance
+      with HDOH HAR 11-46 Class B limits. For each claim, state whether it is COMPLIANT
+      or NON-COMPLIANT. Flag any unsourced numerical values.
+    project_id: 1
+    context: |
+      ## Draft — Section 6.0 Potential Noise Impacts (with error for loop-back test)
+
+      Ambient noise levels at the project site are approximately 52 dBA during daytime
+      hours. The proposed HVAC equipment is expected to produce noise levels of around
+      65 dBA at the property line, which we believe is acceptable under local ordinance.
+
+      NOTE: This draft intentionally contains a NON-COMPLIANT claim (65 dBA > 60 dBA limit)
+      and an unsourced assertion to exercise the standards-checker loop-back path.
+
+  # Stage 3 — TECHNICAL-REVIEWER: Review a compliant draft for tone and defensibility
+  - agent: technical-reviewer
+    description: >
+      Review the following compliant draft of section '6.0 Potential Noise Impacts' for
+      professional tone, clarity, and defensibility. The section has already been audited
+      for standards compliance. Focus on narrative quality, appropriate hedging language,
+      and whether conclusions are clearly supported by the data presented.
+    project_id: 1
+    context: |
+      ## Section 6.0 Potential Noise Impacts (Compliant Draft)
+
+      Ambient noise levels at the project site range from 43.7 dBA Leq (nighttime) to
+      52.3 dBA Leq (daytime), consistent with a Class B residential acoustic environment
+      per HDOH HAR 11-46. Acoustic modeling (CadnaA) predicts that the proposed rooftop
+      HVAC equipment (Mitsubishi PUHY-P250YJM-A, SWL 78 dBA) will contribute 54.1 dBA Leq
+      at the nearest north facade receiver (R1) at 18 m separation. This level is 5.9 dBA
+      below the applicable daytime limit of 60 dBA Leq. Nighttime predictions at all
+      receivers remain below the 50 dBA Leq nighttime criterion. On this basis, the
+      proposed equipment is expected to comply with HDOH HAR 11-46 Class B noise limits.
+
+  # Stage 4 — LATEX-WRITER: Format the reviewed section as LaTeX
+  - agent: latex-writer
+    description: >
+      Format the following reviewed draft of section '6.0 Potential Noise Impacts' as
+      LaTeX. Present the result tables as proper LaTeX tabular environments with
+      appropriate column headers and footnotes. Wrap prose in the correct sectioning
+      commands. Do not add or modify any numeric values.
+    project_id: 1
+    deliverable: "outputs/docs/diagnostic-pipeline-section-6.tex"
+    context: |
+      ## Section 6.0 Potential Noise Impacts (Reviewed Draft)
+
+      Ambient noise levels at the project site range from 43.7 dBA Leq (nighttime) to
+      52.3 dBA Leq (daytime), consistent with a Class B residential acoustic environment
+      per HDOH HAR 11-46.
+
+      Receptor predictions (CadnaA):
+      | Receiver | Distance (m) | Predicted Leq (dBA) | HDOH Limit (dBA) | Result |
+      |---|---|---|---|---|
+      | R1 North facade | 18 | 54.1 | 60 (day) | COMPLIANT |
+      | R2 East facade | 32 | 49.6 | 50 (night) | COMPLIANT |
+      | R3 South facade | 45 | 46.3 | 50 (night) | COMPLIANT |
+
+      The proposed Mitsubishi PUHY-P250YJM-A rooftop HVAC equipment (SWL 78 dBA)
+      is expected to comply with HDOH HAR 11-46 Class B noise limits at all receptors.

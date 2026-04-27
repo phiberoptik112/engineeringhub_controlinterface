@@ -154,6 +154,25 @@ memory:
 #   search_k: 5
 #   threshold: 0.40
 
+# ── Local-first web search for /agent ─────────────────────────────
+# Uses a local/self-hosted SearXNG instance to retrieve web snippets, then
+# injects bounded results into delegated /agent context. MLX still performs
+# the reasoning; SearXNG only supplies current web references.
+#
+# Example SearXNG query endpoint:
+#   http://localhost:8080/search?q=ASTM%20E336&format=json
+#
+# agent_web_search:
+#   enabled: false          # default off; use /agent ... --web per command
+#   provider: "searxng"
+#   searxng_url: "http://localhost:8080"
+#   max_results: 5
+#   max_chars: 12000
+#   timeout_seconds: 10.0
+#   anthropic_backup_enabled: false   # optional Claude fallback if local search fails
+#   anthropic_tool_version: "web_search_20250305"
+#   anthropic_max_uses: 3
+
 # ── Document ingest chunking ─────────────────────────────────────
 # When files are ingested (PDF/DOCX), they are chunked and embedded
 # into memory for semantic search. Requires the docling extra:
@@ -262,7 +281,7 @@ chunking:
 #   slack_webhook_url: ""        # or set JOURNALER_SLACK_WEBHOOK env var
 #
 #   # Conversation settings
-#   max_conversation_history: 20 # turns kept in memory
+#   max_conversation_history: 40 # turns kept in memory
 #   max_tokens: 4096
 #
 #   # Sampling parameters (defaults shown)
@@ -274,21 +293,21 @@ chunking:
 #   # Slash /load: how much of the *remaining* context (after system, snapshot,
 #   # history, reserved output, slack) may go to each file chunk. Uses the same
 #   # len//3 token estimate as the pressure manager.
-#   # load_max_context_fraction: 0.40   # (0, 1]; fraction of remaining tokens
+#   # load_max_context_fraction: 0.65   # (0, 1]; fraction of remaining tokens
 #   # load_max_chars_absolute: 200000  # hard cap per file
 #   # load_min_chars: 1024            # aim for at least this many chars when headroom allows
-#   # load_slack_tokens: 256          # extra margin subtracted from headroom
+#   # load_slack_tokens: 128          # extra margin subtracted from headroom
 #
 #   # ── Context management ─────────────────────────────────────────
 #   # Controls how the daemon manages its finite context window over
 #   # a full workday of conversation.  All values below are defaults.
 #   context_management:
 #     # Fraction of context window used before compression triggers (0.0–1.0)
-#     compress_at: 0.70
+#     compress_at: 0.85
 #     # Fraction at which emergency trim fires if compression isn't enough
-#     emergency_trim_at: 0.90
+#     emergency_trim_at: 0.95
 #     # Automatically archive old topic context when conversation topic shifts
-#     auto_clear_on_topic_shift: true
+#     auto_clear_on_topic_shift: false
 #     # Prepend a bracketed note when the engine takes an automatic action
 #     notify_user_on_action: true
 #     # Time (HH:MM local) to run the end-of-day conversation clear
@@ -302,8 +321,16 @@ chunking:
 #     # Override model_context_window here if different from the top-level setting
 #     # model_context_window: 32768
 #     # Rolling window limits (also controlled by max_conversation_history above)
-#     # max_history_turns: 20
-#     # max_history_tokens: 10000
+#     # max_history_turns: 40
+#     # max_history_tokens: 20000
+#     # compression_keep_recent: 8
+#     # compression_summary_tokens: 800
+#     # conversation_relation_threshold: 0.55
+#     # conversation_relation_k: 5
+#     # conversation_relation_excerpt_chars: 1000
+#     # past_session_search_k: 5
+#     # past_session_excerpt_chars: 1200
+#   conversation_summary_excerpt_chars: 800
 #
 #   # ── Agent delegation ──────────────────────────────────────────
 #   # The Journaler can delegate tasks inline to named agent personalities

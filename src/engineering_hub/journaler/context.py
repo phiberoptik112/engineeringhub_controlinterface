@@ -19,7 +19,6 @@ from engineering_hub.journaler.models import ContextSnapshot, ScanState
 from engineering_hub.journaler.org_parser import (
     extract_completed_tasks,
     extract_pending_tasks,
-    extract_topic_keywords,
     parse_org_file,
     summarize_file,
 )
@@ -57,6 +56,8 @@ class JournalContext:
         journal_lookback_days: int = 5,
         journal_max_files: int = 5,
         pending_tasks_file: Path | None = None,
+        conversation_lookback_days: int = 7,
+        conversation_summary_excerpt_chars: int = 800,
     ) -> None:
         self.org_roam_dir = org_roam_dir
         self.journal_dir = journal_dir
@@ -68,6 +69,11 @@ class JournalContext:
         self.journal_lookback_days = max(0, journal_lookback_days)
         self.journal_max_files = max(1, journal_max_files)
         self._pending_tasks_file = pending_tasks_file
+        self.conversation_lookback_days = max(0, conversation_lookback_days)
+        self.conversation_summary_excerpt_chars = max(
+            200,
+            conversation_summary_excerpt_chars,
+        )
 
         self.state_file = state_dir / "state.json"
         self.cache_file = state_dir / "context_cache.json"
@@ -375,7 +381,6 @@ class JournalContext:
         Intended for the periodic deep-scan schedule (default every 60 min) to
         keep topic digests fresh even when no files have been modified.
         """
-        now = datetime.now()
         today = date.today()
         journal_sel = self._selected_journal_files(today)
 
@@ -435,6 +440,41 @@ class JournalContext:
             f"{len(active_roam_nodes)} active roam nodes"
         )
         return self._snapshot
+
+    def _load_daily_summaries(self, n: int) -> list[dict[str, str]]:
+        """Read the last *n* daily conversation summaries from disk.
+
+        Returns a list of ``{"date": "YYYY-MM-DD", "text": "..."}`` dicts
+        sorted newest-first.  Falls back to an empty list when the
+        ``daily_summaries/`` directory does not exist or files cannot be read.
+        """
+        summary_dir = self.state_dir / "daily_summaries"
+        if not summary_dir.exists():
+            return []
+
+        dated: list[tuple[date, Path]] = []
+        for p in summary_dir.glob("*.md"):
+            stem = p.stem
+            try:
+                d = date.fromisoformat(stem)
+                dated.append((d, p))
+            except ValueError:
+                continue
+
+        dated.sort(key=lambda x: x[0], reverse=True)
+        results: list[dict[str, str]] = []
+        for d, p in dated[:n]:
+            try:
+                text = p.read_text(encoding="utf-8", errors="replace").strip()
+                # Strip the heading line ("# Journaler Daily Summary — YYYY-MM-DD")
+                lines = text.splitlines()
+                if lines and lines[0].startswith("#"):
+                    lines = lines[1:]
+                text = "\n".join(lines).strip()
+                results.append({"date": d.isoformat(), "text": text})
+            except OSError:
+                continue
+        return results
 
     def get_current_context(self) -> str:
         """Format the cached snapshot as a markdown context block
@@ -536,6 +576,24 @@ class JournalContext:
                     f"{output.get('summary', '')[:120]}"
                 )
             lines.append("")
+
+        if self.conversation_lookback_days > 0:
+            summaries = self._load_daily_summaries(self.conversation_lookback_days)
+            if summaries:
+                lines.append("### Recent Conversation Summaries")
+                lines.append(
+                    "_Compressed summaries of past Journaler sessions "
+                    "(newest first). Use these to recall prior discussions "
+                    "and identify continuing threads._"
+                )
+                lines.append("")
+                max_chars = self.conversation_summary_excerpt_chars
+                for entry in summaries:
+                    excerpt = entry["text"][:max_chars].replace("\n", " ").strip()
+                    if len(entry["text"]) > max_chars:
+                        excerpt += "..."
+                    lines.append(f"**{entry['date']}**: {excerpt}")
+                lines.append("")
 
         return "\n".join(lines)
 
@@ -673,6 +731,38 @@ class JournalContext:
                     f"_(seen on {days} days, {count} mentions, last {last})_"
                 )
             lines.append("")
+
+        # Continuing threads: semantic match across recent daily summaries
+        if self.memory_service and s.recurring_topics:
+            try:
+                topic_query = " ".join(
+                    t.get("topic", "") for t in s.recurring_topics[:5]
+                ).strip()
+                if topic_query:
+                    hits = self.memory_service.search(
+                        topic_query,
+                        source="journaler",
+                        k=5,
+                        threshold=0.50,
+                    )
+                    if hits:
+                        lines.append("### Continuing Threads")
+                        lines.append(
+                            "_Conversations from past sessions that overlap with "
+                            "today's recurring topics — threads worth revisiting._"
+                        )
+                        lines.append("")
+                        for hit in hits[:5]:
+                            date_str = (hit.created_at or "")[:10]
+                            excerpt = hit.content[:300].replace("\n", " ").strip()
+                            if len(hit.content) > 300:
+                                excerpt += "..."
+                            lines.append(
+                                f"- **{date_str}** _{hit.similarity:.0%} match_: {excerpt}"
+                            )
+                        lines.append("")
+            except Exception as exc:
+                logger.warning("Continuing threads search failed (non-fatal): %s", exc)
 
         # Stale tasks (pending with no recent journal mention)
         if s.stale_tasks:

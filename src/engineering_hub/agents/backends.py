@@ -52,6 +52,36 @@ class AnthropicBackend:
         text_parts = [block.text for block in message.content if hasattr(block, "text")]
         return "\n".join(text_parts)
 
+    def complete_with_web_search(
+        self,
+        system: str,
+        user_message: str,
+        max_tokens: int,
+        *,
+        tool_version: str = "web_search_20250305",
+        max_uses: int = 3,
+    ) -> str:
+        """Complete using Anthropic's server-side web search tool."""
+        try:
+            message = self._client.messages.create(
+                model=self.model,
+                max_tokens=max_tokens,
+                system=system,
+                messages=[{"role": "user", "content": user_message}],
+                tools=[
+                    {
+                        "type": tool_version,
+                        "name": "web_search",
+                        "max_uses": max_uses,
+                    }
+                ],
+            )
+        except anthropic.APIError as exc:
+            raise LLMBackendError(str(exc), provider="anthropic") from exc
+
+        text_parts = [block.text for block in message.content if hasattr(block, "text")]
+        return "\n".join(text_parts)
+
     def test_connection(self) -> bool:
         try:
             self._client.messages.create(
