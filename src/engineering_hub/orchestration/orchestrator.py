@@ -114,6 +114,8 @@ class Orchestrator:
             prompts_dir=self.settings.prompts_dir,
             output_dir=self.settings.output_dir,
             max_tokens=self.settings.max_tokens,
+            corpus_service=corpus_service,
+            memory_service=self.memory_service,
         )
 
         # Task router (local or Docker container execution)

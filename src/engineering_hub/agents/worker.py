@@ -4,16 +4,20 @@ import logging
 import re
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 
 from engineering_hub.agents.backends import AnthropicBackend, LLMBackend
 from engineering_hub.agents.prompts import PromptLoader
 from engineering_hub.agents.registry import AgentRegistry
 from engineering_hub.agents.style_loader import LatexStyle, StyleLoader
-from engineering_hub.core.constants import AgentType
+from engineering_hub.agents.tools import ToolContext, resolve_tools
+from engineering_hub.core.constants import AgentType, ModelClass
 from engineering_hub.core.exceptions import AgentExecutionError, LLMBackendError
 from engineering_hub.core.models import ParsedTask, TaskResult
 
 logger = logging.getLogger(__name__)
+
+MAX_TOOL_ITERATIONS = 10
 
 
 class AgentWorker:
@@ -27,6 +31,8 @@ class AgentWorker:
         max_tokens: int = 4096,
         styles_dir: Path | None = None,
         templates_dir: Path | None = None,
+        corpus_service: Any | None = None,
+        memory_service: Any | None = None,
     ) -> None:
         self._backend = backend
         self.max_tokens = max_tokens
@@ -38,6 +44,8 @@ class AgentWorker:
             styles_dir=styles_dir or Path("latex-styles"),
             templates_dir=templates_dir or Path("latex-templates"),
         )
+        self._corpus_service = corpus_service
+        self._memory_service = memory_service
 
     @classmethod
     def from_anthropic(
@@ -49,6 +57,8 @@ class AgentWorker:
         max_tokens: int = 4096,
         styles_dir: Path | None = None,
         templates_dir: Path | None = None,
+        corpus_service: Any | None = None,
+        memory_service: Any | None = None,
     ) -> "AgentWorker":
         """Convenience constructor that creates an AnthropicBackend internally."""
         backend = AnthropicBackend(api_key=api_key, model=model)
@@ -59,6 +69,8 @@ class AgentWorker:
             max_tokens=max_tokens,
             styles_dir=styles_dir,
             templates_dir=templates_dir,
+            corpus_service=corpus_service,
+            memory_service=memory_service,
         )
 
     def execute(self, task: ParsedTask, context: str) -> TaskResult:
@@ -80,6 +92,8 @@ class AgentWorker:
                 error_message=f"Agent type '{agent_type.value}' is not enabled",
             )
 
+        config = self._registry.get_config(agent_type)
+
         try:
             system_prompt = self._prompt_loader.get_prompt(agent_type)
 
@@ -98,7 +112,24 @@ class AgentWorker:
             )
 
             logger.info(f"Executing {agent_type.value} agent for task: {task.description[:50]}...")
-            response = self._backend.complete(system_prompt, user_message, self.max_tokens)
+
+            use_tools = (
+                config is not None
+                and config.model_class == ModelClass.TOOL_USE
+                and config.tools
+                and hasattr(self._backend, "complete_with_tools")
+            )
+            if use_tools:
+                response = self._execute_with_tools(
+                    task=task,
+                    system_prompt=system_prompt,
+                    user_message=user_message,
+                    tool_names=config.tools,  # type: ignore[union-attr]
+                    max_tokens=config.max_tokens,  # type: ignore[union-attr]
+                )
+            else:
+                max_tok = config.max_tokens if config else self.max_tokens
+                response = self._backend.complete(system_prompt, user_message, max_tok)
 
             output_path = self._write_output(task, response)
 
@@ -123,6 +154,26 @@ class AgentWorker:
                 success=False,
                 error_message=f"LLM backend error: {e}",
             )
+        except NotImplementedError as e:
+            logger.warning(
+                "Backend does not support tool calling, falling back to single-shot: %s", e
+            )
+            max_tok = config.max_tokens if config else self.max_tokens
+            try:
+                response = self._backend.complete(system_prompt, user_message, max_tok)
+                output_path = self._write_output(task, response)
+                return TaskResult(
+                    task=task,
+                    success=True,
+                    output_path=str(output_path),
+                    agent_response=response,
+                )
+            except Exception as fallback_err:
+                return TaskResult(
+                    task=task,
+                    success=False,
+                    error_message=str(fallback_err),
+                )
         except Exception as e:
             logger.error(f"Agent execution failed: {e}")
             return TaskResult(
@@ -130,6 +181,86 @@ class AgentWorker:
                 success=False,
                 error_message=str(e),
             )
+
+    # ------------------------------------------------------------------
+    # Agentic tool-use loop
+    # ------------------------------------------------------------------
+
+    def _execute_with_tools(
+        self,
+        task: ParsedTask,
+        system_prompt: str,
+        user_message: str,
+        tool_names: list[str],
+        max_tokens: int,
+    ) -> str:
+        """Drive an agentic tool-call loop until the model stops requesting tools
+        or MAX_TOOL_ITERATIONS is reached."""
+
+        tool_defs = resolve_tools(tool_names)
+        if not tool_defs:
+            logger.debug("No resolvable tools for %s — falling back to single-shot.", task.agent)
+            return self._backend.complete(system_prompt, user_message, max_tokens)
+
+        tool_schemas = [t.schema for t in tool_defs]
+        handler_map = {t.schema["name"]: t.handler for t in tool_defs}
+
+        tool_ctx = ToolContext(
+            corpus_service=self._corpus_service,
+            memory_service=self._memory_service,
+            output_dir=self.output_dir,
+            project_id=task.project_id if isinstance(task.project_id, int) else None,
+        )
+
+        messages: list[dict[str, Any]] = [{"role": "user", "content": user_message}]
+        response = None
+
+        complete_with_tools = getattr(self._backend, "complete_with_tools")
+        for _iteration in range(MAX_TOOL_ITERATIONS):
+            response = complete_with_tools(
+                system=system_prompt,
+                messages=messages,
+                tools=tool_schemas,
+                max_tokens=max_tokens,
+            )
+
+            if response.stop_reason != "tool_use" or not response.tool_calls:
+                return response.text or ""
+
+            # Build the assistant content block from the raw response
+            assistant_content = response.raw.get("content", [])
+            messages.append({"role": "assistant", "content": assistant_content})
+
+            tool_results = []
+            for call in response.tool_calls:
+                handler = handler_map.get(call.name)
+                if handler is None:
+                    result_text = f"Unknown tool '{call.name}' — not available."
+                    logger.warning("Tool call to unregistered tool: %s", call.name)
+                else:
+                    try:
+                        result_text = handler(call.arguments, tool_ctx)
+                        logger.debug("Tool %s → %d chars", call.name, len(result_text))
+                    except Exception as exc:
+                        result_text = f"Tool '{call.name}' raised an error: {exc}"
+                        logger.error("Tool %s failed: %s", call.name, exc)
+
+                tool_results.append({
+                    "type": "tool_result",
+                    "tool_use_id": call.id,
+                    "content": result_text,
+                })
+
+            messages.append({"role": "user", "content": tool_results})
+
+        logger.warning(
+            "Agent %s hit MAX_TOOL_ITERATIONS (%d) — returning partial output.",
+            task.agent_type,
+            MAX_TOOL_ITERATIONS,
+        )
+        return (response.text if response else "") or (
+            "(Agent reached iteration limit without producing final output.)"
+        )
 
     # ------------------------------------------------------------------
     # Style / template helpers
@@ -216,7 +347,7 @@ class AgentWorker:
         appended as a clearly labelled override block so the agent still sees it.
         """
         override_lines = [
-            f"<preamble_template>",
+            "<preamble_template>",
             f"% STYLE OVERRIDE: {style.display_name}",
             style.preamble_tex,
             "</preamble_template>",
@@ -225,7 +356,8 @@ class AgentWorker:
             override_lines += [
                 "",
                 "<section_structure_hint>",
-                "SECTION STRUCTURE HINT — apply in preference to the default output_format skeleton:",
+                "SECTION STRUCTURE HINT — apply in preference to the "
+                "default output_format skeleton:",
                 style.section_structure.strip(),
                 "</section_structure_hint>",
             ]
@@ -282,7 +414,8 @@ class AgentWorker:
                 [
                     "",
                     "Please complete this task based on the project context above.",
-                    "Output raw LaTeX source only — no markdown fences, no prose outside the document.",
+                    "Output raw LaTeX source only — no markdown fences, "
+                    "no prose outside the document.",
                 ]
             )
         else:

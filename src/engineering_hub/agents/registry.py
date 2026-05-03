@@ -2,7 +2,7 @@
 
 from dataclasses import dataclass, field
 
-from engineering_hub.core.constants import AgentType
+from engineering_hub.core.constants import AgentType, ModelClass
 
 
 @dataclass
@@ -14,6 +14,7 @@ class AgentConfig:
     tools: list[str] = field(default_factory=list)
     max_tokens: int = 4096
     enabled: bool = True
+    model_class: ModelClass = ModelClass.REASONING
 
 
 # Default agent configurations
@@ -21,20 +22,23 @@ DEFAULT_AGENT_CONFIGS = {
     AgentType.RESEARCH: AgentConfig(
         agent_type=AgentType.RESEARCH,
         prompt_file="research-agent.txt",
-        tools=["web_search", "web_fetch", "django_api"],
+        tools=["search_corpus", "search_memory", "ingest_files"],
         max_tokens=4096,
+        model_class=ModelClass.TOOL_USE,
     ),
     AgentType.TECHNICAL_WRITER: AgentConfig(
         agent_type=AgentType.TECHNICAL_WRITER,
         prompt_file="technical-writer.txt",
-        tools=["create_file", "view", "ingest_files", "django_api"],
+        tools=["search_corpus", "search_memory", "ingest_files"],
         max_tokens=4096,
+        model_class=ModelClass.TOOL_USE,
     ),
     AgentType.STANDARDS_CHECKER: AgentConfig(
         agent_type=AgentType.STANDARDS_CHECKER,
         prompt_file="standards-checker.txt",
-        tools=["view", "django_api"],
+        tools=[],
         max_tokens=4096,
+        model_class=ModelClass.REASONING,
     ),
     AgentType.REF_ENGINEER: AgentConfig(
         agent_type=AgentType.REF_ENGINEER,
@@ -42,6 +46,7 @@ DEFAULT_AGENT_CONFIGS = {
         tools=["web_search", "get_project_file", "get_standard_details"],
         max_tokens=4096,
         enabled=False,  # Phase 5
+        model_class=ModelClass.REASONING,
     ),
     AgentType.EVALUATOR: AgentConfig(
         agent_type=AgentType.EVALUATOR,
@@ -49,30 +54,35 @@ DEFAULT_AGENT_CONFIGS = {
         tools=["get_project_file", "view"],
         max_tokens=4096,
         enabled=False,  # Phase 5
+        model_class=ModelClass.REASONING,
     ),
     AgentType.TECHNICAL_REVIEWER: AgentConfig(
         agent_type=AgentType.TECHNICAL_REVIEWER,
         prompt_file="technical-reviewer.txt",
-        tools=["ingest_files", "get_project_file"],
+        tools=["search_corpus", "search_memory", "ingest_files"],
         max_tokens=8000,
+        model_class=ModelClass.TOOL_USE,
     ),
     AgentType.WEEKLY_REVIEWER: AgentConfig(
         agent_type=AgentType.WEEKLY_REVIEWER,
         prompt_file="weekly-reviewer.txt",
         tools=[],
         max_tokens=6000,
+        model_class=ModelClass.REASONING,
     ),
     AgentType.LATEX_WRITER: AgentConfig(
         agent_type=AgentType.LATEX_WRITER,
         prompt_file="latex-writer.txt",
         tools=["create_file", "view", "django_api"],
         max_tokens=8000,
+        model_class=ModelClass.REASONING,
     ),
     AgentType.PANNING_FOR_GOLD: AgentConfig(
         agent_type=AgentType.PANNING_FOR_GOLD,
         prompt_file="panning-for-gold.txt",
         tools=[],
         max_tokens=12000,
+        model_class=ModelClass.REASONING,
     ),
 }
 
@@ -111,7 +121,7 @@ class AgentRegistry:
         if agent_type in self._configs:
             self._configs[agent_type].enabled = False
 
-    def update_config(self, agent_type: AgentType, **kwargs) -> None:
+    def update_config(self, agent_type: AgentType, **kwargs: object) -> None:
         """Update configuration for an agent type."""
         if agent_type in self._configs:
             config = self._configs[agent_type]

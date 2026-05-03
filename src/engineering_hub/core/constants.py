@@ -12,6 +12,13 @@ class TaskStatus(str, Enum):
     BLOCKED = "BLOCKED"
 
 
+class ModelClass(str, Enum):
+    """Classification that determines execution path for an agent."""
+
+    TOOL_USE = "tool_use"
+    REASONING = "reasoning"
+
+
 class AgentType(str, Enum):
     """Available agent types."""
 

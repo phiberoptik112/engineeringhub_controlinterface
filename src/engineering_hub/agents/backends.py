@@ -7,9 +7,9 @@ Anthropic API, local MLX models, or a remote Ollama server transparently.
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 import anthropic
 import requests
@@ -22,6 +22,35 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+# ---------------------------------------------------------------------------
+# Tool-aware response types
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class ToolCall:
+    """A single tool invocation requested by the model."""
+
+    id: str
+    name: str
+    arguments: dict[str, Any]
+
+
+@dataclass
+class ToolAwareResponse:
+    """Response from a tool-capable completion call."""
+
+    text: str | None
+    tool_calls: list[ToolCall] = field(default_factory=list)
+    stop_reason: str = "end_turn"
+    raw: dict[str, Any] = field(default_factory=dict)
+
+
+# ---------------------------------------------------------------------------
+# Protocol
+# ---------------------------------------------------------------------------
+
+
 @runtime_checkable
 class LLMBackend(Protocol):
     """Minimal interface every LLM backend must satisfy."""
@@ -29,6 +58,11 @@ class LLMBackend(Protocol):
     def complete(self, system: str, user_message: str, max_tokens: int) -> str: ...
 
     def test_connection(self) -> bool: ...
+
+
+# ---------------------------------------------------------------------------
+# Anthropic
+# ---------------------------------------------------------------------------
 
 
 class AnthropicBackend:
@@ -52,6 +86,40 @@ class AnthropicBackend:
         text_parts = [block.text for block in message.content if hasattr(block, "text")]
         return "\n".join(text_parts)
 
+    def complete_with_tools(
+        self,
+        system: str,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+        max_tokens: int,
+    ) -> ToolAwareResponse:
+        """Completion call that passes tool schemas and returns structured results."""
+        try:
+            response = self._client.messages.create(
+                model=self.model,
+                max_tokens=max_tokens,
+                system=system,
+                messages=messages,  # type: ignore[arg-type]
+                tools=tools,  # type: ignore[arg-type]
+            )
+        except anthropic.APIError as exc:
+            raise LLMBackendError(str(exc), provider="anthropic") from exc
+
+        tool_calls = [
+            ToolCall(id=b.id, name=b.name, arguments=b.input)
+            for b in response.content
+            if b.type == "tool_use"
+        ]
+        text_parts = [b.text for b in response.content if hasattr(b, "text")]
+        text = "\n".join(text_parts) if text_parts else None
+
+        return ToolAwareResponse(
+            text=text,
+            tool_calls=tool_calls,
+            stop_reason=response.stop_reason or "end_turn",
+            raw=response.model_dump(),
+        )
+
     def test_connection(self) -> bool:
         try:
             self._client.messages.create(
@@ -63,6 +131,11 @@ class AnthropicBackend:
         except Exception as exc:
             logger.error(f"Anthropic connection test failed: {exc}")
             return False
+
+
+# ---------------------------------------------------------------------------
+# MLX
+# ---------------------------------------------------------------------------
 
 
 @dataclass
@@ -82,6 +155,9 @@ class MLXBackend:
     Accepts either a HuggingFace model ID (e.g. ``mlx-community/gemma-3-27b-it-qat-4bit``)
     or an explicit local path to a snapshot directory containing ``config.json``
     and ``*.safetensors`` weights.
+
+    MLX does not support structured tool calling. Tool-use agents should use
+    Anthropic or Ollama backends instead.
     """
 
     def __init__(
@@ -137,7 +213,7 @@ class MLXBackend:
         )
 
         try:
-            return self._mlx_lm.generate(
+            result: str = self._mlx_lm.generate(
                 self._model,
                 self._tokenizer,
                 prompt=prompt,
@@ -145,13 +221,31 @@ class MLXBackend:
                 sampler=sampler,
                 logits_processors=logits_processors,
             )
+            return result
         except Exception as exc:
             raise LLMBackendError(
                 f"MLX generation failed: {exc}", provider="mlx"
             ) from exc
 
+    def complete_with_tools(
+        self,
+        system: str,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+        max_tokens: int,
+    ) -> ToolAwareResponse:
+        raise NotImplementedError(
+            "MLX backend does not support tool calling. "
+            "Use Anthropic or Ollama for tool-use agents."
+        )
+
     def test_connection(self) -> bool:
         return self._model is not None
+
+
+# ---------------------------------------------------------------------------
+# Ollama
+# ---------------------------------------------------------------------------
 
 
 @dataclass
@@ -182,11 +276,11 @@ class OllamaBackend:
         self._sampling = sampling or OllamaSamplingConfig()
 
     def complete(self, system: str, user_message: str, max_tokens: int) -> str:
-        messages = [
+        messages: list[dict[str, str]] = [
             {"role": "system", "content": system},
             {"role": "user", "content": user_message},
         ]
-        payload: dict = {
+        payload: dict[str, Any] = {
             "model": self._model,
             "messages": messages,
             "stream": False,
@@ -204,7 +298,8 @@ class OllamaBackend:
             )
             resp.raise_for_status()
             data = resp.json()
-            return data.get("message", {}).get("content", "")
+            content: str = data.get("message", {}).get("content", "")
+            return content
         except requests.ConnectionError as exc:
             raise LLMBackendError(
                 f"Cannot reach Ollama at {self._host}. Start it with: ollama serve",
@@ -221,6 +316,80 @@ class OllamaBackend:
                 provider="ollama",
             ) from exc
 
+    def complete_with_tools(
+        self,
+        system: str,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+        max_tokens: int,
+    ) -> ToolAwareResponse:
+        """Tool-capable completion via Ollama's /api/chat endpoint.
+
+        Ollama uses a different tool schema format than Anthropic — each tool
+        is wrapped in ``{"type": "function", "function": {...}}``.
+        """
+        ollama_tools: list[dict[str, Any]] = []
+        for tool in tools:
+            ollama_tools.append({
+                "type": "function",
+                "function": {
+                    "name": tool["name"],
+                    "description": tool.get("description", ""),
+                    "parameters": tool.get("input_schema", {}),
+                },
+            })
+
+        payload: dict[str, Any] = {
+            "model": self._model,
+            "messages": [{"role": "system", "content": system}] + messages,
+            "tools": ollama_tools,
+            "stream": False,
+            "options": {
+                "temperature": self._sampling.temp,
+                "top_p": self._sampling.top_p,
+                "num_predict": max_tokens,
+            },
+        }
+        try:
+            resp = requests.post(
+                f"{self._host}/api/chat",
+                json=payload,
+                timeout=self._timeout,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+        except requests.ConnectionError as exc:
+            raise LLMBackendError(
+                f"Cannot reach Ollama at {self._host}. Start it with: ollama serve",
+                provider="ollama",
+            ) from exc
+        except requests.HTTPError as exc:
+            raise LLMBackendError(
+                f"Ollama HTTP error {resp.status_code}: {resp.text[:300]}",
+                provider="ollama",
+            ) from exc
+        except requests.RequestException as exc:
+            raise LLMBackendError(str(exc), provider="ollama") from exc
+
+        msg: dict[str, Any] = data.get("message", {})
+        tool_calls = [
+            ToolCall(
+                id=tc.get("id", f"call_{i}"),
+                name=tc["function"]["name"],
+                arguments=tc["function"]["arguments"],
+            )
+            for i, tc in enumerate(msg.get("tool_calls") or [])
+        ]
+        text: str | None = msg.get("content") or None
+        stop: str = "tool_use" if tool_calls else (data.get("done_reason") or "end_turn")
+
+        return ToolAwareResponse(
+            text=text,
+            tool_calls=tool_calls,
+            stop_reason=stop,
+            raw=data,
+        )
+
     def test_connection(self) -> bool:
         try:
             resp = requests.get(f"{self._host}/api/tags", timeout=5)
@@ -229,6 +398,11 @@ class OllamaBackend:
         except Exception as exc:
             logger.error(f"Ollama connection test failed: {exc}")
             return False
+
+
+# ---------------------------------------------------------------------------
+# Factory
+# ---------------------------------------------------------------------------
 
 
 def create_backend(settings: Settings) -> LLMBackend:
@@ -254,13 +428,13 @@ def create_backend(settings: Settings) -> LLMBackend:
                 "Set it to a HuggingFace model ID or a local snapshot path.",
                 provider="mlx",
             )
-        sampling = MLXSamplingConfig(
+        mlx_sampling = MLXSamplingConfig(
             temp=settings.mlx_temp,
             top_p=settings.mlx_top_p,
             min_p=settings.mlx_min_p,
             repetition_penalty=settings.mlx_repetition_penalty,
         )
-        return MLXBackend(model_path=settings.mlx_model_path, sampling=sampling)
+        return MLXBackend(model_path=settings.mlx_model_path, sampling=mlx_sampling)
 
     if provider == "ollama":
         if not settings.ollama_chat_model:
@@ -269,7 +443,7 @@ def create_backend(settings: Settings) -> LLMBackend:
                 "Set it to an Ollama model tag (e.g. 'llama3.1:8b').",
                 provider="ollama",
             )
-        sampling = OllamaSamplingConfig(
+        ollama_sampling = OllamaSamplingConfig(
             temp=settings.ollama_temp,
             top_p=settings.ollama_top_p,
         )
@@ -277,7 +451,7 @@ def create_backend(settings: Settings) -> LLMBackend:
             host=settings.ollama_host,
             model=settings.ollama_chat_model,
             timeout=settings.ollama_chat_timeout,
-            sampling=sampling,
+            sampling=ollama_sampling,
         )
 
     raise LLMBackendError(
