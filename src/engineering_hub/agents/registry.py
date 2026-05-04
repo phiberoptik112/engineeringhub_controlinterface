@@ -1,8 +1,21 @@
 """Agent type registry and configuration."""
 
 from dataclasses import dataclass, field
+from enum import Enum
 
 from engineering_hub.core.constants import AgentType
+
+
+class ModelClass(str, Enum):
+    """Classification of agents by their prompting and model requirements.
+
+    REASONING agents do structured evaluation, comparison, or synthesis without
+    driving a tool loop.  TOOL_USE agents iterate over tool calls (search,
+    file creation, API retrieval) to accomplish multi-step tasks.
+    """
+
+    REASONING = "reasoning"
+    TOOL_USE = "tool_use"
 
 
 @dataclass
@@ -11,8 +24,10 @@ class AgentConfig:
 
     agent_type: AgentType
     prompt_file: str
+    model_class: ModelClass = ModelClass.REASONING
     tools: list[str] = field(default_factory=list)
     max_tokens: int = 4096
+    model_override: str | None = None
     enabled: bool = True
 
 
@@ -21,24 +36,28 @@ DEFAULT_AGENT_CONFIGS = {
     AgentType.RESEARCH: AgentConfig(
         agent_type=AgentType.RESEARCH,
         prompt_file="research-agent.txt",
+        model_class=ModelClass.TOOL_USE,
         tools=["web_search", "web_fetch", "django_api"],
         max_tokens=4096,
     ),
     AgentType.TECHNICAL_WRITER: AgentConfig(
         agent_type=AgentType.TECHNICAL_WRITER,
         prompt_file="technical-writer.txt",
+        model_class=ModelClass.TOOL_USE,
         tools=["create_file", "view", "ingest_files", "django_api"],
         max_tokens=4096,
     ),
     AgentType.STANDARDS_CHECKER: AgentConfig(
         agent_type=AgentType.STANDARDS_CHECKER,
         prompt_file="standards-checker.txt",
+        model_class=ModelClass.REASONING,
         tools=["view", "django_api"],
         max_tokens=4096,
     ),
     AgentType.REF_ENGINEER: AgentConfig(
         agent_type=AgentType.REF_ENGINEER,
         prompt_file="ref-engineer.txt",
+        model_class=ModelClass.REASONING,
         tools=["web_search", "get_project_file", "get_standard_details"],
         max_tokens=4096,
         enabled=False,  # Phase 5
@@ -46,6 +65,7 @@ DEFAULT_AGENT_CONFIGS = {
     AgentType.EVALUATOR: AgentConfig(
         agent_type=AgentType.EVALUATOR,
         prompt_file="evaluator.txt",
+        model_class=ModelClass.REASONING,
         tools=["get_project_file", "view"],
         max_tokens=4096,
         enabled=False,  # Phase 5
@@ -53,24 +73,28 @@ DEFAULT_AGENT_CONFIGS = {
     AgentType.TECHNICAL_REVIEWER: AgentConfig(
         agent_type=AgentType.TECHNICAL_REVIEWER,
         prompt_file="technical-reviewer.txt",
+        model_class=ModelClass.TOOL_USE,
         tools=["ingest_files", "get_project_file"],
         max_tokens=8000,
     ),
     AgentType.WEEKLY_REVIEWER: AgentConfig(
         agent_type=AgentType.WEEKLY_REVIEWER,
         prompt_file="weekly-reviewer.txt",
+        model_class=ModelClass.REASONING,
         tools=[],
         max_tokens=6000,
     ),
     AgentType.LATEX_WRITER: AgentConfig(
         agent_type=AgentType.LATEX_WRITER,
         prompt_file="latex-writer.txt",
+        model_class=ModelClass.TOOL_USE,
         tools=["create_file", "view", "django_api"],
         max_tokens=8000,
     ),
     AgentType.PANNING_FOR_GOLD: AgentConfig(
         agent_type=AgentType.PANNING_FOR_GOLD,
         prompt_file="panning-for-gold.txt",
+        model_class=ModelClass.REASONING,
         tools=[],
         max_tokens=12000,
     ),
@@ -87,6 +111,11 @@ class AgentRegistry:
     def get_config(self, agent_type: AgentType) -> AgentConfig | None:
         """Get configuration for an agent type."""
         return self._configs.get(agent_type)
+
+    def get_model_class(self, agent_type: AgentType) -> ModelClass:
+        """Return the model class for *agent_type*, defaulting to REASONING."""
+        config = self._configs.get(agent_type)
+        return config.model_class if config else ModelClass.REASONING
 
     def is_enabled(self, agent_type: AgentType) -> bool:
         """Check if an agent type is enabled."""

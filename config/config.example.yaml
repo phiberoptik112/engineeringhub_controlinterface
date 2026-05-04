@@ -366,14 +366,18 @@ chunking:
 #   # Emacs config.el for import/export of capture templates
 #   emacs_config: "~/.doom.d/config.el"
 
-# Agent configurations (optional - defaults are provided)
+# ── Per-agent model routing ───────────────────────────────────────
+# Assign different local models to reasoning vs tool-use agent classes.
+# Leave empty to use the global llm_provider model for all agents.
+#
+# Reasoning agents: standards-checker, evaluator, ref-engineer, weekly-reviewer,
+#                   panning-for-gold
+# Tool-use agents:  research, technical-writer, technical-reviewer, latex-writer
+#
 # agents:
-#   research:
-#     enabled: true
-#     max_tokens: 4096
-#   technical-writer:
-#     enabled: true
-#     max_tokens: 4096
-#   standards-checker:
-#     enabled: true
-#     max_tokens: 4096
+#   models:
+#     reasoning: "qwen3:32b"           # ollama pull qwen3:32b
+#     tool_use:  "qwen3.6:35b-a3b"    # ollama pull qwen3.6:35b-a3b
+#   # Optional token budget overrides per class:
+#   # reasoning_max_tokens: 8192
+#   # tool_use_max_tokens: 4096

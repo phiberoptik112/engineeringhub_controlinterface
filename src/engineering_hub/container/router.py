@@ -49,11 +49,22 @@ class TaskRouter:
     def is_containerised(self) -> bool:
         return self._docker_executor is not None
 
-    def execute(self, task: ParsedTask, context: str) -> TaskResult:
-        """Execute a task via the appropriate path."""
+    def execute(
+        self,
+        task: ParsedTask,
+        context: str,
+        worker: AgentWorker | None = None,
+    ) -> TaskResult:
+        """Execute a task via the appropriate path.
+
+        When *worker* is provided it is used for local execution instead of
+        the default worker.  This supports per-agent-class model routing
+        without changing the container path.
+        """
         if self._should_containerise(task):
             return self._execute_in_container(task, context)
-        return self._local_worker.execute(task, context)
+        effective_worker = worker or self._local_worker
+        return effective_worker.execute(task, context)
 
     def _should_containerise(self, task: ParsedTask) -> bool:
         return (

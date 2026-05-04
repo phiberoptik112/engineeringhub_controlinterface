@@ -14,10 +14,14 @@ from typing import TYPE_CHECKING, Protocol, runtime_checkable
 import anthropic
 import requests
 
+from engineering_hub.core.constants import AgentType
 from engineering_hub.core.exceptions import LLMBackendError
 
 if TYPE_CHECKING:
+    from engineering_hub.agents.registry import AgentRegistry
     from engineering_hub.config.settings import Settings
+
+from engineering_hub.agents.registry import ModelClass
 
 logger = logging.getLogger(__name__)
 
@@ -261,8 +265,49 @@ class OllamaBackend:
             return False
 
 
-def create_backend(settings: Settings) -> LLMBackend:
-    """Factory: build the appropriate LLM backend from application settings."""
+def _resolve_model_for_agent(
+    settings: Settings,
+    agent_type: AgentType | None,
+    registry: AgentRegistry | None,
+) -> str | None:
+    """Return the model override string for *agent_type*, or ``None`` to use
+    the provider's global default.
+
+    Resolution order:
+      1. ``AgentConfig.model_override`` (per-agent escape hatch)
+      2. Class-level model from settings (``agents_reasoning_model`` / ``agents_tool_use_model``)
+      3. ``None`` -- global model (existing behaviour, unchanged)
+    """
+    if agent_type is None or registry is None:
+        return None
+
+    config = registry.get_config(agent_type)
+    if config is None:
+        return None
+
+    if config.model_override:
+        return config.model_override
+
+    if config.model_class == ModelClass.REASONING and settings.agents_reasoning_model:
+        return settings.agents_reasoning_model
+    if config.model_class == ModelClass.TOOL_USE and settings.agents_tool_use_model:
+        return settings.agents_tool_use_model
+
+    return None
+
+
+def create_backend(
+    settings: Settings,
+    agent_type: AgentType | None = None,
+    registry: AgentRegistry | None = None,
+) -> LLMBackend:
+    """Factory: build the appropriate LLM backend from application settings.
+
+    When *agent_type* and *registry* are provided, the model tag may be
+    overridden per agent class.  The provider (anthropic / mlx / ollama) is
+    always determined by the global ``llm_provider`` setting.
+    """
+    resolved_model = _resolve_model_for_agent(settings, agent_type, registry)
     provider = settings.llm_provider.lower()
 
     if provider == "anthropic":
@@ -278,7 +323,8 @@ def create_backend(settings: Settings) -> LLMBackend:
         )
 
     if provider == "mlx":
-        if not settings.mlx_model_path:
+        model_path = resolved_model or settings.mlx_model_path
+        if not model_path:
             raise LLMBackendError(
                 "mlx.model_path is required when llm_provider is 'mlx'. "
                 "Set it to a HuggingFace model ID or a local snapshot path.",
@@ -290,10 +336,11 @@ def create_backend(settings: Settings) -> LLMBackend:
             min_p=settings.mlx_min_p,
             repetition_penalty=settings.mlx_repetition_penalty,
         )
-        return MLXBackend(model_path=settings.mlx_model_path, sampling=sampling)
+        return MLXBackend(model_path=model_path, sampling=sampling)
 
     if provider == "ollama":
-        if not settings.ollama_chat_model:
+        model = resolved_model or settings.ollama_chat_model
+        if not model:
             raise LLMBackendError(
                 "ollama.chat_model is required when llm_provider is 'ollama'. "
                 "Set it to an Ollama model tag (e.g. 'llama3.1:8b').",
@@ -305,7 +352,7 @@ def create_backend(settings: Settings) -> LLMBackend:
         )
         return OllamaBackend(
             host=settings.ollama_host,
-            model=settings.ollama_chat_model,
+            model=model,
             timeout=settings.ollama_chat_timeout,
             sampling=sampling,
         )

@@ -12,6 +12,15 @@ Backend selection
 - "claude" — Uses AnthropicBackend. Requires an anthropic_api_key be configured.
 - "auto"   — Prefers Claude when an anthropic_worker is available, falls back to MLX.
 
+Per-agent model routing limitation
+-----------------------------------
+The Orchestrator supports per-agent-class model routing (reasoning vs tool_use models
+via ``agents.models`` in config).  The Journaler's MLX path does **not** participate
+in this routing because it reuses the single MLX model already loaded in memory —
+hot-swapping models mid-session is not supported.  The Claude API path could
+theoretically route to different Anthropic model tiers per agent class; this is a
+separate, lower-priority enhancement (see ``_resolve_model_for_agent`` in backends.py).
+
 Skills
 ------
 Skill definitions live in YAML files under the skills/ directory (top-level, alongside
