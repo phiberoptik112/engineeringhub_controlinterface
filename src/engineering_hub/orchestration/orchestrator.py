@@ -19,14 +19,14 @@ from engineering_hub.core.models import ParsedTask, TaskResult
 from engineering_hub.corpus.audit_log import RetrievalAuditLog
 from engineering_hub.corpus.citation_verifier import CitationVerifier
 from engineering_hub.corpus_service_factory import build_corpus_service_from_settings
-from engineering_hub.django.client import DjangoClient
-from engineering_hub.memory.service import MemoryService
-from engineering_hub.notes.manager import SharedNotesManager
 from engineering_hub.diagnostics.artifacts import (
     new_diagnostic_run_id,
     persist_task_diagnostic_bundle,
     write_task_result_artifacts,
 )
+from engineering_hub.django.client import DjangoClient
+from engineering_hub.memory.service import MemoryService
+from engineering_hub.notes.manager import SharedNotesManager
 from engineering_hub.orchestration.dispatcher import TaskDispatcher
 from engineering_hub.orchestration.watcher import FileWatcher
 
