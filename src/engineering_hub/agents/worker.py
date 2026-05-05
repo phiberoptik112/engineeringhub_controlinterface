@@ -10,8 +10,9 @@ from engineering_hub.agents.backends import AnthropicBackend, LLMBackend
 from engineering_hub.agents.prompts import PromptLoader
 from engineering_hub.agents.registry import AgentRegistry
 from engineering_hub.agents.style_loader import LatexStyle, StyleLoader
+from engineering_hub.agents.registry import ModelClass
 from engineering_hub.agents.tools import ToolContext, resolve_tools
-from engineering_hub.core.constants import AgentType, ModelClass
+from engineering_hub.core.constants import AgentType
 from engineering_hub.core.exceptions import AgentExecutionError, LLMBackendError
 from engineering_hub.core.models import ParsedTask, TaskResult
 
