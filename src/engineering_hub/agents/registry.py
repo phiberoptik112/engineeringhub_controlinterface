@@ -1,7 +1,6 @@
 """Agent type registry and configuration."""
 
 from dataclasses import dataclass, field
-
 from enum import Enum
 
 from engineering_hub.core.constants import AgentType

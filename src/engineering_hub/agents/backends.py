@@ -464,7 +464,7 @@ def create_backend(
             )
         return AnthropicBackend(
             api_key=settings.anthropic_api_key.get_secret_value(),
-            model=resolved_model or settings.anthropic_model,
+            model=settings.anthropic_model,
         )
 
     if provider == "mlx":

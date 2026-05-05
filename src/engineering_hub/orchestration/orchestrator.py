@@ -8,12 +8,13 @@ from pathlib import Path
 from typing import Optional
 
 from engineering_hub.actions.file_ingest import FileIngestAction
-from engineering_hub.agents.backends import create_backend
+from engineering_hub.agents.backends import _resolve_model_for_agent, create_backend
+from engineering_hub.agents.registry import AgentRegistry
 from engineering_hub.agents.worker import AgentWorker
 from engineering_hub.config.settings import Settings
 from engineering_hub.container.router import TaskRouter
 from engineering_hub.context.manager import ContextManager
-from engineering_hub.core.constants import TaskStatus, is_ingest_task
+from engineering_hub.core.constants import AgentType, TaskStatus, is_ingest_task
 from engineering_hub.core.models import ParsedTask, TaskResult
 from engineering_hub.corpus.audit_log import RetrievalAuditLog
 from engineering_hub.corpus.citation_verifier import CitationVerifier
@@ -84,6 +85,7 @@ class Orchestrator:
         self.memory_service: Optional[MemoryService] = self._init_memory_service()
 
         corpus_service = build_corpus_service_from_settings(self.settings)
+        self._corpus_service = corpus_service
 
         corpus_audit_log = RetrievalAuditLog(self.settings.corpus_audit_log_path)
 
@@ -107,7 +109,11 @@ class Orchestrator:
             corpus_audit_log=corpus_audit_log,
         )
 
-        # Agent worker (provider chosen by llm_provider setting)
+        # Agent registry + model-class-aware worker cache
+        self._registry = AgentRegistry()
+        self._workers: dict[str, AgentWorker] = {}
+
+        # Default worker (global model, used when no class-level override is configured)
         backend = create_backend(self.settings)
         self.agent_worker = AgentWorker(
             backend=backend,
@@ -117,6 +123,7 @@ class Orchestrator:
             corpus_service=corpus_service,
             memory_service=self.memory_service,
         )
+        self._workers["__global__"] = self.agent_worker
 
         # Task router (local or Docker container execution)
         self.task_router = TaskRouter(self.settings, self.agent_worker)
@@ -142,6 +149,35 @@ class Orchestrator:
         )
 
         self._capture_journal_entries()
+
+    def _get_worker(self, agent_type: AgentType) -> AgentWorker:
+        """Return (and cache) the AgentWorker for this agent's model class."""
+        model_tag = _resolve_model_for_agent(
+            self.settings, agent_type, self._registry,
+        )
+        cache_key = model_tag or "__global__"
+
+        if cache_key not in self._workers:
+            backend = create_backend(
+                self.settings,
+                agent_type=agent_type,
+                registry=self._registry,
+            )
+            self._workers[cache_key] = AgentWorker(
+                backend=backend,
+                prompts_dir=self.settings.prompts_dir,
+                output_dir=self.settings.output_dir,
+                max_tokens=self.settings.max_tokens,
+                corpus_service=self._corpus_service,
+                memory_service=self.memory_service,
+            )
+            logger.info(
+                "Created worker for model '%s' (agent class: %s)",
+                model_tag,
+                self._registry.get_model_class(agent_type).value,
+            )
+
+        return self._workers[cache_key]
 
     def _execute_task(self, task: ParsedTask) -> TaskResult:
         """Execute a task using the agent worker or an action.
@@ -180,8 +216,11 @@ class Orchestrator:
         # Build context for the task
         context = self.context_manager.format_for_agent(task)
 
+        # Resolve the correct worker for this agent's model class
+        worker = self._get_worker(task.agent_type)
+
         # Execute via router (local or Docker container)
-        result = self.task_router.execute(task, context)
+        result = self.task_router.execute(task, context, worker=worker)
 
         if result.success:
             self._capture_task_result(task, result)

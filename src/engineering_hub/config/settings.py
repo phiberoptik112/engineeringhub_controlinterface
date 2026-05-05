@@ -371,6 +371,28 @@ class Settings(BaseSettings):
         description="Max number of recent daily journal files to parse for context/tasks",
     )
 
+    # ── Per-agent model routing ─────────────────────────────────────
+    agents_reasoning_model: str = Field(
+        default="",
+        description="Model tag for reasoning-class agents (standards-checker, evaluator, "
+        "ref-engineer, weekly-reviewer). For Ollama: 'qwen3:32b'. "
+        "For MLX: HF model ID or local path. Empty = fall back to global model.",
+    )
+    agents_tool_use_model: str = Field(
+        default="",
+        description="Model tag for tool-use-class agents (research, technical-writer, "
+        "technical-reviewer). For Ollama: 'qwen3.6:35b-a3b'. "
+        "For MLX: HF model ID or local path. Empty = fall back to global model.",
+    )
+    agents_reasoning_max_tokens: int = Field(
+        default=8192,
+        description="Default max_tokens for reasoning-class agents.",
+    )
+    agents_tool_use_max_tokens: int = Field(
+        default=4096,
+        description="Default max_tokens for tool-use-class agents.",
+    )
+
     # Report template settings
     templates_dir: Path | None = Field(
         default=None,
@@ -705,6 +727,18 @@ class Settings(BaseSettings):
                 flat_config["journaler_journal_lookback_days"] = j["journal_lookback_days"]
             if j.get("journal_max_files") is not None:
                 flat_config["journaler_journal_max_files"] = j["journal_max_files"]
+
+        if "agents" in config:
+            agents = config["agents"]
+            models = agents.get("models", {})
+            if models.get("reasoning"):
+                flat_config["agents_reasoning_model"] = models["reasoning"]
+            if models.get("tool_use"):
+                flat_config["agents_tool_use_model"] = models["tool_use"]
+            if agents.get("reasoning_max_tokens") is not None:
+                flat_config["agents_reasoning_max_tokens"] = agents["reasoning_max_tokens"]
+            if agents.get("tool_use_max_tokens") is not None:
+                flat_config["agents_tool_use_max_tokens"] = agents["tool_use_max_tokens"]
 
         if "templates" in config:
             tpl = config["templates"]
