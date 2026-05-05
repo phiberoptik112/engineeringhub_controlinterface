@@ -34,7 +34,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import yaml
 from pydantic import SecretStr
@@ -64,6 +64,8 @@ def build_delegator(
     default_backend: str = "mlx",
     output_dir: Path | None = None,
     prompts_dir: Path | None = None,
+    corpus_service: Any | None = None,
+    memory_service: Any | None = None,
 ) -> AgentDelegator | None:
     """Construct an :class:`AgentDelegator` or return ``None`` if setup fails.
 
@@ -82,6 +84,8 @@ def build_delegator(
                 api_key=key,
                 prompts_dir=prompts_dir,
                 output_dir=output_dir,
+                corpus_service=corpus_service,
+                memory_service=memory_service,
             )
             logger.info("Claude API worker initialized for agent delegation")
 
@@ -92,6 +96,8 @@ def build_delegator(
             default_backend=default_backend,
             prompts_dir=prompts_dir,
             output_dir=output_dir,
+            corpus_service=corpus_service,
+            memory_service=memory_service,
         )
         logger.info(
             "AgentDelegator ready (default backend: %s, skills: %s)",
@@ -230,6 +236,8 @@ class AgentDelegator:
         default_backend: str = "mlx",
         prompts_dir: Path | None = None,
         output_dir: Path | None = None,
+        corpus_service: Any | None = None,
+        memory_service: Any | None = None,
     ) -> None:
         self._default_backend = default_backend.lower()
         self._anthropic_worker = anthropic_worker
@@ -239,6 +247,8 @@ class AgentDelegator:
             backend=self._mlx_adapter,
             prompts_dir=prompts_dir,
             output_dir=output_dir,
+            corpus_service=corpus_service,
+            memory_service=memory_service,
         )
 
         resolved_skills = skills_dir or _default_skills_dir()
@@ -282,7 +292,7 @@ class AgentDelegator:
             )
 
         try:
-            agent_enum = AgentType(resolved_type)
+            AgentType(resolved_type)
         except ValueError:
             return f"Agent type '{resolved_type}' is not registered in the system."
 

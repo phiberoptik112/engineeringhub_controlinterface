@@ -37,14 +37,14 @@ DEFAULT_AGENT_CONFIGS = {
         agent_type=AgentType.RESEARCH,
         prompt_file="research-agent.txt",
         model_class=ModelClass.TOOL_USE,
-        tools=["web_search", "web_fetch", "django_api"],
+        tools=["search_corpus", "search_memory", "ingest_files"],
         max_tokens=4096,
     ),
     AgentType.TECHNICAL_WRITER: AgentConfig(
         agent_type=AgentType.TECHNICAL_WRITER,
         prompt_file="technical-writer.txt",
         model_class=ModelClass.TOOL_USE,
-        tools=["create_file", "view", "ingest_files", "django_api"],
+        tools=["search_corpus", "search_memory", "ingest_files"],
         max_tokens=4096,
     ),
     AgentType.STANDARDS_CHECKER: AgentConfig(
@@ -74,7 +74,7 @@ DEFAULT_AGENT_CONFIGS = {
         agent_type=AgentType.TECHNICAL_REVIEWER,
         prompt_file="technical-reviewer.txt",
         model_class=ModelClass.TOOL_USE,
-        tools=["ingest_files", "get_project_file"],
+        tools=["search_corpus", "search_memory", "ingest_files"],
         max_tokens=8000,
     ),
     AgentType.WEEKLY_REVIEWER: AgentConfig(
@@ -140,7 +140,7 @@ class AgentRegistry:
         if agent_type in self._configs:
             self._configs[agent_type].enabled = False
 
-    def update_config(self, agent_type: AgentType, **kwargs) -> None:
+    def update_config(self, agent_type: AgentType, **kwargs: object) -> None:
         """Update configuration for an agent type."""
         if agent_type in self._configs:
             config = self._configs[agent_type]
