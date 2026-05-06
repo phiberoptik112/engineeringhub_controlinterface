@@ -16,9 +16,13 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
+from engineering_hub.actions.file_ingest import read_path_content_for_load
 from engineering_hub.config.loader import find_config_file
 from engineering_hub.config.settings import Settings
-from engineering_hub.journaler.constants import DEFAULT_JOURNALER_MLX_MODEL_ID
+from engineering_hub.journaler.constants import (
+    DEFAULT_JOURNALER_MLX_MODEL_ID,
+    JOURNALER_CONVERSATION_EXPORT_DIRNAME,
+)
 from engineering_hub.journaler.engine import (
     SUPPORTED_EXTENSIONS,
     ConversationEngine,
@@ -32,6 +36,7 @@ from engineering_hub.journaler.model_profiles import (
     resolve_journaler_model_spec,
 )
 from engineering_hub.orchestration.orchestrator import Orchestrator
+from engineering_hub.search import build_agent_search_provider_from_settings
 
 console = Console()
 
@@ -47,6 +52,9 @@ class _ExportSlashHelp(Exception):
 def _export_slash_usage() -> str:
     return (
         "/export — same as `engineering-hub journaler export` (transcript → org).\n\n"
+        "With no -o / --note / --find-title / --new-node, exports are written under\n"
+        f"  <org-roam>/{JOURNALER_CONVERSATION_EXPORT_DIRNAME}/\n"
+        "as a new org-roam node (CLI `journaler export` still prints to stdout by default).\n\n"
         "Examples:\n"
         "  /export\n"
         "  /export --summarize\n"
@@ -151,12 +159,20 @@ def _execute_journaler_export(
     spec: object,
     log: Console,
     body_to_stdout: bool,
+    chat_default_roam_export: bool = False,
 ) -> int:
     """Shared implementation for `journaler export` CLI and `/export` in chat.
 
-    When *body_to_stdout* is False, the export body is printed with Rich markup
-    escaped (interactive chat). When True, raw body is written to sys.stdout
-    if no file/note/new-node target consumed it.
+    When *body_to_stdout* is True (CLI default), raw body is written to
+    ``sys.stdout`` if no file/note/new-node target consumed it.
+
+    When *chat_default_roam_export* is True and nothing else consumed the body,
+    writes a new node under the configured org-roam root, in the
+    ``conversation_exports`` subdirectory (see
+    :data:`~engineering_hub.journaler.constants.JOURNALER_CONVERSATION_EXPORT_DIRNAME`).
+
+    When *body_to_stdout* is False and *chat_default_roam_export* is False, the
+    export body is printed with Rich markup escaped (legacy behavior).
     """
     from engineering_hub.journaler.conversation_export import (
         build_summarize_prompt,
@@ -282,6 +298,18 @@ def _execute_journaler_export(
         wrote_file = True
 
     if not wrote_file:
+        if chat_default_roam_export:
+            export_dir = org_roam_dir / JOURNALER_CONVERSATION_EXPORT_DIRNAME
+            export_dir.mkdir(parents=True, exist_ok=True)
+            ok, msg = create_org_node(
+                export_dir,
+                "Journaler chat export",
+                filetags=["journaler-export"],
+                body=body,
+            )
+            color = "green" if ok else "red"
+            log.print(f"[{color}]{escape(msg)}[/{color}]")
+            return 0 if ok else 1
         if body_to_stdout:
             sys.stdout.write(body)
         else:
@@ -456,6 +484,9 @@ def cmd_status(args: argparse.Namespace) -> int:
             use_org_mode=settings.use_org_mode,
             org_task_sections=settings.org_task_sections,
             org_lookback_days=settings.org_lookback_days,
+            pending_tasks_file=settings.resolved_journaler_pending_tasks_file
+            if settings.use_org_mode
+            else None,
         )
         pending = manager.get_pending_tasks()
 
@@ -494,7 +525,7 @@ def cmd_run_once(args: argparse.Namespace) -> int:
         success_count = sum(1 for r in results if r.success)
         fail_count = len(results) - success_count
 
-        console.print(f"\n[bold]Results:[/bold]")
+        console.print("\n[bold]Results:[/bold]")
         console.print(f"  ✓ Completed: {success_count}")
         console.print(f"  ✗ Failed: {fail_count}")
 
@@ -676,7 +707,7 @@ def cmd_weekly_review(args: argparse.Namespace) -> int:
         console.print(f"[red]Error:[/red] Weekly review failed: {exc}")
         return 1
 
-    console.print(f"[bold green]Weekly review complete![/bold green]")
+    console.print("[bold green]Weekly review complete![/bold green]")
     console.print(f"  Report: {output_path}")
     return 0
 
@@ -766,6 +797,7 @@ def _handle_chat_slash_command(
       /open [today|clear|<path>|<title>]  Set session org-roam target for /edit.
       /edit <heading> :: <text>  Append under a heading in the /open target.
       /exit, /quit               Leave the chat (same as bare exit, quit, or :q).
+      /tasks … /queue            Overnight queue in pending-tasks.org (confirm, commit, rollback).
       /agent … /skills           Delegate to agent personalities (when delegator is configured).
       /validate-latex <path>     Compile a .tex file with pdflatex and report errors/warnings.
       /export …                  Export conversation.jsonl to org (same flags as journaler export).
@@ -815,6 +847,20 @@ def _handle_chat_slash_command(
         chat_console.print(f"[green]{escape(msg)}[/green]")
         return
 
+    if cmd in ("/tasks", "/queue"):
+        if export_settings is None:
+            chat_console.print(
+                "[yellow]/tasks requires workspace settings (pending_tasks_file).[/yellow]"
+            )
+            return
+        from engineering_hub.journaler.task_slash import handle_tasks_slash_command
+
+        msg = handle_tasks_slash_command(
+            raw, engine, export_settings.resolved_journaler_pending_tasks_file
+        )
+        chat_console.print(f"[green]{escape(msg)}[/green]")
+        return
+
     if cmd == "/agent":
         if journal_ctx is None:
             chat_console.print(
@@ -824,6 +870,18 @@ def _handle_chat_slash_command(
         from engineering_hub.journaler.chat_server import _handle_agent_command
 
         msg = _handle_agent_command(raw, delegator, journal_ctx, engine=engine)
+        _print_chat_markdown(chat_console, msg)
+        return
+
+    if cmd == "/pipeline":
+        if journal_ctx is None:
+            chat_console.print(
+                "[yellow]/pipeline requires journal context; start from a configured workspace.[/yellow]"
+            )
+            return
+        from engineering_hub.journaler.chat_server import _handle_pipeline_command
+
+        msg = _handle_pipeline_command(raw, delegator, journal_ctx, engine=engine)
         _print_chat_markdown(chat_console, msg)
         return
 
@@ -979,6 +1037,7 @@ def _handle_chat_slash_command(
             spec=export_spec,
             log=chat_console,
             body_to_stdout=False,
+            chat_default_roam_export=True,
         )
         return
 
@@ -1307,8 +1366,7 @@ def _handle_chat_slash_command(
         if not heading or not text:
             chat_console.print("[yellow]Usage: /note <heading> :: <text>[/yellow]")
             return
-        from datetime import datetime as _dt
-        from engineering_hub.journaler.org_writer import _today_journal_path, _create_journal_file
+        from engineering_hub.journaler.org_writer import _create_journal_file, _today_journal_path
         today_path = _today_journal_path(journal_dir)
         _create_journal_file(today_path)
         ok, msg = append_to_heading(today_path, heading, text, create_heading_if_missing=True)
@@ -1449,7 +1507,7 @@ def cmd_journaler(args: argparse.Namespace) -> int:
     if sub is None:
         console.print(
             "[yellow]Usage: engineering-hub journaler"
-            " {start|chat|briefing|export|status|scan|clear|download}[/yellow]"
+            " {start|chat|briefing|export|status|scan|clear|download|pipeline}[/yellow]"
         )
         return 1
 
@@ -1490,7 +1548,12 @@ def cmd_journaler(args: argparse.Namespace) -> int:
 
     from engineering_hub.corpus_service_factory import build_corpus_service_from_settings
     from engineering_hub.journaler.context import JournalContext
-    from engineering_hub.journaler.daemon import JournalerConfig, generate_briefing_now, run_daemon
+    from engineering_hub.journaler.daemon import (
+        JournalerConfig,
+        generate_briefing_now,
+        pressure_config_from_settings,
+        run_daemon,
+    )
 
     memory_service = None
     if settings.memory_enabled:
@@ -1507,6 +1570,7 @@ def cmd_journaler(args: argparse.Namespace) -> int:
             console.print(f"[yellow]Warning:[/yellow] Memory service unavailable: {exc}")
 
     corpus_service = build_corpus_service_from_settings(settings)
+    web_search_provider = build_agent_search_provider_from_settings(settings)
 
     config = JournalerConfig(
         model_path=spec.model_path,
@@ -1526,6 +1590,11 @@ def cmd_journaler(args: argparse.Namespace) -> int:
         max_conversation_history=settings.journaler_max_conversation_history,
         max_tokens=spec.max_tokens,
         model_context_window=spec.model_context_window,
+        context_management=pressure_config_from_settings(
+            settings,
+            model_context_window=spec.model_context_window,
+            max_history_turns=settings.journaler_max_conversation_history,
+        ),
         temp=spec.temp,
         top_p=spec.top_p,
         min_p=spec.min_p,
@@ -1534,6 +1603,13 @@ def cmd_journaler(args: argparse.Namespace) -> int:
         mlx_backend=spec.mlx_backend,
         memory_service=memory_service,
         corpus_service=corpus_service,
+        web_search_provider=web_search_provider,
+        web_search_enabled=settings.agent_web_search_enabled,
+        web_search_max_results=settings.agent_web_search_max_results,
+        web_search_max_chars=settings.agent_web_search_max_chars,
+        web_search_anthropic_backup_enabled=settings.agent_web_search_anthropic_backup_enabled,
+        web_search_anthropic_tool_version=settings.agent_web_search_anthropic_tool_version,
+        web_search_anthropic_max_uses=settings.agent_web_search_anthropic_max_uses,
         load_max_context_fraction=settings.journaler_load_max_context_fraction,
         load_max_chars_absolute=settings.journaler_load_max_chars_absolute,
         load_min_chars=settings.journaler_load_min_chars,
@@ -1546,6 +1622,12 @@ def cmd_journaler(args: argparse.Namespace) -> int:
         scan_org_roam_tree=settings.journaler_scan_org_roam_tree,
         journal_lookback_days=settings.journaler_journal_lookback_days,
         journal_max_files=settings.journaler_journal_max_files,
+        pending_tasks_file=settings.resolved_journaler_pending_tasks_file,
+        conversation_lookback_days=settings.journaler_conversation_lookback_days,
+        conversation_summary_excerpt_chars=(
+            settings.journaler_conversation_summary_excerpt_chars
+        ),
+        org_link_on_relation=settings.journaler_org_link_on_relation,
     )
 
     if sub == "start":
@@ -1572,15 +1654,15 @@ def cmd_journaler(args: argparse.Namespace) -> int:
 
     elif sub == "chat":
         from engineering_hub.journaler.chat_repl import (
-            COMMAND_CATALOG,
             _PALETTE_SENTINEL,
+            COMMAND_CATALOG,
             configure_chat_readline,
             prompt_line,
             set_pending_insertion,
         )
-        from engineering_hub.journaler.file_browser import browse_commands
         from engineering_hub.journaler.delegator import build_delegator
         from engineering_hub.journaler.engine import ConversationEngine
+        from engineering_hub.journaler.file_browser import browse_commands
         from engineering_hub.journaler.prompts import (
             build_skills_block,
             build_workspace_layout,
@@ -1601,6 +1683,9 @@ def cmd_journaler(args: argparse.Namespace) -> int:
             scan_org_roam_tree=config.scan_org_roam_tree,
             journal_lookback_days=config.journal_lookback_days,
             journal_max_files=config.journal_max_files,
+            pending_tasks_file=settings.resolved_journaler_pending_tasks_file,
+            conversation_lookback_days=config.conversation_lookback_days,
+            conversation_summary_excerpt_chars=config.conversation_summary_excerpt_chars,
         )
         ctx.scan()
 
@@ -1613,16 +1698,28 @@ def cmd_journaler(args: argparse.Namespace) -> int:
             ctx.get_current_context(),
             workspace_map=workspace_map,
         )
+        pressure_cfg_chat = config.get_pressure_config()
         engine = ConversationEngine(
             backend=backend,
             system_prompt=system_prompt,
             log_dir=config.state_dir,
             max_history=config.max_conversation_history,
             max_tokens=config.max_tokens,
-            pressure_config=config.get_pressure_config(),
+            pressure_config=pressure_cfg_chat,
             model_context_window=config.model_context_window,
             corpus_service=config.corpus_service,
             load_file_budget=config.get_load_file_budget(),
+            memory_service=config.memory_service,
+            journal_dir=config.journal_dir,
+            relation_threshold=pressure_cfg_chat.conversation_relation_threshold,
+            org_link_on_relation=config.org_link_on_relation,
+            web_search_provider=config.web_search_provider,
+            web_search_enabled=config.web_search_enabled,
+            web_search_max_results=config.web_search_max_results,
+            web_search_max_chars=config.web_search_max_chars,
+            web_search_anthropic_backup_enabled=config.web_search_anthropic_backup_enabled,
+            web_search_anthropic_tool_version=config.web_search_anthropic_tool_version,
+            web_search_anthropic_max_uses=config.web_search_anthropic_max_uses,
         )
 
         delegator = build_delegator(
@@ -1701,6 +1798,35 @@ def cmd_journaler(args: argparse.Namespace) -> int:
                     console.print(_build_status_bar(engine, model_label))
                     continue
                 try:
+                    from engineering_hub.journaler.chat_router import (
+                        route_natural_language_task,
+                    )
+                    from engineering_hub.journaler.chat_server import (
+                        _handle_agent_command,
+                    )
+
+                    mode = (settings.journaler_default_task_mode or "immediate").lower()
+                    if ctx is not None:
+                        routed_result = route_natural_language_task(
+                            user_input,
+                            engine=engine,
+                            delegator=delegator,
+                            mode=mode,
+                            pending_tasks_file=settings.resolved_journaler_pending_tasks_file,
+                            run_agent_command=lambda cmd: _handle_agent_command(
+                                cmd, delegator, ctx, engine=engine
+                            ),
+                        )
+                    else:
+                        routed_result = None
+
+                    if routed_result is not None:
+                        console.print("\n[bold]Journaler:[/bold]")
+                        _print_chat_markdown(console, routed_result.response)
+                        console.print()
+                        console.print(_build_status_bar(engine, model_label))
+                        continue
+
                     raw_response = engine.chat(user_input)
                 except Exception as exc:
                     log.exception("Journaler chat turn failed")
@@ -1804,6 +1930,9 @@ def cmd_journaler(args: argparse.Namespace) -> int:
             scan_org_roam_tree=config.scan_org_roam_tree,
             journal_lookback_days=config.journal_lookback_days,
             journal_max_files=config.journal_max_files,
+            pending_tasks_file=settings.resolved_journaler_pending_tasks_file,
+            conversation_lookback_days=config.conversation_lookback_days,
+            conversation_summary_excerpt_chars=config.conversation_summary_excerpt_chars,
         )
         snapshot = ctx.scan()
         console.print(f"  Last scan: {snapshot.last_scan}")
@@ -1814,7 +1943,7 @@ def cmd_journaler(args: argparse.Namespace) -> int:
 
     elif sub == "clear":
         from engineering_hub.journaler.context_manager import ClearStrategy
-        from engineering_hub.journaler.engine import ConversationalMLXBackend, ConversationEngine
+        from engineering_hub.journaler.engine import ConversationEngine
 
         hard = getattr(args, "hard", False)
         summarize = getattr(args, "summarize", False)
@@ -1848,8 +1977,8 @@ def cmd_journaler(args: argparse.Namespace) -> int:
             msg = engine.clear(strategy)
         else:
             from engineering_hub.journaler.context_manager import (
-                ConversationHistory,
                 ContextCompressor,
+                ConversationHistory,
                 execute_clear,
             )
             history = ConversationHistory()
@@ -1913,6 +2042,95 @@ def cmd_journaler(args: argparse.Namespace) -> int:
             body_to_stdout=True,
         )
 
+    elif sub == "pipeline":
+        pipeline_cmd = getattr(args, "pipeline_command", None)
+        if pipeline_cmd != "draft-section":
+            console.print(
+                "[yellow]Usage: engineering-hub journaler pipeline draft-section "
+                '--section "<section>" [--project <id>] [--backend auto|mlx|claude] '
+                "[--loop-limit <n>][/yellow]"
+            )
+            return 1
+
+        from engineering_hub.context.data_gatherer import DataGatherer
+        from engineering_hub.orchestration.pipeline import AgentPipeline
+
+        section = args.section
+        project_id: int | str | None = None
+        if args.pipeline_project_id is not None:
+            try:
+                project_id = int(args.pipeline_project_id)
+            except ValueError:
+                project_id = args.pipeline_project_id
+
+        backend = getattr(args, "pipeline_backend", "auto")
+        loop_limit = getattr(args, "pipeline_loop_limit", None)
+
+        output_dir = settings.workspace_dir / "outputs"
+        gatherer = DataGatherer(output_dir=output_dir)
+        pid_for_gather = project_id if project_id is not None else "unknown"
+
+        console.print(f"[bold]Gathering data files for section:[/bold] {section}")
+        bundle = gatherer.gather(project_id=pid_for_gather, section_hint=section)
+        console.print(f"  Files found: {bundle.summary_line()}")
+
+        if bundle.is_empty:
+            console.print(
+                "[yellow]Warning:[/yellow] No pre-processed result files found in staging directory.\n"
+                "  Ensure external scripts have written their output to:\n"
+                f"  {output_dir / 'staging' / f'project-{pid_for_gather}'}\n"
+                "  Continuing with empty data bundle."
+            )
+
+        # Build a lightweight delegator from settings for CLI use
+        from engineering_hub.journaler.delegator import build_delegator
+
+        api_key = settings.anthropic_api_key or ""
+
+        try:
+
+            mlx_backend = build_journaler_mlx_backend(spec)
+            delegator = build_delegator(
+                mlx_backend,
+                anthropic_api_key=api_key,
+                output_dir=output_dir,
+            )
+        except Exception as exc:
+            console.print(f"[red]Error:[/red] Could not initialise agent delegator: {exc}")
+            return 1
+
+        if delegator is None:
+            console.print(
+                "[red]Error:[/red] No agent backend available. "
+                "Configure 'anthropic.api_key' or ensure the MLX model is loaded."
+            )
+            return 1
+
+        pipeline = AgentPipeline(output_dir=output_dir / "pipeline")
+        console.print("[bold]Running drafting pipeline…[/bold]")
+
+        try:
+            result = pipeline.run(
+                section=section,
+                data_bundle=bundle,
+                delegator=delegator,
+                project_id=project_id,
+                backend=backend,
+                loop_limit=loop_limit,
+            )
+        except Exception as exc:
+            console.print(f"[red]Pipeline error:[/red] {exc}")
+            return 1
+
+        if result.artifact_path:
+            console.print(f"\n[bold green]Pipeline complete.[/bold green] Artifact: {result.artifact_path}")
+        if result.failed:
+            console.print(f"[red]Pipeline failed:[/red] {result.failure_reason}")
+            return 1
+
+        console.print(result.format_summary())
+        return 0
+
     console.print("[yellow]Unknown journaler command.[/yellow]")
     return 1
 
@@ -1949,7 +2167,7 @@ def cmd_template(args: argparse.Namespace) -> int:
             console.print(f"[red]Error:[/red] Analysis failed: {exc}")
             return 1
 
-        console.print(f"[bold green]Template analysis complete![/bold green]")
+        console.print("[bold green]Template analysis complete![/bold green]")
         console.print(f"  Name: {skeleton.name}")
         console.print(f"  Source docs: {skeleton.source_doc_count}")
         console.print(f"  Sections: {len(skeleton.sections)}")
@@ -2361,6 +2579,47 @@ def cmd_capture(args: argparse.Namespace) -> int:
     return 1
 
 
+def cmd_diagnostic(args: argparse.Namespace) -> int:
+    if args.diagnostic_command == "context-pipeline":
+        return cmd_diagnostic_context_pipeline(args)
+    return 1
+
+
+def cmd_diagnostic_context_pipeline(args: argparse.Namespace) -> int:
+    """Run synthetic tasks through ContextManager + optional AgentWorker; write artifacts."""
+    setup_logging(args.verbose)
+    settings = _apply_cli_overrides(load_settings(args.config), args)
+    settings = settings.model_copy(
+        update={
+            "context_pipeline_diagnostic_enabled": True,
+            "diagnostic_context_audit_prompt": getattr(
+                args, "context_audit_prompt", False
+            ),
+        }
+    )
+    tasks_path = Path(args.tasks).expanduser().resolve()
+    if not tasks_path.is_file():
+        console.print(f"[red]Error:[/red] Tasks file not found: {tasks_path}")
+        return 1
+    if not args.dry_run_context_only:
+        if err := _validate_llm_settings(settings):
+            return err
+
+    from engineering_hub.diagnostics.runner import run_context_pipeline_diagnostic
+
+    code, run_root = run_context_pipeline_diagnostic(
+        settings,
+        tasks_path,
+        max_tasks=args.max_tasks,
+        dry_run_context_only=args.dry_run_context_only,
+    )
+    console.print(
+        f"[bold green]Diagnostic run complete.[/bold green] "
+        f"Artifacts under:\n  {run_root}"
+    )
+    return code
+
+
 def cmd_memory(args: argparse.Namespace) -> int:
     """Query or inspect the local memory database."""
     setup_logging(args.verbose)
@@ -2517,8 +2776,8 @@ def cmd_load(args: argparse.Namespace) -> int:
     skipped = 0
     for file_path in candidates:
         try:
-            content = file_path.read_text(encoding="utf-8", errors="replace")
-        except OSError as exc:
+            content = read_path_content_for_load(file_path)
+        except Exception as exc:
             console.print(f"  [red]✗[/red] {file_path.name}: {exc}")
             skipped += 1
             continue
@@ -2843,6 +3102,48 @@ def main() -> int:
         help="Create a new org-roam node with this #+title and export as body",
     )
 
+    # journaler pipeline subcommand
+    pipeline_p = journaler_sub.add_parser(
+        "pipeline",
+        help="Multi-stage report section drafting pipeline",
+    )
+    pipeline_sub = pipeline_p.add_subparsers(dest="pipeline_command")
+    draft_section_p = pipeline_sub.add_parser(
+        "draft-section",
+        help=(
+            "Gather pre-processed data files and run the full drafting pipeline: "
+            "technical-writer → standards-checker → technical-reviewer → latex-writer"
+        ),
+    )
+    draft_section_p.add_argument(
+        "--section",
+        required=True,
+        metavar="SECTION",
+        help='Report section label (e.g. "6.0 Noise Impacts")',
+    )
+    draft_section_p.add_argument(
+        "--project",
+        dest="pipeline_project_id",
+        default=None,
+        metavar="ID",
+        help="Django project ID for staging directory lookup",
+    )
+    draft_section_p.add_argument(
+        "--backend",
+        dest="pipeline_backend",
+        default="auto",
+        choices=["auto", "mlx", "claude"],
+        help="Agent backend to use for all stages (default: auto)",
+    )
+    draft_section_p.add_argument(
+        "--loop-limit",
+        dest="pipeline_loop_limit",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Override max retries for the standards-checker loop-back (default: 2)",
+    )
+
     # docker command
     docker_parser = subparsers.add_parser(
         "docker", help="Docker container management for agent tasks"
@@ -2893,12 +3194,67 @@ def main() -> int:
     search_p.add_argument("query", help="Search query")
     search_p.add_argument("--k", type=int, default=5, help="Max results")
 
+    diag_parser = subparsers.add_parser(
+        "diagnostic",
+        help="Diagnostic utilities (context pipeline, etc.)",
+    )
+    diag_sub = diag_parser.add_subparsers(dest="diagnostic_command", required=True)
+    _repo_root = Path(__file__).resolve().parents[2]
+    cp_parser = diag_sub.add_parser(
+        "context-pipeline",
+        help="Run context pipeline tasks; write formatted context, checklist, and optional agent output",
+    )
+    cp_parser.add_argument(
+        "--tasks",
+        type=Path,
+        default=_repo_root / "diagnostics" / "context_pipeline_tasks.yaml",
+        help="YAML file with a top-level 'tasks' list",
+    )
+    cp_parser.add_argument(
+        "--max-tasks",
+        type=int,
+        default=10,
+        help="Maximum number of tasks to run from the file",
+    )
+    cp_parser.add_argument(
+        "--dry-run-context-only",
+        action="store_true",
+        help="Build and persist context only (no LLM calls)",
+    )
+    cp_parser.add_argument(
+        "--context-audit-prompt",
+        action="store_true",
+        dest="context_audit_prompt",
+        help="Append CONTEXT AUDIT diagnostic block to agent system prompts",
+    )
+    cp_parser.add_argument(
+        "--docker",
+        action="store_true",
+        default=None,
+        help="Run agent tasks in Docker (overrides docker.enabled)",
+    )
+    cp_parser.add_argument(
+        "--no-docker",
+        action="store_false",
+        dest="docker",
+        help="Force local agent execution",
+    )
+    cp_parser.add_argument(
+        "--llm-provider",
+        dest="llm_provider_override",
+        choices=["anthropic", "mlx", "ollama"],
+        help="Override llm_provider from config",
+    )
+
     args = parser.parse_args()
     setup_logging(args.verbose)
 
     if args.command is None:
         parser.print_help()
         return 0
+
+    if args.command == "diagnostic":
+        return cmd_diagnostic(args)
 
     commands = {
         "start": cmd_start,

@@ -14,6 +14,7 @@ from engineering_hub.agents.tools import ToolContext, resolve_tools
 from engineering_hub.core.constants import AgentType
 from engineering_hub.core.exceptions import AgentExecutionError, LLMBackendError
 from engineering_hub.core.models import ParsedTask, TaskResult
+from engineering_hub.diagnostics.prompt_addendum import DIAGNOSTIC_CONTEXT_AUDIT_ADDENDUM
 
 logger = logging.getLogger(__name__)
 
@@ -33,10 +34,12 @@ class AgentWorker:
         templates_dir: Path | None = None,
         corpus_service: Any | None = None,
         memory_service: Any | None = None,
+        diagnostic_context_audit: bool = False,
     ) -> None:
         self._backend = backend
         self.max_tokens = max_tokens
         self.output_dir = output_dir or Path("outputs")
+        self.diagnostic_context_audit = diagnostic_context_audit
 
         self._prompt_loader = PromptLoader(prompts_dir or Path("prompts"))
         self._registry = AgentRegistry()
@@ -71,6 +74,7 @@ class AgentWorker:
             templates_dir=templates_dir,
             corpus_service=corpus_service,
             memory_service=memory_service,
+            diagnostic_context_audit=False,
         )
 
     def execute(self, task: ParsedTask, context: str) -> TaskResult:
@@ -83,6 +87,18 @@ class AgentWorker:
         Returns:
             TaskResult with success status and outputs
         """
+        return self.execute_with_options(task, context)
+
+    def execute_with_options(
+        self,
+        task: ParsedTask,
+        context: str,
+        *,
+        anthropic_web_search: bool = False,
+        anthropic_web_search_tool_version: str = "web_search_20250305",
+        anthropic_web_search_max_uses: int = 3,
+    ) -> TaskResult:
+        """Execute a task with optional backend-specific execution options."""
         agent_type = task.agent_type
 
         if not self._registry.is_enabled(agent_type):
@@ -107,6 +123,11 @@ class AgentWorker:
                     system_prompt, task.description
                 )
 
+            if self.diagnostic_context_audit:
+                system_prompt = (
+                    system_prompt.rstrip() + "\n\n" + DIAGNOSTIC_CONTEXT_AUDIT_ADDENDUM
+                )
+
             user_message = self._build_user_message(
                 task, context, override_description=cleaned_description
             )
@@ -119,7 +140,17 @@ class AgentWorker:
                 and config.tools
                 and hasattr(self._backend, "complete_with_tools")
             )
-            if use_tools:
+            if anthropic_web_search and isinstance(self._backend, AnthropicBackend):
+                logger.info("Using Anthropic server-side web search fallback for agent task")
+                max_tok = config.max_tokens if config else self.max_tokens
+                response = self._backend.complete_with_web_search(
+                    system_prompt,
+                    user_message,
+                    max_tok,
+                    tool_version=anthropic_web_search_tool_version,
+                    max_uses=anthropic_web_search_max_uses,
+                )
+            elif use_tools:
                 response = self._execute_with_tools(
                     task=task,
                     system_prompt=system_prompt,

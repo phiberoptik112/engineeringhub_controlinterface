@@ -44,6 +44,23 @@ _WIKILINK = re.compile(r"\[\[([^\]]+)\]\]")
 _IN_PROGRESS_RE = re.compile(r"\s*\(in progress\)\s*$")
 _BLOCKED_RE = re.compile(r"\s*\(blocked:[^)]*\)\s*$")
 
+# Top-level org headings (single star) — for standalone queue files without subheading collapse
+_TOP_ORG_HEADING = re.compile(r"^\* (.+)$", re.MULTILINE)
+
+
+def _split_top_level_sections_raw(text: str) -> dict[str, str]:
+    """Split org on top-level `* Heading`; preserve `**` subheadings in bodies."""
+    headings = list(_TOP_ORG_HEADING.finditer(text))
+    if not headings:
+        return {}
+    sections: dict[str, str] = {}
+    for i, match in enumerate(headings):
+        heading = match.group(1).strip()
+        body_start = match.end()
+        body_end = headings[i + 1].start() if i + 1 < len(headings) else len(text)
+        sections[heading] = text[body_start:body_end]
+    return sections
+
 
 class OrgTaskParser:
     """Extracts ``ParsedTask`` objects from org-roam daily journal files.
@@ -64,10 +81,12 @@ class OrgTaskParser:
         journal_dir: Path,
         task_sections: list[str] | None = None,
         lookback_days: int = 1,
+        extra_files: list[Path] | None = None,
     ) -> None:
         self.journal_dir = journal_dir
         self.task_sections: list[str] = task_sections or ["Overnight Agent Tasks"]
         self.lookback_days = lookback_days
+        self.extra_files: list[Path] = [p.expanduser().resolve() for p in (extra_files or [])]
         self._reader = OrgJournalReader(journal_dir)
 
     # ------------------------------------------------------------------
@@ -98,14 +117,40 @@ class OrgTaskParser:
                     journal_date=entry.date.isoformat(),
                     file_path=file_path,
                     section_name=section_name,
+                    source_path=None,
                 )
                 tasks.extend(section_tasks)
+
+        for xf in self.extra_files:
+            if xf.is_file():
+                tasks.extend(self._parse_extra_org_file(xf))
 
         return tasks
 
     def org_file_for_date(self, journal_date: str) -> Path:
         """Return the path to the org file for a given ISO date string."""
         return self.journal_dir / f"{journal_date}.org"
+
+    def _parse_extra_org_file(self, file_path: Path) -> list[ParsedTask]:
+        """Parse task sections from a standalone org file (e.g. pending-tasks.org)."""
+        raw = file_path.read_text(encoding="utf-8")
+        sections = _split_top_level_sections_raw(raw)
+        resolved = str(file_path.resolve())
+        found: list[ParsedTask] = []
+        for section_name in self.task_sections:
+            body = sections.get(section_name, "")
+            if not body.strip():
+                continue
+            found.extend(
+                self._extract_tasks_from_body(
+                    body=body,
+                    journal_date=None,
+                    file_path=file_path,
+                    section_name=section_name,
+                    source_path=resolved,
+                )
+            )
+        return found
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -114,9 +159,10 @@ class OrgTaskParser:
     def _extract_tasks_from_body(
         self,
         body: str,
-        journal_date: str,
+        journal_date: str | None,
         file_path: Path,
         section_name: str,
+        source_path: str | None = None,
     ) -> list[ParsedTask]:
         """Parse task items from a single section body."""
         tasks: list[ParsedTask] = []
@@ -151,6 +197,7 @@ class OrgTaskParser:
                 journal_date=journal_date,
                 category=section_name,
                 abs_line=abs_line,
+                source_path=source_path,
             )
             tasks.append(task)
 
@@ -194,9 +241,10 @@ class OrgTaskParser:
         raw_text: str,
         original_line: str,
         agent: str,
-        journal_date: str,
+        journal_date: str | None,
         category: str,
         abs_line: int,
+        source_path: str | None = None,
     ) -> ParsedTask:
         text = raw_text
 
@@ -243,4 +291,5 @@ class OrgTaskParser:
             raw_block=original_line,
             journal_date=journal_date,
             category=category,
+            source_path=source_path,
         )

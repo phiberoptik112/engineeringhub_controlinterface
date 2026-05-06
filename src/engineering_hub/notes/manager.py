@@ -35,6 +35,7 @@ class SharedNotesManager:
         use_org_mode: bool = False,
         org_task_sections: list[str] | None = None,
         org_lookback_days: int = 1,
+        pending_tasks_file: Path | None = None,
     ) -> None:
         """Initialize manager.
 
@@ -45,6 +46,7 @@ class SharedNotesManager:
             use_org_mode: Use org-roam daily journal parser (takes priority).
             org_task_sections: Org heading names to scan for tasks.
             org_lookback_days: How many recent daily files to scan.
+            pending_tasks_file: Optional Journaler queue org file (org mode only).
         """
         self.path = notes_path
         self._use_org = use_org_mode
@@ -52,10 +54,14 @@ class SharedNotesManager:
         self._category_mapping = journal_categories or {}
 
         if use_org_mode:
+            extras: list[Path] = []
+            if pending_tasks_file is not None:
+                extras.append(pending_tasks_file.expanduser().resolve())
             self._org_parser = OrgTaskParser(
                 journal_dir=notes_path,
                 task_sections=org_task_sections,
                 lookback_days=org_lookback_days,
+                extra_files=extras,
             )
             self._writer = OrgTaskWriter(journal_dir=notes_path)
         elif use_journal_mode:

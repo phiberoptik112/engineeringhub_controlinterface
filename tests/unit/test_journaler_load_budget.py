@@ -6,9 +6,16 @@ from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
+from docx import Document
 
+from engineering_hub.config.settings import Settings
 from engineering_hub.journaler.context_manager import TokenBudget, estimate_tokens
-from engineering_hub.journaler.engine import ConversationEngine, LoadFileBudgetConfig
+from engineering_hub.journaler.daemon import pressure_config_from_settings
+from engineering_hub.journaler.engine import (
+    SUPPORTED_EXTENSIONS,
+    ConversationEngine,
+    LoadFileBudgetConfig,
+)
 
 
 def test_token_budget_used_includes_loaded_and_corpus() -> None:
@@ -30,6 +37,54 @@ def test_load_file_budget_config_rejects_bad_fraction() -> None:
         LoadFileBudgetConfig(max_context_fraction=0.0)
     with pytest.raises(ValueError, match="max_context_fraction"):
         LoadFileBudgetConfig(max_context_fraction=1.5)
+
+
+def test_default_load_budget_uses_more_of_large_windows(tmp_path: Path) -> None:
+    backend = MagicMock()
+    log_dir = tmp_path / "log"
+    log_dir.mkdir()
+    engine = ConversationEngine(
+        backend,
+        "sys",
+        log_dir,
+        max_tokens=4096,
+        model_context_window=32_768,
+    )
+
+    cap = engine._dynamic_max_chars_for_next_load()
+
+    assert cap > 45_000
+
+
+def test_pressure_config_from_settings_accepts_context_management(tmp_path: Path) -> None:
+    config = tmp_path / "config.yaml"
+    config.write_text(
+        """
+journaler:
+  max_conversation_history: 64
+  context_management:
+    compress_at: 0.9
+    max_history_tokens: 30000
+    compression_keep_recent: 12
+    conversation_relation_threshold: 0.5
+    past_session_excerpt_chars: 1800
+""",
+        encoding="utf-8",
+    )
+    settings = Settings.from_yaml(config)
+
+    cfg = pressure_config_from_settings(
+        settings,
+        model_context_window=65_536,
+        max_history_turns=settings.journaler_max_conversation_history,
+    )
+
+    assert cfg.compress_at == 0.9
+    assert cfg.max_history_turns == 64
+    assert cfg.max_history_tokens == 30_000
+    assert cfg.compression_keep_recent == 12
+    assert cfg.conversation_relation_threshold == 0.5
+    assert cfg.past_session_excerpt_chars == 1800
 
 
 def test_dynamic_load_truncates_to_small_window(tmp_path: Path) -> None:
@@ -135,6 +190,29 @@ def test_load_file_no_budget_returns_false(tmp_path: Path) -> None:
     ok, msg = engine.load_file(p, extensions=frozenset({".md"}))
     assert ok is False
     assert "budget" in msg.lower()
+
+
+def test_load_file_docx_converts_to_text(tmp_path: Path) -> None:
+    backend = MagicMock()
+    log_dir = tmp_path / "log"
+    log_dir.mkdir()
+    engine = ConversationEngine(
+        backend,
+        "x",
+        log_dir,
+        model_context_window=4096,
+        max_tokens=512,
+    )
+    docx_path = tmp_path / "sample.docx"
+    doc = Document()
+    doc.add_paragraph("Hello from DOCX ingest")
+    doc.save(docx_path)
+
+    ok, msg = engine.load_file(docx_path, extensions=SUPPORTED_EXTENSIONS)
+    assert ok is True
+    assert "sample.docx" in engine._loaded_files
+    assert "Hello from DOCX ingest" in engine._loaded_files["sample.docx"]
+    assert "Loaded" in msg
 
 
 def test_explicit_max_chars_bypasses_dynamic(tmp_path: Path) -> None:

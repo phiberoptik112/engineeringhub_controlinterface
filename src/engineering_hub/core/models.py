@@ -24,10 +24,14 @@ class ParsedTask(BaseModel):
     # Journal mode fields (for category-based extraction)
     journal_date: str | None = None
     category: str | None = None
+    # When set, task lives in this org file (e.g. Journaler pending-tasks.org).
+    source_path: str | None = None
 
     @property
     def task_id(self) -> str:
         """Stable identifier for deduplication (journal or legacy)."""
+        if self.source_path:
+            return f"{self.source_path}:{self.start_line}"
         if self.journal_date is not None:
             return f"{self.journal_date}:{self.category}:{self.start_line}"
         return str(self.start_line)
