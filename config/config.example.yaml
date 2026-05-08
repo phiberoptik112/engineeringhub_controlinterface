@@ -144,6 +144,22 @@ memory:
   search_k: 5         # memories injected per agent task
   threshold: 0.35     # cosine similarity floor (0.0-1.0)
 
+# ── Zettelkasten proposal workflow ────────────────────────────────
+# Mines marked org-roam daily journal spans into reviewable permanent-note
+# proposals. It writes proposal buffers under outputs/zettelkasten first;
+# permanent org-roam files are created only by `engineering-hub zettel apply`.
+zettelkasten:
+  enabled: true
+  # proposal_dir: "~/org-roam/engineering-hub/outputs/zettelkasten"
+  markers:
+    - "#idea"
+    - "#extract"
+    - "TODO extract"
+    - "TODO: extract"
+  journal_lookback_days: 7
+  link_top_k: 5
+  link_similarity_threshold: 0.75
+
 # ── PDF reference corpus (libraryfiles-corpus) ───────────────────
 # Install in the same venv: pip install -e /path/to/libraryfiles_corpus
 # Uses ollama.host / ollama.embed_model above for query-time embeddings.
@@ -268,8 +284,8 @@ chunking:
 #   # for *.org (not the full roam tree). Large journal years: pair with lookback below.
 #   # scan_org_roam_tree: true
 #   # watch_dirs: []             # extra org directories to rglob, e.g. ["~/org-roam/projects"]
-#   # journal_lookback_days: 5   # daily journal files within this many days (with cap)
-#   # journal_max_files: 5       # max recent daily journal files to parse for context/tasks
+#   # journal_lookback_days: 30  # daily journal files within this many days (with cap)
+#   # journal_max_files: 30      # max recent daily journal files to parse for context/tasks
 #
 #   # HTTP chat endpoint
 #   chat_enabled: true

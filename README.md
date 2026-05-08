@@ -28,6 +28,7 @@ They coexist cleanly: the Orchestrator processes explicit tasks while the Journa
 - **Context Management**: Token-aware conversation history with automatic compression, topic-shift archival, end-of-day reset, and manual `/clear` controls — keeps the local model coherent across a full workday
 - **Org-Roam Write Skill**: Journaler chat can write properly-formatted org-roam files — add TODOs, mark tasks done, append notes to today's journal (`/note`), set a session target on any roam note (`/open`), append under a heading there (`/edit`), search by title (`/find`), and create new nodes — via slash commands
 - **Journaler Export**: CLI `journaler export` reads the persisted chat transcript (`conversation.jsonl`) and writes org-roam-friendly output to **stdout** by default (raw per-turn org, optional MLX **summary + open TODOs**); use `--note`, `--find-title`, `-o`, or `--new-node` for file targets. In **`journaler chat`**, bare **`/export`** writes under **`conversation_exports/`** in the configured org-roam root unless you pass one of those targets.
+- **Zettelkasten Proposals**: Mine marked daily-journal ideas (`#idea`, `#extract`, `TODO extract`) into reviewable atomic-note proposal buffers, suggest conservative related links from memory, and apply approved notes into org-roam
 - **Context File Loading**: Inject files or directories into the Journaler's live context (`/load`) or the persistent memory store (`engineering-hub load`)
 - **Vector Memory**: Local semantic memory (`memory.db`) with Ollama embeddings for past-task and ingest retrieval
 - **PDF Reference Corpus**: Optional ingested reference corpus (`corpus.db` from **libraryfiles-corpus**) injected as RAG into **Journaler chat** turns and **Orchestrator** agent tasks (separate from workspace memory)
@@ -173,10 +174,15 @@ In **`journaler chat`**, **`/export`** uses the same export pipeline as the CLI;
 /agent_browse                   Browse and pick an agent skill interactively
 /tasks …                        Overnight queue: list, confirm, commit, rollback (see below)
 /queue <description>            Propose one task for the queue (then /tasks confirm && commit)
+/history <query>                Retrieve prior chat excerpts from conversation logs
+/history --agent panning-for-gold <query>
+                                Have an agent review retrieved chat history
 /skills                         List delegation skills / personas from skills/*.yaml
 /open today                     Set /edit target to today's journal (or /open <path>, /open <title>)
 /edit_browse                    Browse org-roam files to set /edit target
 /edit Section :: body text      Append under a heading in the file opened with /open
+/zettel propose                 Create reviewable atomic-note proposals from marked journals
+/zettel apply path/to/batch.json Apply approved Zettelkasten proposals into org-roam
 /help                           Show all slash commands
 ```
 
@@ -259,7 +265,7 @@ The Journaler is a persistent daemon that runs a local ~32B model on Apple Silic
 - **Knows** the workspace layout and org-roam format conventions — injected into the system prompt when the conversation engine starts so the model can reason about file locations and produce valid org syntax
 - **Loads agent personas** from `skills/*.yaml`: a concise **skills block** (display name, description, when-to-use, example `/agent` lines) is appended to the system prompt for **both** `journaler start` and **`journaler chat`**. On the daemon, each scheduled org-roam scan refreshes the rolling context snapshot **and re-attaches** that skills block so personas are not dropped mid-run
 - **Uses** `journaler.agent_backend`, optional `journaler.skills_dir`, and optional `journaler.anthropic_api_key` (else `anthropic.api_key` / `ENGINEERING_HUB_ANTHROPIC_API_KEY`) for delegation — same resolution for daemon and interactive chat
-- **Generates** a morning briefing at a configurable time (default 9:00 AM), with an extra **pending-tasks.org** summary when recent queue timestamps appear in that file
+- **Generates** a morning briefing at a configurable time (default 9:00 AM), with concise 2-3 sentence items that emphasize trends across the journal window and an extra **pending-tasks.org** summary when recent queue timestamps appear in that file
 - **Responds** to ad-hoc questions via an HTTP chat endpoint on `localhost:18790`
 - **Writes** to daily journals and org-roam nodes via slash commands where intended; **overnight queue** tasks go only to **`pending-tasks.org`** (see **`/tasks`** / **`/queue`**)
 - **Posts** briefings and alerts to Slack via incoming webhooks (optional)
@@ -277,8 +283,8 @@ journaler:
   briefing_enabled: true
   briefing_time: "09:00"
   # scan_org_roam_tree: true        # false = only journal.org_journal_dir + watch_dirs
-  # journal_lookback_days: 5
-  # journal_max_files: 5
+  # journal_lookback_days: 30
+  # journal_max_files: 30
   # watch_dirs: []
   # conversation_lookback_days: 7   # how many past daily summaries appear in the proactive snapshot
   # org_link_on_relation: true      # write a cross-reference into today's journal on semantic match
@@ -539,12 +545,22 @@ While in `engineering-hub journaler chat`, any input starting with `/` is handle
 
 | Command | Description |
 | --- | --- |
-| `/agent <type> <desc> [--project <id>] [--backend mlx\|claude]` | Delegate a task to a named agent and get the result inline. Types: `research`, `technical-writer`, `standards-checker`, `technical-reviewer`, `weekly-reviewer`, `latex-writer` |
+| `/agent <type> <desc> [--project <id>] [--backend mlx\|claude]` | Delegate a task to a named agent and get the result inline. Types: `research`, `technical-writer`, `standards-checker`, `technical-reviewer`, `weekly-reviewer`, `latex-writer`, `zettelkasten-curator` |
+| `/history <query>` | Retrieve matching excerpts from prior Journaler chat logs (`conversation.jsonl`) and daily summaries |
+| `/history --agent <type> [--backend mlx\|claude] <query>` | Dispatch retrieved prior-chat excerpts to a named agent for review, synthesis, or extraction |
 | `/pipeline draft-section --section "<section>" [--project <id>] [--backend mlx\|claude] [--loop-limit <n>]` | Run the multi-stage report drafting pipeline — gathers pre-computed result files, drafts prose, audits compliance, reviews tone, and emits LaTeX; see [Report Drafting Pipeline](#report-drafting-pipeline) |
 | `/agent_browse` | Interactive skill picker — arrow keys to browse agents, Enter to select, then type a task description |
 | `/skills` | List all available agent delegation skills with descriptions and examples |
 | `/tasks` | Show session queue proposals, or use `/tasks confirm`, `/tasks commit`, `/tasks reject N`, `/tasks edit N <text>`, `/tasks clear`, `/tasks rollback [N \| --all]` |
 | `/queue <description>` | Shorthand to propose one overnight task (defaults agent to `research` until you edit/confirm); then `/tasks confirm` and `/tasks commit` |
+
+**Zettelkasten proposals**
+
+| Command | Description |
+| --- | --- |
+| `/zettel propose [days]` | Mine marked daily journals for reviewable atomic-note proposal buffers |
+| `/zettel apply <proposal-json>` | Apply approved notes from a proposal batch into the org-roam directory |
+| `/zettel status` | Show processed source spans and proposal batch count |
 
 **Org-roam write operations**
 
@@ -1115,7 +1131,7 @@ See [config/config.example.yaml](config/config.example.yaml) for all available o
 - `journaler.default_task_mode` - **`immediate`** (default: classifier may auto-delegate) or **`propose`** (**`DISPATCH:`** + confirm in CLI)
 - `journaler.scan_org_roam_tree` - When false, scan only `journal.org_journal_dir` and `journaler.watch_dirs` (default: true)
 - `journaler.watch_dirs` - Extra org directories to include in scans
-- `journaler.journal_lookback_days` / `journaler.journal_max_files` - Window for parsing daily journals (defaults: 5 / 5)
+- `journaler.journal_lookback_days` / `journaler.journal_max_files` - Window for parsing daily journals (defaults: 30 / 30)
 - `journaler.conversation_lookback_days` - Number of past daily conversation summaries included in the proactive context snapshot every tick (default: 7; independent of `journal_lookback_days`)
 - `journaler.org_link_on_relation` - When true, write a cross-reference link into today's journal whenever a related past conversation is detected via semantic search (default: true)
 - `journaler.model_profile` - Name of the active entry in `journaler.models` (when the map is non-empty)

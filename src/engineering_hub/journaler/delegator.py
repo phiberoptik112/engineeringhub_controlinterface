@@ -133,6 +133,10 @@ _AGENT_ALIASES: dict[str, str] = {
     "panning": "panning-for-gold",
     "pan-for-gold": "panning-for-gold",
     "gold": "panning-for-gold",
+    "zettelkasten-curator": "zettelkasten-curator",
+    "zettelkasten": "zettelkasten-curator",
+    "zettel": "zettelkasten-curator",
+    "curator": "zettelkasten-curator",
 }
 
 

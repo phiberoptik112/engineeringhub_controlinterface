@@ -15,10 +15,11 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from engineering_hub.journaler.models import ContextSnapshot, ScanState
+from engineering_hub.journaler.models import ContextSnapshot, OrgFileInfo, ScanState
 from engineering_hub.journaler.org_parser import (
     extract_completed_tasks,
     extract_pending_tasks,
+    extract_topic_keywords,
     parse_org_file,
     summarize_file,
 )
@@ -53,8 +54,8 @@ class JournalContext:
         state_dir: Path,
         watch_dirs: list[Path] | None = None,
         scan_org_roam_tree: bool = True,
-        journal_lookback_days: int = 5,
-        journal_max_files: int = 5,
+        journal_lookback_days: int = 30,
+        journal_max_files: int = 30,
         pending_tasks_file: Path | None = None,
         conversation_lookback_days: int = 7,
         conversation_summary_excerpt_chars: int = 800,
@@ -146,6 +147,36 @@ class JournalContext:
             changed_files.append(org_file)
             self._state.record(org_file)
             seen.add(key)
+
+    def _journal_window_entries(self, info: OrgFileInfo) -> list[dict[str, str]]:
+        """Return daily journal entries plus file-level topic signals."""
+        topic_signals = "|".join(extract_topic_keywords(info)[:40])
+        day_entries: list[dict[str, str]] = []
+
+        for idx, entry in enumerate(info.entries):
+            ts_str = entry.timestamp.strftime("%H:%M") if entry.timestamp else ""
+            row = {
+                "time": ts_str,
+                "heading": entry.title,
+                "content": entry.body[:300] if entry.body else "",
+                "state": entry.state or "",
+                "tags": ",".join(entry.tags),
+            }
+            if idx == 0 and topic_signals:
+                row["keywords"] = topic_signals
+            day_entries.append(row)
+
+        if not day_entries and topic_signals:
+            day_entries.append({
+                "time": "",
+                "heading": "",
+                "content": "",
+                "state": "",
+                "tags": "",
+                "keywords": topic_signals,
+            })
+
+        return day_entries
 
     def _prune_journal_state(self, journal_sel: set[Path]) -> None:
         """Drop mtime entries for daily files outside the current journal window."""
@@ -244,17 +275,7 @@ class JournalContext:
             # journal_window: full lookback window, grouped by date
             if file_date:
                 date_key = file_date.isoformat()
-                day_entries: list[dict[str, str]] = []
-                for entry in info.entries:
-                    ts_str = entry.timestamp.strftime("%H:%M") if entry.timestamp else ""
-                    day_entries.append({
-                        "time": ts_str,
-                        "heading": entry.title,
-                        "content": entry.body[:200] if entry.body else "",
-                        "state": entry.state or "",
-                        "tags": ",".join(entry.tags),
-                    })
-                journal_window_delta[date_key] = day_entries
+                journal_window_delta[date_key] = self._journal_window_entries(info)
 
             # Track project note changes
             summary = summarize_file(info, max_chars=300)
@@ -285,17 +306,7 @@ class JournalContext:
             # Add today to window even when not changed, for completeness
             date_key = today.isoformat()
             if date_key not in journal_window_delta:
-                day_entries = []
-                for entry in info.entries:
-                    ts_str = entry.timestamp.strftime("%H:%M") if entry.timestamp else ""
-                    day_entries.append({
-                        "time": ts_str,
-                        "heading": entry.title,
-                        "content": entry.body[:200] if entry.body else "",
-                        "state": entry.state or "",
-                        "tags": ",".join(entry.tags),
-                    })
-                journal_window_delta[date_key] = day_entries
+                journal_window_delta[date_key] = self._journal_window_entries(info)
 
         # Fetch recent agent outputs from memory
         recent_agent_outputs: list[dict[str, str]] = []
@@ -394,17 +405,7 @@ class JournalContext:
                 continue
             info = parse_org_file(org_file)
             date_key = file_date.isoformat()
-            day_entries: list[dict[str, str]] = []
-            for entry in info.entries:
-                ts_str = entry.timestamp.strftime("%H:%M") if entry.timestamp else ""
-                day_entries.append({
-                    "time": ts_str,
-                    "heading": entry.title,
-                    "content": entry.body[:200] if entry.body else "",
-                    "state": entry.state or "",
-                    "tags": ",".join(entry.tags),
-                })
-            journal_window[date_key] = day_entries
+            journal_window[date_key] = self._journal_window_entries(info)
             # Update mtime record so incremental scan won't re-parse unchanged files
             self._state.record(org_file)
 
@@ -528,10 +529,29 @@ class JournalContext:
                     if not day_entries:
                         continue
                     lines.append(f"**{date_key}**")
+                    topic_signals = [
+                        keyword
+                        for entry in day_entries
+                        for keyword in entry.get("keywords", "").split("|")
+                        if keyword
+                    ]
+                    if topic_signals:
+                        lines.append(
+                            f"  Topic signals: {', '.join(topic_signals[:6])}"
+                        )
                     for entry in day_entries[:5]:
-                        state_prefix = f"[{entry['state']}] " if entry.get("state") else ""
-                        time_prefix = f"**{entry['time']}** " if entry.get("time") else ""
-                        lines.append(f"- {time_prefix}{state_prefix}{entry.get('heading', '')}")
+                        if not entry.get("heading") and not entry.get("content"):
+                            continue
+                        state_prefix = (
+                            f"[{entry['state']}] " if entry.get("state") else ""
+                        )
+                        time_prefix = (
+                            f"**{entry['time']}** " if entry.get("time") else ""
+                        )
+                        lines.append(
+                            f"- {time_prefix}{state_prefix}"
+                            f"{entry.get('heading', '')}"
+                        )
                         if entry.get("content"):
                             lines.append(f"  {entry['content'][:120]}")
                     if len(day_entries) > 5:
@@ -539,7 +559,7 @@ class JournalContext:
                 lines.append("")
 
         if s.recurring_topics:
-            lines.append("### Recurring Topics")
+            lines.append("### Cross-Journal Content Trends")
             for topic in s.recurring_topics[:10]:
                 days = topic.get("days_seen", 1)
                 last = topic.get("last_seen", "")
@@ -697,7 +717,19 @@ class JournalContext:
                     if not day_entries:
                         continue
                     lines.append(f"**{date_key}**")
+                    topic_signals = [
+                        keyword
+                        for entry in day_entries
+                        for keyword in entry.get("keywords", "").split("|")
+                        if keyword
+                    ]
+                    if topic_signals:
+                        lines.append(
+                            f"  Topic signals: {', '.join(topic_signals[:10])}"
+                        )
                     for entry in day_entries[:8]:
+                        if not entry.get("heading") and not entry.get("content"):
+                            continue
                         state_prefix = (
                             f"[{entry['state']}] " if entry.get("state") else ""
                         )
@@ -721,7 +753,7 @@ class JournalContext:
 
         # Recurring topics across multiple days
         if s.recurring_topics:
-            lines.append("### Recurring Topics")
+            lines.append("### Cross-Journal Content Trends")
             for topic in s.recurring_topics[:10]:
                 days = topic.get("days_seen", 1)
                 count = topic.get("count", 1)
@@ -856,18 +888,23 @@ class JournalContext:
         for date_key, entries in window.items():
             seen_today: set[str] = set()
             for entry in entries:
-                heading = (entry.get("heading") or "").strip()
-                if not heading:
-                    continue
-                normalized = heading.lower().rstrip(".")
-                # Skip generic catch-all headings that aren't meaningful
-                if normalized in {
-                    "notes", "tasks", "overnight agent tasks", "log",
-                    "meetings", "todo", "done", "agenda",
-                }:
-                    continue
-                topic_count[normalized] += 1
-                seen_today.add(normalized)
+                candidates = [
+                    entry.get("heading", ""),
+                    *entry.get("tags", "").split(","),
+                    *entry.get("keywords", "").split("|"),
+                ]
+                for candidate in candidates:
+                    normalized = candidate.strip().lower().rstrip(".")
+                    if not normalized:
+                        continue
+                    # Skip generic catch-all headings that are not meaningful.
+                    if normalized in {
+                        "notes", "tasks", "overnight agent tasks", "log",
+                        "meetings", "todo", "done", "agenda",
+                    }:
+                        continue
+                    topic_count[normalized] += 1
+                    seen_today.add(normalized)
             for topic in seen_today:
                 topic_days[topic].add(date_key)
 

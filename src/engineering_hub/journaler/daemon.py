@@ -90,8 +90,8 @@ class JournalerConfig:
 
     watch_dirs: list[Path] | None = None
     scan_org_roam_tree: bool = True
-    journal_lookback_days: int = 5
-    journal_max_files: int = 5
+    journal_lookback_days: int = 30
+    journal_max_files: int = 30
 
     # Journaler-owned overnight queue file (Orchestrator scans via OrgTaskParser extra_files).
     pending_tasks_file: Path | None = None

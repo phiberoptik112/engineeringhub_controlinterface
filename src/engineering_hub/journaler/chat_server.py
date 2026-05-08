@@ -17,6 +17,9 @@ Slash commands (parsed before reaching the LLM):
     Falls back to writing to the journal if no delegator is configured.
     /skills
         List available agent delegation skills.
+    /history [--agent <type>] [--backend mlx|claude] <query>
+        Retrieve prior Journaler chat excerpts, optionally dispatching an agent
+        to review the retrieved transcript context.
     /pipeline draft-section --section "<section>" [--project <id>] [--backend mlx|claude] [--loop-limit <n>]
         Run the multi-stage report drafting pipeline:
         DataGatherer → technical-writer → standards-checker (loop) → technical-reviewer → latex-writer.
@@ -28,6 +31,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import shlex
 import threading
 import time
 from datetime import datetime
@@ -38,6 +42,10 @@ from typing import TYPE_CHECKING
 from engineering_hub.journaler.chat_router import route_natural_language_task
 from engineering_hub.journaler.model_profiles import journaler_slash_model_command
 from engineering_hub.journaler.org_writer import add_todo_to_journal
+from engineering_hub.journaler.session_retrieval import (
+    format_past_session_block,
+    retrieve_past_sessions,
+)
 
 if TYPE_CHECKING:
     from engineering_hub.journaler.context import JournalContext
@@ -201,6 +209,10 @@ def _make_handler(
                     )
                 elif mlow == "/skills":
                     response = _handle_skills_command(delegator)
+                elif mlow.startswith("/history"):
+                    response = _handle_history_command(
+                        message, delegator, context, engine=engine
+                    )
                 elif mlow.startswith("/tasks") or mlow.startswith("/queue"):
                     from engineering_hub.journaler.task_slash import (
                         handle_tasks_slash_command,
@@ -508,6 +520,99 @@ def _handle_agent_command(
         anthropic_web_search_max_uses=(
             engine.web_search_anthropic_max_uses if engine is not None else 3
         ),
+    )
+
+
+def _handle_history_command(
+    message: str,
+    delegator: AgentDelegator | None,
+    context: JournalContext,
+    engine: ConversationEngine | None = None,
+) -> str:
+    """Retrieve prior Journaler chat excerpts, optionally reviewing via an agent.
+
+    Syntax:
+        /history [--agent <type>] [--backend mlx|claude] <query>
+    """
+    try:
+        tokens = shlex.split(message)
+    except ValueError as exc:
+        return f"Could not parse `/history` command: {exc}"
+
+    if not tokens or tokens[0].lower() != "/history":
+        return "Usage: `/history [--agent <type>] [--backend mlx|claude] <query>`"
+
+    agent_type: str | None = None
+    backend = "auto"
+    query_parts: list[str] = []
+    i = 1
+    while i < len(tokens):
+        token = tokens[i]
+        if token == "--agent":
+            i += 1
+            if i >= len(tokens):
+                return "`--agent` requires an agent type."
+            agent_type = tokens[i]
+        elif token == "--backend":
+            i += 1
+            if i >= len(tokens):
+                return "`--backend` requires `mlx` or `claude`."
+            backend = tokens[i].lower()
+            if backend not in {"mlx", "claude", "auto"}:
+                return "`--backend` must be `mlx`, `claude`, or `auto`."
+        else:
+            query_parts.append(token)
+        i += 1
+
+    query = " ".join(query_parts).strip()
+    if not query:
+        return "Usage: `/history [--agent <type>] [--backend mlx|claude] <query>`"
+
+    hits = retrieve_past_sessions(
+        query,
+        state_dir=context.state_dir,
+        max_results=(
+            engine._pressure_config.past_session_search_k if engine is not None else 5
+        ),
+        excerpt_chars=(
+            engine._pressure_config.past_session_excerpt_chars
+            if engine is not None
+            else 1200
+        ),
+    )
+    block = format_past_session_block(hits)
+    if not block:
+        return (
+            "No matching prior Journaler chat excerpts found in "
+            "`conversation.jsonl` or `daily_summaries/`."
+        )
+
+    if agent_type is None:
+        return (
+            f"{block}\n\n"
+            "To have an agent review these excerpts, run "
+            "`/history --agent panning-for-gold <query>` or choose another "
+            "agent with `--agent <type>`."
+        )
+
+    if delegator is None:
+        return (
+            "Agent delegation is not configured, so I can retrieve history but "
+            "cannot dispatch an agent review.\n\n"
+            f"{block}"
+        )
+
+    delegate_context = block
+    if engine is not None:
+        base_context = engine.build_delegate_context(query)
+        if base_context:
+            delegate_context = f"{base_context}\n\n{block}"
+
+    return delegator.delegate(
+        agent_type=agent_type,
+        description=f"Review retrieved Journaler chat history for: {query}",
+        backend=backend,
+        journaler_context=delegate_context,
     )
 
 

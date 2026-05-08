@@ -363,12 +363,12 @@ class Settings(BaseSettings):
         description="Extra org directories to include in Journaler scans (rglob *.org)",
     )
     journaler_journal_lookback_days: int = Field(
-        default=5,
+        default=30,
         ge=0,
         description="Include daily journal files from the last N calendar days (with journal_max_files cap)",
     )
     journaler_journal_max_files: int = Field(
-        default=5,
+        default=30,
         ge=1,
         description="Max number of recent daily journal files to parse for context/tasks",
     )
@@ -397,6 +397,36 @@ class Settings(BaseSettings):
     journaler_org_link_on_relation: bool = Field(
         default=True,
         description="When True, write a cross-reference link into today's journal when a related past conversation is detected",
+    )
+
+    # Zettelkasten proposal workflow
+    zettelkasten_enabled: bool = Field(
+        default=True,
+        description="Enable the org-roam Zettelkasten proposal workflow",
+    )
+    zettelkasten_proposal_dir: Path | None = Field(
+        default=None,
+        description="Directory for generated Zettelkasten proposal JSON/org review files",
+    )
+    zettelkasten_markers: list[str] = Field(
+        default_factory=lambda: ["#idea", "#extract", "TODO extract", "TODO: extract"],
+        description="Journal markers that identify candidate atomic notes",
+    )
+    zettelkasten_journal_lookback_days: int = Field(
+        default=7,
+        ge=1,
+        description="Recent daily journal days scanned by zettel propose",
+    )
+    zettelkasten_link_top_k: int = Field(
+        default=5,
+        ge=0,
+        description="Maximum semantic link suggestions per proposed note",
+    )
+    zettelkasten_link_similarity_threshold: float = Field(
+        default=0.75,
+        ge=0.0,
+        le=1.0,
+        description="Minimum cosine similarity for Zettelkasten link suggestions",
     )
 
     # ── Per-agent model routing ─────────────────────────────────────
@@ -580,6 +610,13 @@ class Settings(BaseSettings):
     def journaler_state_dir(self) -> Path:
         """Path to the Journaler daemon state directory."""
         return self.workspace_dir / ".journaler"
+
+    @property
+    def zettelkasten_resolved_proposal_dir(self) -> Path:
+        """Effective directory for Zettelkasten proposal buffers."""
+        if self.zettelkasten_proposal_dir is not None:
+            return self.zettelkasten_proposal_dir
+        return self.output_dir / "zettelkasten"
 
     @property
     def journaler_briefing_output_dir(self) -> Path:
@@ -921,6 +958,27 @@ class Settings(BaseSettings):
                         flat_config["diagnostic_debug_context_max_chars"] = cp[
                             "debug_context_max_chars"
                         ]
+
+        if "zettelkasten" in config:
+            zettel = config["zettelkasten"]
+            if zettel.get("enabled") is not None:
+                flat_config["zettelkasten_enabled"] = zettel["enabled"]
+            if zettel.get("proposal_dir"):
+                flat_config["zettelkasten_proposal_dir"] = Path(
+                    zettel["proposal_dir"]
+                ).expanduser()
+            if zettel.get("markers") is not None:
+                flat_config["zettelkasten_markers"] = list(zettel["markers"] or [])
+            if zettel.get("journal_lookback_days") is not None:
+                flat_config["zettelkasten_journal_lookback_days"] = zettel[
+                    "journal_lookback_days"
+                ]
+            if zettel.get("link_top_k") is not None:
+                flat_config["zettelkasten_link_top_k"] = zettel["link_top_k"]
+            if zettel.get("link_similarity_threshold") is not None:
+                flat_config["zettelkasten_link_similarity_threshold"] = zettel[
+                    "link_similarity_threshold"
+                ]
 
         def _is_empty(v: object) -> bool:
             if v is None or v == "":

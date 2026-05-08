@@ -30,7 +30,8 @@ Your role:
   conversations as primary user context.  When the user says "last time",
   "that session", "previous chat", or refers to a prior discussion, first
   use the conversation history/retrieval blocks before falling back to
-  workspace notes.
+  workspace notes. For explicit lookup or agent review, suggest
+  `/history <query>` or `/history --agent <type> <query>`.
 - Flag items that seem stalled, overdue, or need follow-up.
 - When the user wants draft reports, test protocols, executive summaries,
   or other client-ready technical documents, suggest concrete ways to task
@@ -221,6 +222,12 @@ You can tell the user about these commands; the user types them directly:
                                Default backend is journaler.agent_backend in config
                                ("mlx" is default; use "auto" for Claude when a key is present).
 
+  /history [--agent <type>] [--backend mlx|claude] <query>
+                               Retrieve excerpts from prior Journaler chat logs
+                               (conversation.jsonl and daily summaries). With
+                               --agent, dispatch the retrieved excerpts to a
+                               named persona for review.
+
   /skills                      List all available agent delegation skills with
                                descriptions and example invocations.
 
@@ -232,59 +239,52 @@ You can tell the user about these commands; the user types them directly:
 """
 
 BRIEFING_PROMPT = """\
-Generate a comprehensive morning briefing for today ({date}).
+Generate a concise morning briefing for today ({date}).
 
 You have the following context about recent activity, spanning the full
 journal lookback window:
 
 {briefing_context}
 
-Structure your briefing with the following sections.  Be thorough — this
-briefing is the primary daily planning document and should give a
-complete picture of where things stand and what to do next.
+Structure your briefing with the following sections.  Prioritize content
+trends found across many daily journals over single-day recaps.  Each
+bullet or numbered item should be 2-3 sentences: first state the item,
+then explain the pattern, significance, or suggested next move.  Prefer
+synthesis over inventory.
 
-1. **Yesterday's Highlights** — What got done, what agents completed,
-   any notable findings or outputs worth reviewing.  For each item,
-   briefly note its significance to the broader project it belongs to
-   (e.g. "this unblocks X" or "completes the Y deliverable").
+1. **Cross-Journal Trends** — Start here.  Identify recurring topics,
+   repeated concerns, project momentum, and themes appearing across the
+   journal window.  Call out which trends seem to be strengthening,
+   fading, or fragmenting.
 
-2. **Week-at-a-Glance** — Synthesize the multi-day journal thread and
-   recurring topics into a narrative arc.  What themes dominated the
-   week?  What gained momentum, what lost it?  Call out recurring topics
-   that appear on 3+ days — these are ongoing threads worth explicit
-   attention.
+2. **Yesterday in Context** — Summarize what changed yesterday only
+   insofar as it confirms, interrupts, or advances the longer-running
+   trends.  Include notable agent outputs or findings when they shift a
+   project direction.
 
 3. **Today's Agenda** — Pending tasks ordered by suggested priority.
-   For each, briefly explain *why* it should be tackled in that order
-   (deadline pressure, dependency, quick win, etc.).  Group by project
-   when multiple tasks belong to the same effort.
+   Explain why each item belongs in that position using evidence from
+   the trend history, deadlines, dependencies, or quick-win potential.
+   Group by project when multiple tasks belong to the same effort.
 
 4. **Needs Attention** — Anything stalled, overdue, or needing a
    decision.  For stale tasks (shown with first-seen dates), note how
-   many days they have been pending and why they may be stuck.  For
-   each, suggest one of: escalate, delegate to an agent, break into
-   smaller pieces, or drop.
+   many days they have been pending and why the journal trend suggests
+   they may be stuck.  For each, suggest one of: escalate, delegate to
+   an agent, break into smaller pieces, or drop.
 
-5. **Suggested Paths Forward** — The most important section.  For each
-   active project or recurring topic, suggest 1–2 concrete next actions.
-   Categorize each suggestion as:
-   - **Quick win** (< 30 min): something that can be knocked out
-     immediately to maintain momentum.
-   - **Deep-work block** (1–2 hours): focused work that moves the
-     needle on a major deliverable.
-   - **Agent task**: work that can be delegated to a research,
-     technical-writer, or standards-checker agent.
-   - **Decision needed**: flag items that require human judgment before
-     any agent or task can proceed.
-   Reference specific org-roam notes or agent outputs where relevant so
-   the suggestions are actionable, not generic.
+5. **Suggested Paths Forward** — For each active project or recurring
+   topic, suggest 1-2 concrete next actions.  Categorize each suggestion
+   as **Quick win**, **Deep-work block**, **Agent task**, or
+   **Decision needed**, and reference specific org-roam notes or agent
+   outputs where relevant.
 
-6. **Quick Stats** — Number of pending vs completed tasks this week,
-   active projects, stale task count, recent memory entries.
+6. **Quick Stats** — Number of pending vs completed tasks in the journal
+   window, active projects, stale task count, recent memory entries.
 
-Aim for 800–1200 words.  Use bullet points and bold key phrases for
-scannability, but do not sacrifice depth for brevity — the goal is a
-thorough planning document, not a summary.\
+Aim for 500-800 words.  Use concise bullets with bold key phrases.  Do
+not list every journal entry; surface the patterns that make today easier
+to plan.\
 """
 
 

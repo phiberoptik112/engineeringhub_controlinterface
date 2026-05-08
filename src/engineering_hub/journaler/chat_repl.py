@@ -44,9 +44,22 @@ COMMAND_CATALOG: list[CommandEntry] = [
     ),
     CommandEntry("/tasks", "[confirm|commit|rollback|…]", "Overnight task queue (pending-tasks.org)", "Agent Delegation"),
     CommandEntry("/queue", "<description>", "Propose a task for the overnight queue", "Agent Delegation"),
+    CommandEntry(
+        "/history",
+        "[--agent <type>] <query>",
+        "Retrieve prior chat excerpts or dispatch an agent review",
+        "Agent Delegation",
+    ),
     CommandEntry("/skills", "", "List available agent personas", "Agent Delegation"),
     CommandEntry("/agent_browse", "", "Interactive skill picker for agent delegation", "Agent Delegation"),
     CommandEntry("/validate-latex", "<path>", "Compile a .tex file and report errors", "Agent Delegation"),
+    # Zettelkasten
+    CommandEntry(
+        "/zettel",
+        "{propose|apply|status}",
+        "Manage atomic note proposals",
+        "Zettelkasten",
+    ),
     # Capture Templates
     CommandEntry("/capture", "<name> [field=value ...]", "Apply a capture template", "Capture Templates"),
     CommandEntry("/capture_list", "", "List available capture templates", "Capture Templates"),

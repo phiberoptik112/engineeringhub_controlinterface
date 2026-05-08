@@ -219,6 +219,38 @@ Reads journal entries + agent memory for the period and produces a structured we
 
 ---
 
+## Zettelkasten Proposal Workflow
+
+Marked daily-journal ideas can be mined into reviewable permanent-note proposals:
+
+```org
+* Notes
+The acoustic value of an operable partition depends on installed boundary conditions. #idea
+```
+
+Run:
+
+```bash
+engineering-hub zettel propose
+```
+
+This scans recent daily journals for configured markers (`#idea`, `#extract`, `TODO extract`, `TODO: extract`) and writes two files under `outputs/zettelkasten/`:
+
+- `<batch>.org` — a human-readable review buffer
+- `<batch>.json` — the approved/apply source of truth
+
+After reviewing or editing the JSON sidecar, apply approved notes:
+
+```bash
+engineering-hub zettel apply outputs/zettelkasten/<batch>.json
+```
+
+The apply step writes permanent org-roam nodes with `:ID:`, `#+title:`, source links back to the daily journal, tags, and conservative related-link suggestions. The workflow records source-span hashes in `.journaler/zettelkasten_state.json` so unchanged journal spans are not proposed repeatedly.
+
+In `journaler chat`, the same flow is available with `/zettel propose [days]`, `/zettel status`, and `/zettel apply <proposal-json>`.
+
+---
+
 ## How Tasks Are Tracked
 
 After a run, your journal file is updated in place:

@@ -35,8 +35,17 @@ from engineering_hub.journaler.model_profiles import (
     journaler_slash_model_command,
     resolve_journaler_model_spec,
 )
+from engineering_hub.memory.service import MemoryService
 from engineering_hub.orchestration.orchestrator import Orchestrator
 from engineering_hub.search import build_agent_search_provider_from_settings
+from engineering_hub.zettelkasten import (
+    apply_proposal_batch,
+    create_proposal_batch,
+    detect_candidates,
+    load_proposal_batch,
+)
+from engineering_hub.zettelkasten.proposals import write_proposal_batch
+from engineering_hub.zettelkasten.state import ZettelkastenState, default_state_path
 
 console = Console()
 
@@ -799,8 +808,10 @@ def _handle_chat_slash_command(
       /exit, /quit               Leave the chat (same as bare exit, quit, or :q).
       /tasks … /queue            Overnight queue in pending-tasks.org (confirm, commit, rollback).
       /agent … /skills           Delegate to agent personalities (when delegator is configured).
+      /history …                 Retrieve prior chat excerpts or dispatch an agent to review them.
       /validate-latex <path>     Compile a .tex file with pdflatex and report errors/warnings.
       /export …                  Export conversation.jsonl to org (same flags as journaler export).
+      /zettel …                  Propose/apply Zettelkasten notes from marked journals.
       /model                     Show model, or switch profile / path (see /help).
       /help                      Show available slash commands.
     """
@@ -870,6 +881,18 @@ def _handle_chat_slash_command(
         from engineering_hub.journaler.chat_server import _handle_agent_command
 
         msg = _handle_agent_command(raw, delegator, journal_ctx, engine=engine)
+        _print_chat_markdown(chat_console, msg)
+        return
+
+    if cmd == "/history":
+        if journal_ctx is None:
+            chat_console.print(
+                "[yellow]/history requires journal context; start from a configured workspace.[/yellow]"
+            )
+            return
+        from engineering_hub.journaler.chat_server import _handle_history_command
+
+        msg = _handle_history_command(raw, delegator, journal_ctx, engine=engine)
         _print_chat_markdown(chat_console, msg)
         return
 
@@ -1041,12 +1064,64 @@ def _handle_chat_slash_command(
         )
         return
 
+    if cmd == "/zettel":
+        if export_settings is None:
+            chat_console.print(
+                "[yellow]/zettel requires workspace config; "
+                "start from a configured workspace.[/yellow]"
+            )
+            return
+        action = parts[1].lower() if len(parts) >= 2 else "status"
+        state_path = default_state_path(export_settings.workspace_dir)
+        state = ZettelkastenState.load(state_path)
+        if action == "propose":
+            days = int(parts[2]) if len(parts) >= 3 and parts[2].isdigit() else None
+            memory_service = getattr(journal_ctx, "memory_service", None)
+            code, msg = _propose_zettelkasten_notes(
+                export_settings,
+                memory_service=memory_service,
+                lookback_days=days,
+            )
+            color = "green" if code == 0 else "red"
+            for line in msg.splitlines():
+                chat_console.print(f"[{color}]{escape(line)}[/{color}]")
+            return
+        if action == "apply":
+            if len(parts) < 3:
+                chat_console.print("[yellow]Usage: /zettel apply <proposal-json>[/yellow]")
+                return
+            batch = load_proposal_batch(Path(" ".join(parts[2:])))
+            created = apply_proposal_batch(
+                batch,
+                roam_dir=export_settings.org_journal_dir.parent,
+                state=state,
+            )
+            state.save(state_path)
+            chat_console.print(f"[green]Applied {len(created)} Zettelkasten note(s).[/green]")
+            for path in created:
+                chat_console.print(f"  [cyan]{path}[/cyan]")
+            return
+        if action == "status":
+            chat_console.print(
+                f"[cyan]Zettelkasten state:[/cyan] {len(state.processed_hashes)} "
+                f"processed span(s), {len(state.proposal_batches)} proposal batch(es)."
+            )
+            chat_console.print(
+                f"[dim]Proposal dir: {export_settings.zettelkasten_resolved_proposal_dir}[/dim]"
+            )
+            return
+        chat_console.print(
+            "[yellow]Usage: /zettel {propose [days]|apply <json>|status}[/yellow]"
+        )
+        return
+
     if cmd == "/help":
         write_cmds = (
             "\n  [bold]File operations (requires org-roam dir):[/bold]\n"
             "  [cyan]/task <description>[/cyan]          Add a TODO to today's journal\n"
             "  [cyan]/done <fragment>[/cyan]             Mark a matching TODO as done\n"
-            "  [cyan]/note <heading> :: <text>[/cyan]   Append text under a heading in today's journal\n"
+            "  [cyan]/note <heading> :: <text>[/cyan]   Append text under "
+            "a heading in today's journal\n"
             "  [cyan]/open[/cyan]                       Show current /edit target\n"
             "  [cyan]/open clear[/cyan]                  Clear /edit target\n"
             "  [cyan]/open today[/cyan]                  Target today's daily journal\n"
@@ -1074,13 +1149,19 @@ def _handle_chat_slash_command(
             "  [cyan]/budget[/cyan]                    Show token budget breakdown\n"
             "  [cyan]/topic[/cyan]                     Show currently detected conversation topic\n"
             "  [cyan]/agent <type> <desc>[/cyan]      Delegate to a named agent (see README)\n"
+            "  [cyan]/history <query>[/cyan]           Retrieve prior chat excerpts\n"
+            "  [cyan]/history --agent <type> <query>[/cyan]  Have an agent review retrieved history\n"
             "  [cyan]/agent_browse[/cyan]              Browse and pick an agent skill\n"
             "  [cyan]/skills[/cyan]                    List agent delegation skills / personas\n"
             "  [cyan]/validate-latex <path>[/cyan]    Compile a .tex file and report errors\n"
             "                                 (prompts to auto-fix via agent on failure)\n"
             "  [cyan]/export[/cyan]                    Export transcript (`/export --help`)\n"
+            "  [cyan]/zettel propose [days][/cyan]     Create reviewable "
+            "atomic-note proposals\n"
+            "  [cyan]/zettel apply <json>[/cyan]       Apply approved proposals into org-roam\n"
             + write_cmds +
-            "  [cyan]/exit[/cyan], [cyan]/quit[/cyan]          Leave chat (or type exit, quit, :q)\n"
+            "  [cyan]/exit[/cyan], [cyan]/quit[/cyan]          Leave chat "
+            "(or type exit, quit, :q)\n"
             "  [cyan]/help[/cyan]                      Show this help\n"
         )
         return
@@ -2804,6 +2885,122 @@ def cmd_load(args: argparse.Namespace) -> int:
     return 0 if skipped == 0 else 1
 
 
+def _zettel_memory_service(settings: Settings) -> object | None:
+    """Build memory service for link suggestions when memory is enabled."""
+    if not settings.memory_enabled:
+        return None
+
+    return MemoryService.from_workspace(
+        workspace_dir=settings.workspace_dir,
+        ollama_host=settings.ollama_host,
+        ollama_model=settings.ollama_embed_model,
+        enabled=settings.memory_enabled,
+    )
+
+
+def _propose_zettelkasten_notes(
+    settings: Settings,
+    *,
+    memory_service: object | None = None,
+    lookback_days: int | None = None,
+) -> tuple[int, str]:
+    if not settings.zettelkasten_enabled:
+        return 1, "Zettelkasten workflow is disabled in config."
+
+    state_path = default_state_path(settings.workspace_dir)
+    state = ZettelkastenState.load(state_path)
+    days = lookback_days or settings.zettelkasten_journal_lookback_days
+    candidates = detect_candidates(
+        settings.org_journal_dir,
+        markers=settings.zettelkasten_markers,
+        lookback_days=days,
+    )
+    batch = create_proposal_batch(
+        candidates,
+        state=state,
+        memory_service=memory_service,
+        link_top_k=settings.zettelkasten_link_top_k,
+        link_threshold=settings.zettelkasten_link_similarity_threshold,
+    )
+    if not batch.notes:
+        return 0, (
+            f"No new Zettelkasten candidates found in the last {days} day(s). "
+            f"Scanned {len(candidates)} marked span(s)."
+        )
+
+    json_path, org_path = write_proposal_batch(
+        batch,
+        settings.zettelkasten_resolved_proposal_dir,
+        state=state,
+    )
+    state.save(state_path)
+    return 0, (
+        f"Created {len(batch.notes)} proposed note(s).\n"
+        f"Review: {org_path}\n"
+        f"Apply JSON: {json_path}"
+    )
+
+
+def cmd_zettel(args: argparse.Namespace) -> int:
+    """Mine daily journals for Zettelkasten note proposals."""
+    setup_logging(args.verbose)
+    settings = load_settings(args.config)
+    sub = getattr(args, "zettel_command", None)
+    if sub is None:
+        console.print("[yellow]Usage:[/yellow] engineering-hub zettel {propose|apply|status}")
+        return 1
+
+    state_path = default_state_path(settings.workspace_dir)
+    state = ZettelkastenState.load(state_path)
+
+    if sub == "propose":
+        memory_service = _zettel_memory_service(settings)
+        code, msg = _propose_zettelkasten_notes(
+            settings,
+            memory_service=memory_service,
+            lookback_days=args.days,
+        )
+        color = "green" if code == 0 else "red"
+        for line in msg.splitlines():
+            console.print(f"[{color}]{escape(line)}[/{color}]")
+        if memory_service is not None and hasattr(memory_service, "db"):
+            memory_service.db.close()
+        return code
+
+    if sub == "apply":
+        batch = load_proposal_batch(Path(args.proposal_json))
+        selected = set(args.proposal_id or []) or None
+        created = apply_proposal_batch(
+            batch,
+            roam_dir=settings.org_journal_dir.parent,
+            state=state,
+            proposal_ids=selected,
+        )
+        state.save(state_path)
+        if not created:
+            console.print("[yellow]No proposal notes were applied.[/yellow]")
+            return 1
+        console.print(f"[bold green]Applied {len(created)} note(s):[/bold green]")
+        for path in created:
+            console.print(f"  [cyan]{path}[/cyan]")
+        return 0
+
+    if sub == "status":
+        table = Table(title="Zettelkasten State")
+        table.add_column("Field", style="cyan")
+        table.add_column("Value", style="green")
+        table.add_row("State file", str(state_path))
+        table.add_row("Processed spans", str(len(state.processed_hashes)))
+        table.add_row("Proposal batches", str(len(state.proposal_batches)))
+        table.add_row("Proposal dir", str(settings.zettelkasten_resolved_proposal_dir))
+        table.add_row("Markers", ", ".join(settings.zettelkasten_markers))
+        console.print(table)
+        return 0
+
+    console.print("[yellow]Unknown zettel command.[/yellow]")
+    return 1
+
+
 def main() -> int:
     """Main entry point."""
     parser = argparse.ArgumentParser(
@@ -3181,6 +3378,38 @@ def main() -> int:
         help="Extra tag to attach (can be used multiple times)",
     )
 
+    # zettel command
+    zettel_parser = subparsers.add_parser(
+        "zettel",
+        help="Mine org-roam journals for reviewable Zettelkasten note proposals",
+    )
+    zettel_sub = zettel_parser.add_subparsers(dest="zettel_command")
+
+    zettel_propose = zettel_sub.add_parser(
+        "propose",
+        help="Create a proposal buffer from marked daily-journal entries",
+    )
+    zettel_propose.add_argument(
+        "--days",
+        type=int,
+        default=None,
+        help="Override zettelkasten.journal_lookback_days",
+    )
+
+    zettel_apply = zettel_sub.add_parser(
+        "apply",
+        help="Apply approved proposals into the org-roam directory",
+    )
+    zettel_apply.add_argument("proposal_json", help="Proposal batch JSON file")
+    zettel_apply.add_argument(
+        "--proposal-id",
+        action="append",
+        default=None,
+        help="Apply only this proposal id (can be used multiple times)",
+    )
+
+    zettel_sub.add_parser("status", help="Show Zettelkasten proposal state")
+
     # memory command
     memory_parser = subparsers.add_parser("memory", help="Inspect the local memory database")
     memory_sub = memory_parser.add_subparsers(dest="memory_command")
@@ -3267,6 +3496,7 @@ def main() -> int:
         "journaler": cmd_journaler,
         "docker": cmd_docker,
         "load": cmd_load,
+        "zettel": cmd_zettel,
         "memory": cmd_memory,
         "weekly-review": cmd_weekly_review,
     }

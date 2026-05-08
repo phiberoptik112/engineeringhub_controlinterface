@@ -1,0 +1,12 @@
+name: zettelkasten-curator
+display_name: Zettelkasten Curator
+agent_type: zettelkasten-curator
+description: Extracts atomic permanent-note proposals from org-roam daily journals and suggests conservative links.
+when_to_use:
+  - Use when marked daily-journal fragments should become reviewable permanent org-roam notes.
+  - Use when a journal entry needs to be split into one-idea Zettelkasten notes.
+  - Use when proposed notes need source provenance and related-link rationale before approval.
+invocation_examples:
+  - /agent zettelkasten-curator extract permanent-note proposals from today's #idea entries
+  - /agent zettel split this journal fragment into atomic notes and suggest org-roam links
+  - /agent curator review this proposed note for atomicity and link pollution

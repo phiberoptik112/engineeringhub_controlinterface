@@ -98,6 +98,13 @@ DEFAULT_AGENT_CONFIGS = {
         tools=[],
         max_tokens=12000,
     ),
+    AgentType.ZETTELKASTEN_CURATOR: AgentConfig(
+        agent_type=AgentType.ZETTELKASTEN_CURATOR,
+        prompt_file="zettelkasten-curator.txt",
+        model_class=ModelClass.REASONING,
+        tools=["search_memory"],
+        max_tokens=6000,
+    ),
 }
 
 
