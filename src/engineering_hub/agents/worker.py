@@ -190,8 +190,15 @@ class AgentWorker:
                 "Backend does not support tool calling, falling back to single-shot: %s", e
             )
             max_tok = config.max_tokens if config else self.max_tokens
+            no_tool_note = (
+                "\n\n[Note: Tool calling is not available in this backend. "
+                "Do not attempt to call tools or emit tool call syntax. "
+                "Provide your best answer using only the context and knowledge "
+                "already provided.]\n"
+            )
+            augmented_system = system_prompt + no_tool_note
             try:
-                response = self._backend.complete(system_prompt, user_message, max_tok)
+                response = self._backend.complete(augmented_system, user_message, max_tok)
                 output_path = self._write_output(task, response)
                 return TaskResult(
                     task=task,

@@ -42,6 +42,9 @@ def build_corpus_service_from_settings(settings: Settings) -> Any:
             expanded,
         )
         return None
+    embedder_cfg = settings.corpus_embedder_config or {}
+    # build_embedder() expects {"embedder": {...}} — wrap the sub-dict.
+    embedder_config_arg = {"embedder": embedder_cfg} if embedder_cfg else None
     try:
         service = _CorpusService.from_db_path(
             expanded,
@@ -49,6 +52,7 @@ def build_corpus_service_from_settings(settings: Settings) -> Any:
             ollama_model=settings.ollama_embed_model,
             search_k=settings.corpus_search_k,
             search_threshold=settings.corpus_search_threshold,
+            embedder_config=embedder_config_arg,
         )
     except Exception as exc:
         logger.warning("Failed to initialize CorpusService: %s", exc)
@@ -58,6 +62,6 @@ def build_corpus_service_from_settings(settings: Settings) -> Any:
     else:
         logger.warning(
             "CorpusService initialized but embedder unavailable; "
-            "corpus search will return empty until Ollama is running."
+            "corpus search will return empty results."
         )
     return service

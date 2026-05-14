@@ -35,6 +35,7 @@ from engineering_hub.journaler.model_profiles import (
     journaler_slash_model_command,
     resolve_journaler_model_spec,
 )
+from engineering_hub.journaler.timesheet_slash import handle_timesheet_slash_command
 from engineering_hub.memory.service import MemoryService
 from engineering_hub.orchestration.orchestrator import Orchestrator
 from engineering_hub.search import build_agent_search_provider_from_settings
@@ -800,6 +801,8 @@ def _handle_chat_slash_command(
       /budget                    Show token budget breakdown.
       /topic                     Show the currently detected conversation topic.
       /find <title fragment>     Search org-roam files by #+title:.
+      /timesheet <hours> project "<project>" :: <description>
+                                  Log hours to today's journal, grouped by project.
       /task <description>        Add a TODO to today's journal.
       /done <fragment>           Mark a matching TODO as done in today's journal.
       /note <heading> :: <text>  Append text under a heading in today's journal.
@@ -1120,6 +1123,8 @@ def _handle_chat_slash_command(
             "\n  [bold]File operations (requires org-roam dir):[/bold]\n"
             "  [cyan]/task <description>[/cyan]          Add a TODO to today's journal\n"
             "  [cyan]/done <fragment>[/cyan]             Mark a matching TODO as done\n"
+            "  [cyan]/timesheet <hours> project \"<project>\" :: <desc>[/cyan]\n"
+            "                                 Log hours grouped by project\n"
             "  [cyan]/note <heading> :: <text>[/cyan]   Append text under "
             "a heading in today's journal\n"
             "  [cyan]/open[/cyan]                       Show current /edit target\n"
@@ -1164,6 +1169,14 @@ def _handle_chat_slash_command(
             "(or type exit, quit, :q)\n"
             "  [cyan]/help[/cyan]                      Show this help\n"
         )
+        return
+
+    if cmd == "/timesheet":
+        if journal_dir is None:
+            chat_console.print("[yellow]/timesheet requires a daily journal directory.[/yellow]")
+            return
+        msg = handle_timesheet_slash_command(raw, journal_dir)
+        chat_console.print(f"[green]{escape(msg)}[/green]")
         return
 
     if cmd == "/files":

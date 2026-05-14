@@ -39,6 +39,7 @@ from typing import TYPE_CHECKING, Any
 import yaml
 from pydantic import SecretStr
 
+from engineering_hub.agents.registry import AgentRegistry, ModelClass
 from engineering_hub.agents.worker import AgentWorker
 from engineering_hub.core.constants import AgentType
 from engineering_hub.core.models import ParsedTask, TaskStatus
@@ -167,6 +168,18 @@ class JournalerMLXBackendAdapter:
         ]
         return self._backend.chat(messages, max_tokens)
 
+    def complete_with_tools(
+        self,
+        system: str,
+        messages: list[dict],
+        tools: list[dict],
+        max_tokens: int,
+    ) -> None:
+        raise NotImplementedError(
+            "MLX backend does not support tool calling; "
+            "use Claude API for tool-use agents."
+        )
+
     def test_connection(self) -> bool:
         return self._backend.is_loaded()
 
@@ -246,6 +259,7 @@ class AgentDelegator:
         self._default_backend = default_backend.lower()
         self._anthropic_worker = anthropic_worker
 
+        self._registry = AgentRegistry()
         self._mlx_adapter = JournalerMLXBackendAdapter(mlx_backend)
         self._mlx_worker = AgentWorker(
             backend=self._mlx_adapter,
@@ -308,6 +322,37 @@ class AgentDelegator:
             return (
                 "No agent backend is available. "
                 "Configure 'anthropic.api_key' for Claude or ensure the MLX model is loaded."
+            )
+
+        # Auto-promote TOOL_USE agents from MLX to Claude when available, since
+        # MLX does not support structured tool calling.
+        try:
+            agent_model_class = self._registry.get_model_class(AgentType(resolved_type))
+        except ValueError:
+            agent_model_class = ModelClass.REASONING
+
+        if (
+            worker is self._mlx_worker
+            and agent_model_class == ModelClass.TOOL_USE
+            and self._default_backend != "mlx"
+        ):
+            if self._anthropic_worker:
+                logger.info(
+                    "Auto-promoting TOOL_USE agent '%s' from MLX to Claude API",
+                    resolved_type,
+                )
+                worker = self._anthropic_worker
+            else:
+                logger.warning(
+                    "Agent '%s' requires tool calling but MLX does not support it. "
+                    "Results may be incomplete. Configure anthropic.api_key for full capability.",
+                    resolved_type,
+                )
+        elif worker is self._mlx_worker and agent_model_class == ModelClass.TOOL_USE:
+            logger.info(
+                "TOOL_USE agent '%s' running on MLX (agent_backend=mlx); "
+                "tool calls will fall back to single-shot if unsupported.",
+                resolved_type,
             )
 
         task = ParsedTask(

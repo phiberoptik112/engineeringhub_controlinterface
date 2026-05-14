@@ -502,6 +502,15 @@ class Settings(BaseSettings):
         default=0.40,
         description="Minimum cosine similarity for corpus results (higher than memory threshold)",
     )
+    corpus_embedder_config: dict = Field(
+        default_factory=dict,
+        description=(
+            "Embedder config passed to libraryfiles_corpus build_embedder(). "
+            "Keys: provider (ollama|auto|mlx|huggingface), mode (local|api), "
+            "model, hf_model, mlx_model, token. "
+            "Empty dict (default) uses Ollama via OllamaEmbedder."
+        ),
+    )
 
     # Agent web search settings (local-first, used by Journaler /agent)
     agent_web_search_enabled: bool = Field(
@@ -912,6 +921,8 @@ class Settings(BaseSettings):
                 flat_config["corpus_search_k"] = corpus["search_k"]
             if corpus.get("threshold") is not None:
                 flat_config["corpus_search_threshold"] = corpus["threshold"]
+            if corpus.get("embedder") and isinstance(corpus["embedder"], dict):
+                flat_config["corpus_embedder_config"] = dict(corpus["embedder"])
 
         if "agent_web_search" in config:
             web = config["agent_web_search"]

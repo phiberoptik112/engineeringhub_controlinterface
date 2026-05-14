@@ -24,6 +24,8 @@ Slash commands (parsed before reaching the LLM):
         Run the multi-stage report drafting pipeline:
         DataGatherer → technical-writer → standards-checker (loop) → technical-reviewer → latex-writer.
         All numeric data must be pre-computed; the pipeline drafts prose only.
+    /timesheet <hours> project "<project>" :: <description>
+        Log hours to today's journal under * Timesheet, grouped by project.
 """
 
 from __future__ import annotations
@@ -46,6 +48,7 @@ from engineering_hub.journaler.session_retrieval import (
     format_past_session_block,
     retrieve_past_sessions,
 )
+from engineering_hub.journaler.timesheet_slash import handle_timesheet_slash_command
 
 if TYPE_CHECKING:
     from engineering_hub.journaler.context import JournalContext
@@ -220,6 +223,11 @@ def _make_handler(
 
                     response = handle_tasks_slash_command(
                         message, engine, resolved_pending
+                    )
+                elif mlow.startswith("/timesheet"):
+                    response = handle_timesheet_slash_command(
+                        message,
+                        context.journal_dir,
                     )
                 else:
                     settings_obj = (

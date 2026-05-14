@@ -31,7 +31,7 @@ COMMAND_CATALOG: list[CommandEntry] = [
     CommandEntry("/files", "[clear]", "List or clear loaded files", "Context Management"),
     # File Ops
     CommandEntry("/load", "<path> [-r]", "Load a file or directory into context", "File Ops"),
-    CommandEntry("/load_browse", "", "Interactive browser for org-roam files", "File Ops"),
+    CommandEntry("/load_browse", "", "Browse/load files with metadata and home search", "File Ops"),
     CommandEntry("/edit_browse", "", "Interactive browser to set /edit target", "File Ops"),
     CommandEntry("/find", "<title fragment>", "Search org-roam files by title", "File Ops"),
     # Agent Delegation
@@ -69,6 +69,12 @@ COMMAND_CATALOG: list[CommandEntry] = [
     CommandEntry("/edit", "<heading> :: <text>", "Append text under a heading in the open target", "Org-Roam Write"),
     CommandEntry("/task", "<description>", "Add a TODO to today's journal", "Org-Roam Write"),
     CommandEntry("/done", "<fragment>", "Mark a matching TODO as done", "Org-Roam Write"),
+    CommandEntry(
+        "/timesheet",
+        '<hours> project "<project>" :: <description>',
+        "Log hours to today's journal by project",
+        "Org-Roam Write",
+    ),
     CommandEntry("/note", "<heading> :: <text>", "Append text under a heading in today's journal", "Org-Roam Write"),
     # Export
     CommandEntry(

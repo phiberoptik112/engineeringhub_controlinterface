@@ -164,7 +164,7 @@ In **`journaler chat`**, **`/export`** uses the same export pipeline as the CLI;
 /load path/to/file.md           Load a single file
 /load path/to/dir/              Load all supported files in a directory
 /load path/to/dir/ -r           Load recursively
-/load_browse                    Interactive file browser (arrow keys, multi-select)
+/load_browse                    Interactive file browser (hidden files, size/date columns, / home search)
 /files                          List currently loaded files (with sizes)
 /files clear                    Remove all loaded files from context
 /export                         Export transcript to `<org-roam>/conversation_exports/` (see below)
@@ -185,6 +185,8 @@ In **`journaler chat`**, **`/export`** uses the same export pipeline as the CLI;
 /zettel apply path/to/batch.json Apply approved Zettelkasten proposals into org-roam
 /help                           Show all slash commands
 ```
+
+Inside `/load_browse`, press `/` to search supported files under your home directory, including supported dotfiles and files inside hidden dot folders. Results use the same multi-select controls as the normal org-roam browser.
 
 Supported extensions: `.md`, `.txt`, `.org`, `.py`, `.yaml`, `.yml`, `.json`, `.tex`, `.csv`, `.toml`, `.rst`, `.docx` (converted to markdown for context). Each `/load` is capped from your `journaler.model_context_window`, current conversation/history usage, and optional `journaler.load_*` keys in config (documented under **Journaler → Configuration** below). Oversized files are truncated with a notice. Directory loads share one remaining budget across files (recomputed after each file). Loaded files appear in the model's system prompt on every turn, count toward `/budget` and context pressure, and are cleared when the session ends.
 
@@ -568,6 +570,8 @@ While in `engineering-hub journaler chat`, any input starting with `/` is handle
 | --- | --- |
 | `/task <description>` | Add `- [ ] <description>` to today's journal under `* Overnight Agent Tasks` |
 | `/done <fragment>` | Mark the first matching `- [ ]` item as `- [X]` with a `CLOSED:` timestamp |
+| `/timesheet <hours> project "<project>" :: <description>` | Log hours to today's journal under `* Timesheet`, grouped by project |
+| `/timesheet <hours> --project "<project>" --desc "<description>"` | Same as above, using flag syntax; add `--project-id <id>` to create a `django://project/<id>` link |
 | `/note <heading> :: <text>` | Append text under a heading in today's journal (creates the heading if absent) |
 | `/open` | Print the current `/edit` target path, if any |
 | `/open clear` | Clear the session edit target |
@@ -577,6 +581,40 @@ While in `engineering-hub journaler chat`, any input starting with `/` is handle
 | `/edit <heading> :: <text>` | Append text under a heading in the note opened with `/open` (same ` :: ` delimiter as `/note`) |
 | `/edit_browse` | Interactive file browser to set the `/edit` target — browse `.org` files, Enter to select |
 | `/find <title fragment>` | Search all org-roam files for a case-insensitive `#+title:` match; prints matching paths |
+
+`/timesheet` writes an append-only line such as `- [2026-05-07 Thu 22:55] 2.00h :: report drafting` under `* Timesheet` → `** Project X` in the daily journal. It also maintains an agent-searchable org-roam note at `<org-roam>/timesheets/timesheet-reference.org` tagged `:timesheet:agent-context:worklog:`; that reference groups entries by project, adds project heading tags such as `:project_42:`, and links back to the daily journal plus `django://project/<id>` when `--project-id` is provided. The existing `/capture contracting-hours ...` template remains available when you want one org-roam node per contracting-hour entry instead.
+
+Examples:
+
+```text
+# Interactive journaler chat
+/timesheet 2 project "Project X" :: report drafting and client coordination
+/timesheet 0.5 --project "Project X" --desc "follow-up email and action items"
+
+# Link the entry to a Django project reference
+/timesheet 1.25 --project "LVT Phase B" --project-id 42 --desc "reviewed test data and updated report outline"
+
+# Numeric project shorthand; logs under "Project 42" and links django://project/42
+/timesheet 0.75 project 42 :: prepared field measurement checklist
+```
+
+The persistent reference note is intentionally separate from the daily journal so agents can search across accumulated time logs by project, tags, and links. A project-linked entry in `<org-roam>/timesheets/timesheet-reference.org` looks like:
+
+```org
+* Timesheet
+** [[django://project/42][LVT Phase B]] :project:project_42:
+- [2026-05-07 Thu 22:55] 1.25h :: reviewed test data and updated report outline
+  - Daily journal: [[file:/path/to/org-roam/journals/2026-05-07.org][2026-05-07.org]]
+  - Project link: [[django://project/42][LVT Phase B]]
+```
+
+The same command works through the daemon HTTP `/chat` endpoint:
+
+```bash
+curl -X POST http://localhost:18790/chat \
+  -H "Content-Type: application/json" \
+  -d '{"message": "/timesheet 2 --project \"Project X\" --desc \"report drafting\""}'
+```
 
 **General**
 
@@ -588,7 +626,7 @@ Tasks added with `/task` use the `- [ ] @agent:` format understood by the Orches
 
 With **`journaler.default_task_mode: immediate`** (default), ordinary messages that describe agent work may be **classified** and **delegated inline** (no `/agent` prefix) unless you use explicit **queue** language (“run later”, “queue for tonight”, …) or **`/queue`**. With **`default_task_mode: propose`**, that auto-path is off; the model uses **`DISPATCH:`** lines and you confirm before the agent runs (interactive chat prompts **Run it? [y/N]**; HTTP `/chat` still auto-runs a `DISPATCH` after the model responds, as before).
 
-**`/model`** in interactive chat reloads the MLX weights but **keeps the delegator’s adapter in sync**, so `/agent --backend mlx` continues to use the active checkpoint (same behavior as HTTP `/chat`). **`/export`**, **`/open`**, **`/edit`**, and the **`/load_browse`** / **`/agent_browse`** / **`/edit_browse`** TUIs are only in interactive **`journaler chat`**; the HTTP endpoint handles **`/model`**, **`/agent`**, **`/tasks`**, **`/queue`**, and **`/skills`**. Loaded files are appended to the system prompt as fenced blocks and persist for the life of the chat session only.
+**`/model`** in interactive chat reloads the MLX weights but **keeps the delegator’s adapter in sync**, so `/agent --backend mlx` continues to use the active checkpoint (same behavior as HTTP `/chat`). **`/export`**, **`/open`**, **`/edit`**, and the **`/load_browse`** / **`/agent_browse`** / **`/edit_browse`** TUIs are only in interactive **`journaler chat`**; the HTTP endpoint handles **`/model`**, **`/agent`**, **`/tasks`**, **`/queue`**, **`/timesheet`**, and **`/skills`**. Loaded files are appended to the system prompt as fenced blocks and persist for the life of the chat session only.
 
 To persist files for long-term retrieval across sessions, use `engineering-hub load` instead (see [Load Files into Context](#6-load-files-into-context)).
 
