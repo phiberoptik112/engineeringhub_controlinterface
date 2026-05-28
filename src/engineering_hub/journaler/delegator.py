@@ -2,7 +2,7 @@
 
 Allows the Journaler to delegate tasks directly to named agent personalities
 (research, technical-writer, standards-checker, technical-reviewer, weekly-reviewer,
-latex-writer, panning-for-gold)
+latex-writer, panning-for-gold, lvt-task-extractor)
 using either the local MLX model already loaded in memory or the Claude API.
 
 Backend selection
@@ -67,6 +67,9 @@ def build_delegator(
     prompts_dir: Path | None = None,
     corpus_service: Any | None = None,
     memory_service: Any | None = None,
+    proposal_dir: Path | None = None,
+    zettel_state_path: Path | None = None,
+    org_journal_dir: Path | None = None,
 ) -> AgentDelegator | None:
     """Construct an :class:`AgentDelegator` or return ``None`` if setup fails.
 
@@ -87,6 +90,9 @@ def build_delegator(
                 output_dir=output_dir,
                 corpus_service=corpus_service,
                 memory_service=memory_service,
+                proposal_dir=proposal_dir,
+                zettel_state_path=zettel_state_path,
+                org_journal_dir=org_journal_dir,
             )
             logger.info("Claude API worker initialized for agent delegation")
 
@@ -99,6 +105,9 @@ def build_delegator(
             output_dir=output_dir,
             corpus_service=corpus_service,
             memory_service=memory_service,
+            proposal_dir=proposal_dir,
+            zettel_state_path=zettel_state_path,
+            org_journal_dir=org_journal_dir,
         )
         logger.info(
             "AgentDelegator ready (default backend: %s, skills: %s)",
@@ -138,6 +147,18 @@ _AGENT_ALIASES: dict[str, str] = {
     "zettelkasten": "zettelkasten-curator",
     "zettel": "zettelkasten-curator",
     "curator": "zettelkasten-curator",
+    "lvt-task-extractor": "lvt-task-extractor",
+    "lvt": "lvt-task-extractor",
+    "lvt-tasks": "lvt-task-extractor",
+    "lvt-extractor": "lvt-task-extractor",
+    "coordination-analyst": "coordination-analyst",
+    "coordination": "coordination-analyst",
+    "coordinator": "coordination-analyst",
+    "coord": "coordination-analyst",
+    "acoustic-sim-expert": "acoustic-sim-expert",
+    "acoustic-sim": "acoustic-sim-expert",
+    "sim-expert": "acoustic-sim-expert",
+    "nora": "acoustic-sim-expert",
 }
 
 
@@ -255,6 +276,9 @@ class AgentDelegator:
         output_dir: Path | None = None,
         corpus_service: Any | None = None,
         memory_service: Any | None = None,
+        proposal_dir: Path | None = None,
+        zettel_state_path: Path | None = None,
+        org_journal_dir: Path | None = None,
     ) -> None:
         self._default_backend = default_backend.lower()
         self._anthropic_worker = anthropic_worker
@@ -267,6 +291,9 @@ class AgentDelegator:
             output_dir=output_dir,
             corpus_service=corpus_service,
             memory_service=memory_service,
+            proposal_dir=proposal_dir,
+            zettel_state_path=zettel_state_path,
+            org_journal_dir=org_journal_dir,
         )
 
         resolved_skills = skills_dir or _default_skills_dir()

@@ -105,6 +105,27 @@ DEFAULT_AGENT_CONFIGS = {
         tools=["search_memory"],
         max_tokens=6000,
     ),
+    AgentType.LVT_TASK_EXTRACTOR: AgentConfig(
+        agent_type=AgentType.LVT_TASK_EXTRACTOR,
+        prompt_file="lvt-task-extractor.txt",
+        model_class=ModelClass.REASONING,
+        tools=[],
+        max_tokens=6000,
+    ),
+    AgentType.COORDINATION_ANALYST: AgentConfig(
+        agent_type=AgentType.COORDINATION_ANALYST,
+        prompt_file="coordination-analyst.txt",
+        model_class=ModelClass.REASONING,
+        tools=[],
+        max_tokens=4096,
+    ),
+    AgentType.ACOUSTIC_SIM_EXPERT: AgentConfig(
+        agent_type=AgentType.ACOUSTIC_SIM_EXPERT,
+        prompt_file="acoustic-sim-expert.txt",
+        model_class=ModelClass.TOOL_USE,
+        tools=["search_corpus", "search_memory", "ingest_files"],
+        max_tokens=6000,
+    ),
 }
 
 

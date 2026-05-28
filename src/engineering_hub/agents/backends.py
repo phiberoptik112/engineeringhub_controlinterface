@@ -259,18 +259,6 @@ class MLXBackend:
                 f"MLX generation failed: {exc}", provider="mlx"
             ) from exc
 
-    def complete_with_tools(
-        self,
-        system: str,
-        messages: list[dict[str, Any]],
-        tools: list[dict[str, Any]],
-        max_tokens: int,
-    ) -> ToolAwareResponse:
-        raise NotImplementedError(
-            "MLX backend does not support tool calling. "
-            "Use Anthropic or Ollama for tool-use agents."
-        )
-
     def test_connection(self) -> bool:
         return self._model is not None
 

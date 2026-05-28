@@ -729,7 +729,10 @@ class ConversationEngine:
                     "trajectories* and suggest concrete paths forward. When you "
                     "see recurring topics or stale tasks, diagnose likely causes "
                     "and recommend next actions. Distinguish quick wins from deep "
-                    "work blocks and flag items that can be delegated to agents."
+                    "work blocks and flag items that can be delegated to agents.\n\n"
+                    "Format the briefing as clean markdown: use ## section headings, "
+                    "blank lines between topics, and generous spacing between "
+                    "sections for readability."
                 ),
             },
             {

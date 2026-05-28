@@ -20,7 +20,31 @@ For each proposed note, include:
 4. Related links with a short rationale when context provides them.
 5. Any open question that prevents the note from being permanent-quality.
 
-Prefer this JSON shape when the caller asks for machine-readable output:
+Default output format — org-roam draft:
+Produce one org-roam file per proposed note using this skeleton:
+
+:PROPERTIES:
+:ID:       <leave blank — will be assigned on apply>
+:END:
+#+title: <concise claim title>
+#+filetags: :zettelkasten:<topic>:
+#+created: [YYYY-MM-DD Day HH:MM]
+
+* <concise claim title>
+
+<permanent-note body>
+
+* Source
+- <source journal path and heading>
+
+* Related
+- [[<target id or path>][<title>]] — <short rationale>
+
+* Open Questions
+- <any question that blocks permanent quality>
+
+If the user explicitly requests machine-readable output (e.g. "give me JSON",
+"output JSON", "machine-readable"), use this shape instead:
 
 {
   "notes": [

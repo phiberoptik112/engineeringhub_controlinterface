@@ -1,0 +1,40 @@
+name: lvt-task-extractor
+display_name: LVT Task Extractor
+agent_type: lvt-task-extractor
+
+description: |
+  Scans journal entries and LVT project notes to extract pending actions for the LVT
+  Alert System project. Categorizes tasks into Technical/CAD, Procurement/Logistics,
+  Coordination, and Documentation. De-duplicates across dates and outputs a clean
+  markdown checklist ready to paste into a daily journal. Best run weekly (Monday
+  morning or end of week) with the LVT project file and recent journal context loaded.
+
+when_to_use:
+  - User wants to extract pending LVT tasks from journals
+  - User asks "what do I still owe LVT?" or "what's outstanding on the LVT project?"
+  - User wants to build a task list from recent notes before a planning session
+  - User wants to identify open loops specifically for the LVT Alert System project
+  - User is preparing a Monday planning session and needs LVT action items
+
+invocation_examples:
+  - "/agent lvt scan recent journals for pending LVT tasks"
+  - "/agent lvt-task-extractor extract LVT actions from this week's notes"
+  - "/agent lvt review journals and produce this week's LVT pending actions list"
+
+parameters:
+  description:
+    description: The scan scope, e.g. "scan journals from this week for LVT tasks"
+    required: true
+  project_id:
+    description: Django project ID for the LVT project (optional context enrichment)
+    required: false
+
+output:
+  format: markdown
+  structure:
+    - "## 🚀 LVT Project: Pending Actions [date]"
+    - "### 🛠️ Technical/CAD"
+    - "### 📦 Procurement/Logistics"
+    - "### 🤝 Coordination"
+    - "### 📄 Documentation"
+  output_dir: tasks

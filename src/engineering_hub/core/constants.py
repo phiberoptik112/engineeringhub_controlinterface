@@ -25,6 +25,9 @@ class AgentType(str, Enum):
     LATEX_WRITER = "latex-writer"
     PANNING_FOR_GOLD = "panning-for-gold"
     ZETTELKASTEN_CURATOR = "zettelkasten-curator"
+    LVT_TASK_EXTRACTOR = "lvt-task-extractor"
+    COORDINATION_ANALYST = "coordination-analyst"
+    ACOUSTIC_SIM_EXPERT = "acoustic-sim-expert"
 
 
 def is_ingest_task(description: str) -> bool:
@@ -48,4 +51,7 @@ AGENT_PROMPT_FILES = {
     AgentType.LATEX_WRITER: "latex-writer.txt",
     AgentType.PANNING_FOR_GOLD: "panning-for-gold.txt",
     AgentType.ZETTELKASTEN_CURATOR: "zettelkasten-curator.txt",
+    AgentType.LVT_TASK_EXTRACTOR: "lvt-task-extractor.txt",
+    AgentType.COORDINATION_ANALYST: "coordination-analyst.txt",
+    AgentType.ACOUSTIC_SIM_EXPERT: "acoustic-sim-expert.txt",
 }

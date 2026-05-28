@@ -276,6 +276,43 @@ class Settings(BaseSettings):
         default="09:00",
         description="Time for morning briefing (HH:MM, local time)",
     )
+    journaler_end_of_day_time: str = Field(
+        default="15:30",
+        description="Time to generate the daily conversation summary and archive history (HH:MM, local time)",
+    )
+
+    # Discussion briefing settings
+    journaler_discussion_briefing_enabled: bool = Field(
+        default=False,
+        description="Enable scheduled Topics Discussion Briefing (multi-persona roundtable)",
+    )
+    journaler_discussion_briefing_time: str = Field(
+        default="08:45",
+        description="Time for discussion briefing (HH:MM, local time); runs before morning briefing",
+    )
+    journaler_personas_dir: Path | None = Field(
+        default=None,
+        description="Path to personas/*.yaml directory; defaults to repo personas/ directory",
+    )
+    journaler_discussion_persona_lookback_days: int = Field(
+        default=7,
+        description="Days of per-persona history to inject into each discussion call",
+    )
+    journaler_discussion_max_tokens_per_persona: int = Field(
+        default=1024,
+        description="Max tokens generated per persona in the discussion briefing",
+    )
+
+    # Coordination scan settings
+    journaler_coordination_scan_enabled: bool = Field(
+        default=False,
+        description="Enable scheduled coordination analyst scan (scans journal for client coordination signals)",
+    )
+    journaler_coordination_scan_interval_min: int = Field(
+        default=0,
+        description="Interval in minutes between coordination scans (0 = disabled)",
+    )
+
     journaler_chat_enabled: bool = Field(
         default=True,
         description="Enable HTTP chat endpoint",
@@ -817,6 +854,28 @@ class Settings(BaseSettings):
                 flat_config["journaler_briefing_enabled"] = j["briefing_enabled"]
             if j.get("briefing_time"):
                 flat_config["journaler_briefing_time"] = j["briefing_time"]
+            if j.get("end_of_day_time"):
+                flat_config["journaler_end_of_day_time"] = j["end_of_day_time"]
+            if j.get("discussion_briefing_enabled") is not None:
+                flat_config["journaler_discussion_briefing_enabled"] = j["discussion_briefing_enabled"]
+            if j.get("discussion_briefing_time"):
+                flat_config["journaler_discussion_briefing_time"] = j["discussion_briefing_time"]
+            if j.get("personas_dir"):
+                flat_config["journaler_personas_dir"] = Path(j["personas_dir"]).expanduser()
+            if j.get("discussion_persona_lookback_days") is not None:
+                flat_config["journaler_discussion_persona_lookback_days"] = int(
+                    j["discussion_persona_lookback_days"]
+                )
+            if j.get("discussion_max_tokens_per_persona") is not None:
+                flat_config["journaler_discussion_max_tokens_per_persona"] = int(
+                    j["discussion_max_tokens_per_persona"]
+                )
+            if j.get("coordination_scan_enabled") is not None:
+                flat_config["journaler_coordination_scan_enabled"] = j["coordination_scan_enabled"]
+            if j.get("coordination_scan_interval_min") is not None:
+                flat_config["journaler_coordination_scan_interval_min"] = int(
+                    j["coordination_scan_interval_min"]
+                )
             if j.get("chat_enabled") is not None:
                 flat_config["journaler_chat_enabled"] = j["chat_enabled"]
             if j.get("chat_host"):

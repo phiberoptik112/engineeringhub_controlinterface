@@ -110,6 +110,18 @@ engineering-hub journaler briefing
 # View the latest briefing
 engineering-hub journaler briefing --latest
 
+# Generate a Topics Discussion Briefing (multi-persona roundtable)
+engineering-hub journaler briefing --discussion
+
+# View the latest discussion briefing
+engineering-hub journaler briefing --latest-discussion
+
+# Run the Coordination Analyst scan on recent journal context
+engineering-hub journaler briefing --coordination-scan
+
+# Generate today's daily summary now (reads conversation.jsonl, writes daily_summaries/)
+engineering-hub journaler summarize
+
 # Check daemon status
 engineering-hub journaler status
 
@@ -323,6 +335,17 @@ journaler:
   # load_max_chars_absolute: 200000
   # load_min_chars: 1024
   # load_slack_tokens: 256
+
+  # Topics Discussion Briefing — multi-persona roundtable (disabled by default)
+  # discussion_briefing_enabled: false
+  # discussion_briefing_time: "08:45"    # runs before morning briefing
+  # personas_dir: "~/org-roam/engineering-hub/personas"  # default: personas/ at repo root
+  # discussion_persona_lookback_days: 7  # days of per-persona history to inject
+  # discussion_max_tokens_per_persona: 1024
+
+  # Coordination Analyst scheduled scan (disabled by default)
+  # coordination_scan_enabled: false
+  # coordination_scan_interval_min: 0    # 0 = disabled; e.g. 240 = every 4h
 ```
 
 `model_path` is optional: if omitted, the Journaler falls back to `mlx.model_path` (the orchestrator MLX path), then to a built-in default (`mlx-community/gemma-4-31b-it-8bit`). Use `journaler download` after changing paths.
@@ -465,12 +488,24 @@ The Journaler runs all day, and a 32B model's context window fills up over hours
 | **Compression** | Window ≥ 70% full | Asks the model to summarize earlier turns into a ~200-word paragraph; replaces them with a single preserved system message |
 | **Emergency trim** | Window ≥ 90% after compression | Force-drops to the last 3 turns |
 | **Topic-aware clear** | Topic shift detected (3 consecutive on-topic messages) | Archives the old topic, starts fresh with the new one |
-| **End-of-day reset** | Scheduled (default midnight) | Compresses the full day, saves to `daily_summaries/YYYY-MM-DD.md`, resets history |
+| **End-of-day reset** | Scheduled (`end_of_day_time`, default 15:30) or `/summarize` on demand | Compresses the full day, saves to `daily_summaries/YYYY-MM-DD.md`, resets history |
 | **Manual clear** | `/clear` command | User-controlled: soft, compress-then-clear, or full reset |
 
 ### Daily Summary Context Loop
 
-The daily summaries written at midnight feed back into every future session through two complementary paths:
+Daily summaries are generated automatically at `end_of_day_time` (default **15:30**, configurable) and feed back into every future session through two complementary paths. You can also trigger a summary at any time:
+
+- **Inside `journaler chat`:** type `/summarize` — generates the summary immediately from the current session's history and archives it.
+- **From the terminal:** `engineering-hub journaler summarize` — reads today's turns from `conversation.jsonl`, generates the summary, and writes it without needing an active chat session.
+
+To change the scheduled time, set `end_of_day_time` in your config:
+
+```yaml
+journaler:
+  end_of_day_time: "15:30"   # HH:MM local time
+```
+
+Or via environment variable: `ENGINEERING_HUB_JOURNALER_END_OF_DAY_TIME=15:30`.
 
 **Proactive path — snapshot injection (every 10-min tick)**
 
@@ -513,6 +548,7 @@ While in `engineering-hub journaler chat`, any input starting with `/` is handle
 | `/clear` | Soft clear: archive conversation history, keep context snapshot |
 | `/clear --summarize` | Compress history into a summary, then clear |
 | `/clear --hard` | Full reset: clear conversation and wipe scan state |
+| `/summarize` | Generate today's daily summary now, write it to `daily_summaries/YYYY-MM-DD.md`, and archive history |
 | `/status` | Show context pressure, utilization %, turn count, and current topic |
 | `/budget` | Show full token budget breakdown (system prompt, snapshot, history, available) |
 | `/topic` | Show the currently detected conversation topic |
@@ -663,18 +699,125 @@ Web search is local-first. The host process queries SearXNG, formats titles, URL
 
 For **draft reports, protocols, executive summaries, and other client-facing Markdown deliverables**, use the **`technical-writer`** persona. The default Journaler system prompt and workspace layout describe **available agents**, **immediate vs queue** behavior, and practical routes: **`/agent technical-writer …`**, natural-language delegation in **immediate** mode, queue **`/task`** / journal lines with `@technical-writer:`, **`/queue`** + **`/tasks commit`** for **`pending-tasks.org`**, optional **`--project <id>`** for Django context, and **`/skills`** for full persona text. Delegated technical-writer runs use `prompts/technical-writer.txt`; saved artifacts often land under **`outputs/docs/`**.
 
-**Examples:**
+#### Agent Reference
+
+Each agent has a defined scope, output format, and set of practical invocations. Use `/skills` in the chat to see the live list.
+
+---
+
+**`research`** — Gather, synthesize, or summarize technical information from standards, prior reports, or external sources.
+Output: markdown research document under `outputs/research/`.
 
 ```text
-/agent research IBC 1207.3 occupant comfort requirements --project 42
-/agent research Find current FAA guidance on vertiport noise --backend mlx --web
-/agent research Search current ASTM updates for E336 --web
-/agent technical-writer draft executive summary for noise assessment --project 25 --backend claude
-/agent standards-checker audit ASTM citations in draft report --backend mlx
-/agent weekly-reviewer summarize this week's work and open loops
+/agent research IBC 1207.3 occupant comfort requirements for multifamily --project 42
+/agent research Compare ASTM E336-17a vs E336-23 changes to flanking path requirements
+/agent research Find current FAA guidance on vertiport noise criteria --web
+/agent research What STC ratings does IBC 1207.3 require for hotel guest rooms
+```
+
+---
+
+**`technical-writer`** — Draft or revise client-facing deliverables: field reports, test protocols, executive summaries, specifications.
+Output: markdown document under `outputs/docs/`. Use `--project` to inject Django project scope.
+
+```text
+/agent technical-writer draft executive summary for the Oak Street noise assessment --project 25
+/agent technical-writer write a field report section covering the Phase 2 site visit findings
+/agent technical-writer draft a scope-of-work letter for wall assembly testing at 200 Main St
+/agent technical-writer revise the Introduction section to clarify the test standard citations
+/agent technical-writer draft a response to reviewer comment #4 on the STC discrepancy
+```
+
+---
+
+**`standards-checker`** — Audit a draft or set of conclusions against ASTM, ISO, and IBC citations.
+Output: gap analysis with PASS / CONDITIONAL PASS / FLAG FOR REVIEW verdicts.
+
+```text
+/agent standards-checker audit ASTM citations in the attached draft report --backend mlx
+/agent standards-checker verify the STC ratings in the Phase 1 report match E336-17a procedure
+/agent standards-checker check IBC 1207.3 compliance for the proposed partition assembly specs
+/agent standards-checker does our field protocol meet E1007-16 requirements for IIC testing
+```
+
+---
+
+**`technical-reviewer`** — Peer review a draft document: produces a review comment set and a revised version.
+Output: review comments + revised document under `outputs/docs/`.
+
+```text
+/agent technical-reviewer review the attached noise assessment report for technical accuracy
+/agent technical-reviewer check the executive summary for clarity and correct standard references
+/agent technical-reviewer review the protocol draft before we send it to the client
+```
+
+---
+
+**`weekly-reviewer`** — Summarize recent work across the workspace, surface open loops, and produce a project status overview.
+Output: markdown weekly review under `outputs/`.
+
+```text
+/agent weekly-reviewer summarize this week's work and open loops across all active projects
+/agent weekly-reviewer what's the status of the LVT and Oak Street projects this week
+/agent weekly-reviewer what deliverables are outstanding and which projects need follow-up
+```
+
+---
+
+**`latex-writer`** — Produce compilable `.tex` source for consulting deliverables with style-controlled preambles.
+Output: `.tex` file under `outputs/latex/`. Accepts `--style`, `--template`, `--list-styles`.
+
+```text
+/agent latex-writer --style consulting-report draft field report for project 18
 /agent latex-writer --style executive-summary draft exec summary for project 5
 /agent latex-writer --list-styles
+/agent latex-writer --template preamble-minimal scaffold a blank test protocol
 ```
+
+---
+
+**`panning-for-gold`** — Mine a meeting transcript, brainstorm session, or raw notes for actionable ideas, evaluations, and PKM captures.
+Output: gold-found markdown with ACT NOW / RESEARCH MORE / PARK IT / KILL IT triage.
+
+```text
+/agent panning-for-gold extract ideas from the attached site visit transcript
+/agent panning-for-gold mine this brainstorm doc for anything worth capturing
+```
+
+---
+
+**`zettelkasten-curator`** — Scan daily journal markers (`#idea`, `#extract`, `TODO extract`) and propose atomic org-roam notes with conservative link suggestions.
+Output: proposal batch JSON + org review file under `outputs/zettelkasten/`.
+
+```text
+/agent zettelkasten-curator extract and propose atomic notes from this week's journals
+/agent zettel review recent journals for #idea and #extract markers
+```
+
+---
+
+**`lvt-task-extractor`** — Scan LVT project notes and journals for pending actions, categorized into Technical/CAD, Procurement, Coordination, and Documentation.
+Output: markdown task checklist under `outputs/tasks/`.
+
+```text
+/agent lvt-task-extractor extract pending LVT actions from this week's journals
+/agent lvt scan recent notes and produce the LVT pending actions list for Monday planning
+/agent lvt what do I still owe LVT this week
+```
+
+---
+
+**`coordination-analyst`** — Scan context for client coordination signals: tricky asks, scope implications, required deliverables, implied engineering tasks, and suggested response framing.
+Output: structured markdown under `outputs/coordination/`.
+
+```text
+/agent coordination-analyst review this email from the Oak Street client about extra assemblies
+/agent coord scan this week's journal for outstanding client coordination items
+/agent coordination-analyst what engineering tasks does this client ask imply for project 32
+/agent coord flag any scope drift indicators in the attached meeting notes
+```
+
+---
 
 If no live backend is configured, the command falls back to writing the task to today's journal under `* Overnight Agent Tasks` for the Orchestrator to pick up on its next scan.
 
@@ -710,6 +853,79 @@ invocation_examples:
 ```
 
 To add a new delegation capability, drop a new `.yaml` file into `skills/` — no code changes needed. The Journaler loads all skill files when the **ConversationEngine** starts (**daemon** or **interactive `journaler chat`**) and injects a summary into the system prompt (including **when_to_use** hints) so the ambient model knows what it can delegate and how. **Custom** `.journaler/system_prompt.txt` overrides the default template; copy the `{context_snapshot}` placeholder and any delegation guidance you still want if you maintain your own file.
+
+### Coordination Analyst Agent
+
+The `coordination-analyst` agent scans provided context — emails, meeting notes, journal entries, project correspondence — for client coordination signals and produces a structured breakdown:
+
+- **Core Ask**: what the client actually wants, stripped of politeness and ambiguity
+- **Scope Implications**: what this adds or changes relative to the agreed project scope
+- **Deliverables Required**: concrete outputs needed (report sections, drawings, test data)
+- **Engineering Tasks**: specific org-TODO-ready tasks implied by the ask
+- **Suggested Response Framing**: professionally framed reply language for the engineer
+- **Risk / Urgency**: timeline pressure, relationship risk, downstream dependencies
+- **Scope Drift Indicators**: cross-message patterns suggesting unstated expectations
+
+**Invoke on demand:**
+```
+/agent coordination-analyst review the attached email thread from project 32
+/agent coord scan this week's journal for outstanding client coordination items
+```
+
+**Run as a one-off CLI scan:**
+```bash
+engineering-hub journaler briefing --coordination-scan
+```
+
+Output is written to `.journaler/outputs/coordination/YYYY-MM-DD.md`. When the scheduled scan is enabled (`journaler.coordination_scan_enabled: true`, `coordination_scan_interval_min: 240`), the daemon runs the scan automatically and feeds results into the **coordination-liaison** persona's history store so they surface in the next Discussion Briefing.
+
+### Topics Discussion Briefing
+
+The Discussion Briefing generates a multi-persona roundtable over the day's shared project context. Each persona makes one LLM call, seeing the workspace context plus the running transcript from personas who spoke before it.
+
+**Personas** are defined in the top-level `personas/` directory alongside `skills/`. Each `.yaml` file describes one org identity:
+
+```yaml
+# personas/project-manager.yaml
+id: project-manager
+display_name: "Alex (Project Manager)"
+role_summary: "Tracks project timelines, budget health, client commitments, and blockers."
+communication_style: "Direct and deadline-oriented. Flags pressure early."
+areas_of_focus:
+  - project timeline and milestone status
+  - blocking issues and dependencies
+  - scope changes and their schedule impact
+system_prompt_suffix: |
+  You are Alex, the Project Manager. Focus on: are we on track? Are any
+  deadlines in danger? What do we need to decide or escalate today?
+```
+
+**Five personas ship out of the box:**
+
+| Persona | Focus |
+| --- | --- |
+| Alex (Project Manager) | Schedule, risk, client commitments, blockers |
+| Sam (Acoustic Engineer) | Measurement methodology, standards compliance, technical flags |
+| Taylor (Client Liaison) | Communication quality, relationship health, outstanding client items |
+| Jordan (Standards Reviewer) | ASTM/ISO/IBC compliance, citation accuracy, defensibility |
+| Morgan (Coordination Liaison) | Client coordination signals, scope drift, implied tasks |
+
+Each persona maintains an append-only history log under `.journaler/personas/{id}/history.jsonl`, injected back as past context in subsequent sessions for continuity across days.
+
+**Generate on demand:**
+```bash
+engineering-hub journaler briefing --discussion
+engineering-hub journaler briefing --latest-discussion
+```
+
+**Enable as a scheduled briefing** (runs before the morning briefing by default):
+```yaml
+journaler:
+  discussion_briefing_enabled: true
+  discussion_briefing_time: "08:45"
+```
+
+Output is saved to `.journaler/briefings/discussion-YYYY-MM-DD.md`.
 
 ### LaTeX Writer Agent
 

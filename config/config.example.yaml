@@ -254,19 +254,24 @@ chunking:
 #   #   engineering-hub journaler --model mlx-community/other-id start
 #   # In chat (CLI or HTTP): /model , /model reasoning , /model path <hf-id>
 #   #
-#   # model_profile: "default"
-#   # models:
-#   #   default:
-#   #     model_path: "mlx-community/gemma-4-31b-it-8bit"
-#   #     model_context_window: 131072
-#   #     mlx_backend: auto          # auto | mlx-lm | mlx-vlm
-#   #     enable_thinking: null       # null = omit (Gemma); true/false for Qwen3 templates
-#   #   reasoning:
-#   #     model_path: "mlx-community/Qwen3-30B-A3B-Instruct-2507-4bit"
-#   #     model_context_window: 32768
-#   #     temp: 0.6
-#   #     top_p: 0.95
-#   #     enable_thinking: true
+#   # The "reasoning" profile activates Qwen3 thinking mode, which produces
+#   # more exploratory, self-reflective responses at the cost of additional
+#   # tokens. Recommended for reflective/exploratory sessions; switch at
+#   # runtime with: /model reasoning
+#   #
+#   model_profile: "default"
+#   models:
+#     default:
+#       model_path: "mlx-community/gemma-4-31b-it-8bit"
+#       model_context_window: 131072
+#       mlx_backend: auto          # auto | mlx-lm | mlx-vlm
+#       enable_thinking: null       # null = omit (Gemma); true/false for Qwen3 templates
+#     reasoning:
+#       model_path: "mlx-community/Qwen3-30B-A3B-Instruct-2507-4bit"
+#       model_context_window: 32768
+#       temp: 0.6
+#       top_p: 0.95
+#       enable_thinking: true       # activates Qwen3 extended thinking template
 #
 #   # The model's actual context window in tokens.
 #   # Used by the context pressure manager to calculate utilization.
@@ -279,6 +284,21 @@ chunking:
 #   # Morning briefing schedule
 #   briefing_enabled: true
 #   briefing_time: "09:00"       # local time (HH:MM); default 9:00
+#
+#   # Topics Discussion Briefing — multi-persona roundtable (disabled by default)
+#   # discussion_briefing_enabled: false
+#   # discussion_briefing_time: "08:45"     # runs before morning briefing; default 08:45
+#   # personas_dir: "~/org-roam/engineering-hub/personas"  # default: personas/ at repo root
+#   # discussion_persona_lookback_days: 7   # days of per-persona history to inject
+#   # discussion_max_tokens_per_persona: 1024
+#
+#   # Coordination Analyst scheduled scan (disabled by default)
+#   # coordination_scan_enabled: false
+#   # coordination_scan_interval_min: 0    # 0 = disabled; e.g. 240 = every 4h
+#
+#   # Daily conversation summary (end-of-day archive + /summarize command)
+#   end_of_day_time: "15:30"     # local time (HH:MM); default 15:30
+#                                # use 'journaler summarize' or /summarize to trigger on demand
 #
 #   # Scan scope: when false, only journal.org_journal_dir + watch_dirs are scanned
 #   # for *.org (not the full roam tree). Large journal years: pair with lookback below.
@@ -327,7 +347,8 @@ chunking:
 #     # Prepend a bracketed note when the engine takes an automatic action
 #     notify_user_on_action: true
 #     # Time (HH:MM local) to run the end-of-day conversation clear
-#     end_of_day_time: "00:00"
+#     # Prefer top-level journaler.end_of_day_time; this nested key is a fallback override
+#     end_of_day_time: "15:30"
 #     # Auto-clear conversation after N minutes of inactivity
 #     inactivity_clear_minutes: 120
 #     # Write daily conversation summaries to memory.db (requires memory.enabled)

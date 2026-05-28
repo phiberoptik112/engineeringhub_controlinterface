@@ -28,6 +28,7 @@ COMMAND_CATALOG: list[CommandEntry] = [
     CommandEntry("/budget", "", "Token budget breakdown", "Context Management"),
     CommandEntry("/topic", "", "Show the currently detected conversation topic", "Context Management"),
     CommandEntry("/clear", "[--hard|--summarize]", "Clear conversation history", "Context Management"),
+    CommandEntry("/summarize", "", "Generate today's daily summary now and archive history", "Context Management"),
     CommandEntry("/files", "[clear]", "List or clear loaded files", "Context Management"),
     # File Ops
     CommandEntry("/load", "<path> [-r]", "Load a file or directory into context", "File Ops"),

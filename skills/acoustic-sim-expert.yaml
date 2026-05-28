@@ -1,0 +1,88 @@
+name: acoustic-sim-expert
+display_name: Acoustic Sim Expert
+agent_type: acoustic-sim-expert
+
+description: |
+  Electroacoustic simulation specialist for loudspeaker driver behavior, horn and waveguide
+  geometry, and enclosure/cabinet design. Searches the corpus for driver parameters, horn
+  geometry guidelines, enclosure alignment tables, BEM/FEM methodology references, and AES/IEC
+  transducer standards. Produces structured simulation reviews with method validity assessments,
+  parameter gap analysis, and quantified confidence bounds. Use for driver T-S parameter lookups,
+  horn profile comparisons, vented/sealed box alignment checks, and model-to-measurement
+  reconciliation.
+
+when_to_use:
+  - User needs T-S parameters or large-signal (Klippel) data for a specific driver model
+  - User wants to validate or challenge a Hornresp / ABEC / VACS simulation result
+  - User is selecting a horn profile (exponential, tractrix, OS waveguide, CD) and needs geometry tradeoffs
+  - User has a vented or sealed box design and wants the alignment checked against standard tables
+  - User needs to know where a plane-wave horn model breaks down vs BEM for their geometry
+  - User wants AES or IEC measurement standard references for transducer characterization
+  - User has a model-to-measurement mismatch and needs a systematic gap analysis
+  - User is designing a port and needs turbulence onset velocity estimates
+
+invocation_examples:
+  - "/agent acoustic-sim-expert lookup OS waveguide constant directivity mouth radius tradeoffs"
+  - "/agent acoustic-sim-expert lookup Thiele-Small 18Sound 10ND830 Bl Re Qts Vas Fs"
+  - "/agent acoustic-sim-expert lookup vented enclosure Qtc Bessel Butterworth Chebyshev alignment Fb"
+  - "/agent acoustic-sim-expert lookup exponential horn cutoff frequency flare rate plane wave validity"
+  - "/agent acoustic-sim-expert lookup AES2 loudspeaker power handling impedance measurement standard"
+  - "/agent acoustic-sim-expert lookup ABEC BEM boundary element loudspeaker cabinet radiation baffle"
+  - "/agent acoustic-sim-expert lookup transmission line enclosure quarter wave resonance stuffing"
+  - "/agent acoustic-sim-expert lookup port turbulence onset velocity chuffing diameter slot round"
+  - "/agent acoustic-sim-expert review driver model assumptions for project 14 --project 14"
+
+parameters:
+  project_id:
+    description: Django project ID for context enrichment (optional)
+    required: false
+  description:
+    description: >
+      The simulation topic, driver/geometry lookup, or design review task. Prefix with
+      "lookup" for corpus searches, "review" for simulation critique, or "compare" for
+      method/geometry tradeoffs.
+    required: true
+
+corpus_search_strategy:
+  priority_order:
+    - search_memory first (prior sim runs, prior driver characterization)
+    - search_corpus with specific model/geometry terms
+    - refine with method-specific vocabulary (BEM, T-S, plane-wave, mode-matching)
+    - flag gaps explicitly rather than fill from parametric memory
+
+  high_yield_query_patterns:
+    driver_parameters:
+      - '"Thiele-Small [driver model] Bl Re Qts Vas Fs sensitivity" — datasheet parameters'
+      - '"Klippel [driver] Bl(x) Cms(x) Le(x) distortion" — large-signal nonlinearity'
+      - '"[manufacturer] [model] impedance curve resonance fs" — measured impedance'
+    horn_geometry:
+      - '"OS waveguide oblate spheroidal constant directivity coverage angle" — CD waveguides'
+      - '"exponential horn cutoff frequency flare rate ka mouth" — plane-wave valid range'
+      - '"tractrix horn mouth diffraction radiation impedance throat coupling" — profile comparison'
+      - '"horn throat compression driver coupling acoustic loading efficiency" — throat behavior'
+    enclosure_design:
+      - '"vented enclosure Qtc alignment Bessel Butterworth Chebyshev Fb port tuning" — box alignments'
+      - '"sealed box Qtc system Q alignment rolloff f3 critically damped" — sealed alignments'
+      - '"transmission line enclosure quarter wave resonance damping stuffing material" — TL design'
+      - '"port velocity turbulence onset chuffing diameter length slot round flared" — port limits'
+    simulation_methods:
+      - '"ABEC BEM boundary element loudspeaker cabinet radiation directivity" — BEM methodology'
+      - '"baffle diffraction edge diffraction wavelength rolloff loudspeaker mounting" — diffraction effects'
+      - '"plane wave horn model validity mouth radius wavelength ka breakdown frequency" — method limits'
+      - '"FEM finite element loudspeaker enclosure modal resonance cabinet panel" — structural modes'
+    standards:
+      - '"AES2 loudspeaker power handling impedance measurement standard" — AES2'
+      - '"IEC 60268 loudspeaker sensitivity frequency response measurement" — IEC measurement'
+      - '"AES-1id directivity balloon measurement loudspeaker polar" — directivity standard'
+      - '"AES75 M-Noise loudspeaker testing power handling" — power handling test signal'
+
+output:
+  format: markdown
+  structure:
+    - Simulation Method Assessment (method name, applicable frequency range, validity verdict)
+    - Parameter / Geometry Gap Analysis (what is underspecified or unvalidated)
+    - Expected Deviations (quantified where possible — dB, Hz, degrees)
+    - Corpus Findings (cited chunks from search_corpus results)
+    - Recommended Next Steps (measure, refine mesh, switch method, or accept with caveat)
+    - References (all [SOURCE:] citations)
+  output_dir: analysis

@@ -15,6 +15,11 @@ from engineering_hub.core.constants import AgentType
 from engineering_hub.core.exceptions import AgentExecutionError, LLMBackendError
 from engineering_hub.core.models import ParsedTask, TaskResult
 from engineering_hub.diagnostics.prompt_addendum import DIAGNOSTIC_CONTEXT_AUDIT_ADDENDUM
+from engineering_hub.zettelkasten.linking import suggest_links
+from engineering_hub.zettelkasten.proposals import write_proposal_batch
+from engineering_hub.zettelkasten.response_parser import parse_curator_response
+from engineering_hub.zettelkasten.models import ProposalBatch
+from engineering_hub.zettelkasten.state import ZettelkastenState, new_batch_id
 
 logger = logging.getLogger(__name__)
 
@@ -35,6 +40,9 @@ class AgentWorker:
         corpus_service: Any | None = None,
         memory_service: Any | None = None,
         diagnostic_context_audit: bool = False,
+        proposal_dir: Path | None = None,
+        zettel_state_path: Path | None = None,
+        org_journal_dir: Path | None = None,
     ) -> None:
         self._backend = backend
         self.max_tokens = max_tokens
@@ -49,6 +57,9 @@ class AgentWorker:
         )
         self._corpus_service = corpus_service
         self._memory_service = memory_service
+        self._proposal_dir = proposal_dir
+        self._zettel_state_path = zettel_state_path
+        self._org_journal_dir = org_journal_dir
 
     @classmethod
     def from_anthropic(
@@ -62,6 +73,9 @@ class AgentWorker:
         templates_dir: Path | None = None,
         corpus_service: Any | None = None,
         memory_service: Any | None = None,
+        proposal_dir: Path | None = None,
+        zettel_state_path: Path | None = None,
+        org_journal_dir: Path | None = None,
     ) -> "AgentWorker":
         """Convenience constructor that creates an AnthropicBackend internally."""
         backend = AnthropicBackend(api_key=api_key, model=model)
@@ -75,6 +89,9 @@ class AgentWorker:
             corpus_service=corpus_service,
             memory_service=memory_service,
             diagnostic_context_audit=False,
+            proposal_dir=proposal_dir,
+            zettel_state_path=zettel_state_path,
+            org_journal_dir=org_journal_dir,
         )
 
     def execute(self, task: ParsedTask, context: str) -> TaskResult:
@@ -513,23 +530,27 @@ class AgentWorker:
             )
             return response
 
-        if ext == ".md":
+        if ext in (".md", ".org"):
             # Strip a single outer code fence (matches postprocess_model_org behaviour)
             stripped = response.strip()
             if stripped.startswith("```") and stripped.endswith("```"):
                 inner = stripped[3:]
                 if "\n" in inner:
-                    # Drop the opening language tag line (e.g. "markdown\n")
+                    # Drop the opening language tag line (e.g. "markdown\n", "org\n")
                     inner = inner.split("\n", 1)[1]
                 if inner.endswith("```"):
                     inner = inner[: -len("```")]
-                logger.debug("Stripped outer markdown fence from .md agent output.")
+                logger.debug("Stripped outer code fence from %s agent output.", ext)
                 return inner.strip()
 
         return response
 
     def _write_output(self, task: ParsedTask, response: str) -> Path:
         """Write agent response to output file."""
+        # Zettelkasten curator: route through the proposals pipeline when configured.
+        if task.agent_type == AgentType.ZETTELKASTEN_CURATOR and self._proposal_dir:
+            return self._write_zettel_proposal(task, response)
+
         if task.deliverable:
             output_path = self.output_dir / task.deliverable.lstrip("/")
         else:
@@ -542,9 +563,11 @@ class AgentWorker:
                 AgentType.TECHNICAL_REVIEWER: "reviews",
                 AgentType.LATEX_WRITER: "latex",
                 AgentType.PANNING_FOR_GOLD: "panning",
+                AgentType.ZETTELKASTEN_CURATOR: "zettelkasten",
             }
             agent_extensions = {
                 AgentType.LATEX_WRITER: ".tex",
+                AgentType.ZETTELKASTEN_CURATOR: ".org",
             }
             agent_dir = agent_dirs.get(task.agent_type, "outputs")
             ext = agent_extensions.get(task.agent_type, ".md")
@@ -570,6 +593,74 @@ class AgentWorker:
         logger.debug(f"Wrote output to {output_path}")
 
         return output_path
+
+    def _write_zettel_proposal(self, task: ParsedTask, response: str) -> Path:
+        """Parse an LLM curator response and write it through the proposals pipeline.
+
+        Produces a JSON sidecar and an org review buffer via write_proposal_batch().
+        Falls back to the plain .org dump if parsing yields no notes.
+        """
+        assert self._proposal_dir is not None
+
+        notes = parse_curator_response(
+            response,
+            task_description=task.description,
+            org_journal_dir=self._org_journal_dir,
+        )
+
+        if not notes:
+            logger.warning(
+                "Zettelkasten curator response yielded no parseable notes — "
+                "falling back to plain .org dump."
+            )
+            fallback_dir = self._proposal_dir
+            fallback_dir.mkdir(parents=True, exist_ok=True)
+            slug = "".join(
+                c if c.isalnum() or c == "-" else "-"
+                for c in task.description[:30].lower()
+            )
+            slug = "-".join(filter(None, slug.split("-")))
+            fallback_path = fallback_dir / f"{new_batch_id()}-{slug}-raw.org"
+            fallback_path.write_text(
+                self._postprocess_output(response, ".org"), encoding="utf-8"
+            )
+            return fallback_path
+
+        # Enrich each note with semantic link suggestions from the memory store.
+        for note in notes:
+            if not note.links and self._memory_service is not None:
+                note.links = suggest_links(
+                    note.body,
+                    self._memory_service,
+                    top_k=5,
+                    threshold=0.75,
+                )
+
+        state: ZettelkastenState | None = None
+        if self._zettel_state_path is not None:
+            state = ZettelkastenState.load(self._zettel_state_path)
+
+        batch = ProposalBatch(
+            batch_id=new_batch_id(),
+            created_at=datetime.now().isoformat(timespec="seconds"),
+            notes=notes,
+            source_count=len(notes),
+        )
+
+        _json_path, org_path = write_proposal_batch(
+            batch, self._proposal_dir, state=state
+        )
+
+        if state is not None and self._zettel_state_path is not None:
+            state.save(self._zettel_state_path)
+
+        logger.info(
+            "Zettelkasten proposal batch %s written: %d note(s) → %s",
+            batch.batch_id,
+            len(notes),
+            org_path,
+        )
+        return org_path
 
     def _validate_latex_output(self, tex_path: Path) -> str:
         """Run pdflatex on *tex_path* and return a one-line validation summary.

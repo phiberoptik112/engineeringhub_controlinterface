@@ -32,6 +32,7 @@ from engineering_hub.journaler.model_profiles import (
 from engineering_hub.journaler.prompts import (
     build_skills_block,
     build_workspace_layout,
+    format_briefing_markdown,
     format_briefing_prompt,
     format_system_prompt,
     load_briefing_prompt,
@@ -61,6 +62,17 @@ class JournalerConfig:
     briefing_enabled: bool = True
     briefing_time: str = "09:00"
     briefing_output_dir: Path | None = None
+
+    # Discussion briefing (multi-persona roundtable)
+    discussion_briefing_enabled: bool = False
+    discussion_briefing_time: str = "08:45"
+    personas_dir: Path | None = None
+    discussion_persona_lookback_days: int = 7
+    discussion_max_tokens_per_persona: int = 1024
+
+    # Coordination analyst scan
+    coordination_scan_enabled: bool = False
+    coordination_scan_interval_min: int = 0
 
     chat_enabled: bool = True
     chat_host: str = "127.0.0.1"
@@ -168,6 +180,7 @@ def pressure_config_from_settings(
     raw = dict(settings.journaler_context_management or {})
     raw.setdefault("model_context_window", model_context_window)
     raw.setdefault("max_history_turns", max_history_turns)
+    raw.setdefault("end_of_day_time", settings.journaler_end_of_day_time)
     allowed = set(PressureConfig.__dataclass_fields__)
     return PressureConfig(**{k: v for k, v in raw.items() if k in allowed})
 
@@ -272,6 +285,12 @@ def run_daemon(config: JournalerConfig, settings: Settings | None = None) -> Non
         skills_dir=config.skills_dir,
         default_backend=config.agent_backend,
         output_dir=config.workspace_dir / "outputs",
+        proposal_dir=settings.zettelkasten_resolved_proposal_dir if settings is not None else None,
+        zettel_state_path=(
+            settings.journaler_state_dir / "zettelkasten_state.json"
+            if settings is not None else None
+        ),
+        org_journal_dir=settings.org_journal_dir if settings is not None else None,
     )
     skills_suffix = ""
     if delegator is not None:
@@ -345,6 +364,29 @@ def run_daemon(config: JournalerConfig, settings: Settings | None = None) -> Non
             slack=slack,
         )
         logger.info(f"Morning briefing scheduled at {config.briefing_time}")
+
+    if config.discussion_briefing_enabled:
+        schedule.every().day.at(config.discussion_briefing_time).do(
+            _discussion_briefing,
+            config=config,
+            context=context,
+            engine=engine,
+        )
+        logger.info(
+            "Discussion briefing scheduled at %s", config.discussion_briefing_time
+        )
+
+    if config.coordination_scan_enabled and config.coordination_scan_interval_min > 0:
+        schedule.every(config.coordination_scan_interval_min).minutes.do(
+            _coordination_scan,
+            config=config,
+            context=context,
+            engine=engine,
+        )
+        logger.info(
+            "Coordination scan scheduled every %d min",
+            config.coordination_scan_interval_min,
+        )
 
     # Schedule end-of-day context clear
     eod_time = pressure_cfg.end_of_day_time
@@ -447,8 +489,10 @@ def generate_briefing_now(
             load_file_budget=config.get_load_file_budget(),
         )
 
-    briefing = engine.generate_briefing(
-        briefing_context, prompt, max_tokens=config.max_briefing_tokens
+    briefing = format_briefing_markdown(
+        engine.generate_briefing(
+            briefing_context, prompt, max_tokens=config.max_briefing_tokens
+        )
     )
 
     # Save to file
@@ -462,6 +506,175 @@ def generate_briefing_now(
     logger.info(f"Briefing written to {output_path}")
 
     return briefing
+
+
+def generate_discussion_now(
+    config: JournalerConfig,
+    context: JournalContext | None = None,
+    engine: ConversationEngine | None = None,
+) -> str:
+    """Generate a Discussion Briefing on demand (for CLI ``journaler briefing --discussion``).
+
+    If context/engine are not provided, creates temporary instances.
+    Returns the discussion markdown text.
+    """
+    from engineering_hub.journaler.discussion_briefing import (
+        DiscussionBriefingGenerator,
+    )
+    from engineering_hub.journaler.persona_history import PersonaHistoryStore
+
+    if context is None:
+        ptf = config.pending_tasks_file
+        if ptf is None:
+            ptf = config.workspace_dir / ".journaler" / "pending-tasks.org"
+        context = JournalContext(
+            org_roam_dir=config.org_roam_dir,
+            journal_dir=config.journal_dir,
+            workspace_dir=config.workspace_dir,
+            memory_service=config.memory_service,
+            state_dir=config.state_dir,
+            watch_dirs=config.watch_dirs,
+            scan_org_roam_tree=config.scan_org_roam_tree,
+            journal_lookback_days=config.journal_lookback_days,
+            journal_max_files=config.journal_max_files,
+            pending_tasks_file=ptf,
+            conversation_lookback_days=config.conversation_lookback_days,
+            conversation_summary_excerpt_chars=config.conversation_summary_excerpt_chars,
+        )
+        context.scan()
+
+    if engine is None:
+        backend = ConversationalMLXBackend(
+            model_path=config.model_path,
+            temp=config.temp,
+            top_p=config.top_p,
+            min_p=config.min_p,
+            repetition_penalty=config.repetition_penalty,
+            backend=config.mlx_backend,
+            enable_thinking=config.enable_thinking,
+        )
+        engine = ConversationEngine(
+            backend=backend,
+            system_prompt="You are the Journaler.",
+            log_dir=config.state_dir,
+            max_tokens=config.max_tokens,
+            pressure_config=config.get_pressure_config(),
+            model_context_window=config.model_context_window,
+            corpus_service=config.corpus_service,
+            load_file_budget=config.get_load_file_budget(),
+        )
+
+    shared_context = context.get_briefing_context()
+    today_str = date.today().isoformat()
+
+    personas_dir = config.personas_dir
+    if personas_dir is None:
+        here = Path(__file__).parent
+        for parent in [here, here.parent, here.parent.parent, here.parent.parent.parent]:
+            candidate = parent / "personas"
+            if candidate.is_dir():
+                personas_dir = candidate
+                break
+
+    if personas_dir is None or not personas_dir.is_dir():
+        raise FileNotFoundError(
+            "Personas directory not found. Set journaler.personas_dir in config "
+            "or create a 'personas/' directory at the repo root."
+        )
+
+    history_store = PersonaHistoryStore(config.state_dir / "personas")
+    generator = DiscussionBriefingGenerator.from_personas_dir(
+        personas_dir=personas_dir,
+        history_store=history_store,
+        engine=engine,
+        max_tokens_per_persona=config.discussion_max_tokens_per_persona,
+        persona_lookback_days=config.discussion_persona_lookback_days,
+    )
+
+    discussion = generator.generate(
+        shared_context,
+        date_str=today_str,
+        topic="on-demand discussion briefing",
+    )
+
+    output_dir = config.briefing_output_dir or (config.state_dir / "briefings")
+    output_dir.mkdir(parents=True, exist_ok=True)
+    output_path = output_dir / f"discussion-{today_str}.md"
+    output_path.write_text(discussion, encoding="utf-8")
+    logger.info("Discussion briefing written to %s", output_path)
+
+    return discussion
+
+
+def generate_summary_now(config: JournalerConfig) -> Path:
+    """Generate today's daily summary on demand (for CLI ``journaler summarize`` command).
+
+    Reads today's turns from ``conversation.jsonl``, populates a temporary engine,
+    runs ``_end_of_day_clear``, and returns the path to the written summary file.
+    Raises ``ValueError`` if there are no turns recorded today.
+    """
+    import json
+
+    from engineering_hub.journaler.context_manager import ConversationTurn
+
+    log_file = config.state_dir / "conversation.jsonl"
+    today_prefix = date.today().isoformat()  # "YYYY-MM-DD"
+
+    today_turns: list[ConversationTurn] = []
+    if log_file.exists():
+        for line in log_file.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                entry = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            ts = entry.get("timestamp", "")
+            if ts.startswith(today_prefix) and entry.get("role") not in ("system", ""):
+                today_turns.append(
+                    ConversationTurn(
+                        role=entry["role"],
+                        content=entry.get("content", ""),
+                        timestamp=ts,
+                        tokens=0,
+                    )
+                )
+
+    backend = ConversationalMLXBackend(
+        model_path=config.model_path,
+        temp=config.temp,
+        top_p=config.top_p,
+        min_p=config.min_p,
+        repetition_penalty=config.repetition_penalty,
+        backend=config.mlx_backend,
+        enable_thinking=config.enable_thinking,
+    )
+    engine = ConversationEngine(
+        backend=backend,
+        system_prompt="You are the Journaler.",
+        log_dir=config.state_dir,
+        max_tokens=config.max_tokens,
+        pressure_config=config.get_pressure_config(),
+        model_context_window=config.model_context_window,
+        corpus_service=config.corpus_service,
+        load_file_budget=config.get_load_file_budget(),
+        memory_service=config.memory_service,
+    )
+
+    if not today_turns:
+        raise ValueError(
+            f"No conversation turns recorded for {today_prefix}. "
+            "Start a chat session first, or check that the state directory is correct."
+        )
+
+    for turn in today_turns:
+        engine.history.turns.append(turn)
+
+    _end_of_day_clear(engine, config)
+
+    summary_path = config.state_dir / "daily_summaries" / f"{today_prefix}.md"
+    return summary_path
 
 
 # ---------------------------------------------------------------------------
@@ -535,8 +748,10 @@ def _morning_briefing(
     today_str = date.today().isoformat()
     prompt = format_briefing_prompt(briefing_template, today_str, briefing_context)
 
-    briefing = engine.generate_briefing(
-        briefing_context, prompt, max_tokens=config.max_briefing_tokens
+    briefing = format_briefing_markdown(
+        engine.generate_briefing(
+            briefing_context, prompt, max_tokens=config.max_briefing_tokens
+        )
     )
 
     output_dir = config.briefing_output_dir or (config.state_dir / "briefings")
@@ -550,6 +765,124 @@ def _morning_briefing(
 
     if slack:
         slack.post_briefing(briefing)
+
+
+def _discussion_briefing(
+    config: JournalerConfig,
+    context: JournalContext,
+    engine: ConversationEngine,
+) -> None:
+    """Generate the Topics Discussion Briefing (multi-persona roundtable)."""
+    from engineering_hub.journaler.discussion_briefing import (
+        DiscussionBriefingGenerator,
+    )
+    from engineering_hub.journaler.persona_history import PersonaHistoryStore
+
+    context.scan()
+    shared_context = context.get_briefing_context()
+    today_str = date.today().isoformat()
+
+    personas_dir = config.personas_dir
+    if personas_dir is None:
+        # Walk up from this file to find repo root personas/ directory
+        here = Path(__file__).parent
+        for parent in [here, here.parent, here.parent.parent, here.parent.parent.parent]:
+            candidate = parent / "personas"
+            if candidate.is_dir():
+                personas_dir = candidate
+                break
+
+    if personas_dir is None or not personas_dir.is_dir():
+        logger.warning(
+            "Discussion briefing: personas directory not found — skipping. "
+            "Set journaler.personas_dir in config."
+        )
+        return
+
+    history_store = PersonaHistoryStore(config.state_dir / "personas")
+    generator = DiscussionBriefingGenerator.from_personas_dir(
+        personas_dir=personas_dir,
+        history_store=history_store,
+        engine=engine,
+        max_tokens_per_persona=config.discussion_max_tokens_per_persona,
+        persona_lookback_days=config.discussion_persona_lookback_days,
+    )
+
+    discussion = generator.generate(
+        shared_context,
+        date_str=today_str,
+        topic="morning discussion briefing",
+    )
+
+    output_dir = config.briefing_output_dir or (config.state_dir / "briefings")
+    output_dir.mkdir(parents=True, exist_ok=True)
+    discussion_path = output_dir / f"discussion-{today_str}.md"
+    discussion_path.write_text(discussion, encoding="utf-8")
+    logger.info("Discussion briefing generated: %s", discussion_path)
+
+
+def _coordination_scan(
+    config: JournalerConfig,
+    context: JournalContext,
+    engine: ConversationEngine,
+) -> None:
+    """Run the Coordination Analyst agent against recent journal context.
+
+    Writes output to ``{state_dir}/outputs/coordination/YYYY-MM-DD.md`` and
+    appends the result to the coordination-liaison persona history store so it
+    surfaces in the next discussion briefing.
+    """
+    context.scan()
+    today_str = date.today().isoformat()
+
+    journal_context = context.get_briefing_context()
+
+    from engineering_hub.agents.worker import AgentWorker
+    from engineering_hub.core.constants import AgentType, TaskStatus
+    from engineering_hub.core.models import ParsedTask
+    from engineering_hub.journaler.delegator import JournalerMLXBackendAdapter
+    from engineering_hub.journaler.persona_history import PersonaHistoryStore
+
+    try:
+        adapted_backend = JournalerMLXBackendAdapter(engine._backend)
+        worker = AgentWorker(backend=adapted_backend)
+        task = ParsedTask(
+            agent=AgentType.COORDINATION_ANALYST.value,
+            status=TaskStatus.PENDING,
+            description=(
+                f"Scan the provided journal context for client coordination signals, "
+                f"scope drift indicators, and implied engineering tasks. "
+                f"Context date: {today_str}."
+            ),
+            start_line=0,
+            end_line=0,
+            raw_block="",
+        )
+        result = worker.execute_with_options(task, context=journal_context)
+    except Exception as exc:
+        logger.warning("Coordination scan failed: %s", exc)
+        return
+
+    if not result.success or not result.output:
+        logger.warning("Coordination scan returned no output: %s", result.error_message)
+        return
+
+    # Write output file
+    output_dir = config.state_dir / "outputs" / "coordination"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    output_path = output_dir / f"{today_str}.md"
+    output_path.write_text(result.output, encoding="utf-8")
+    logger.info("Coordination scan written: %s", output_path)
+
+    # Feed result into coordination-liaison persona history
+    history_store = PersonaHistoryStore(config.state_dir / "personas")
+    history_store.append(
+        "coordination-liaison",
+        today_str,
+        "coordination scan",
+        result.output,
+        source="coordination_scan",
+    )
 
 
 def _end_of_day_clear(
@@ -581,7 +914,11 @@ def _end_of_day_clear(
     try:
         summary = engine._raw_complete(
             f"Summarize today's conversation for archival. "
-            f"Include key decisions, open questions, and action items.\n\n"
+            f"Include: (1) key decisions made, (2) open questions, "
+            f"(3) action items, (4) any workflow friction observed "
+            f"(repeated context-switching, unclear task scope, missing information "
+            f"that slowed progress, tools or commands that could have helped), and "
+            f"(5) one concrete workflow improvement to try tomorrow.\n\n"
             f"{all_text}",
             max_tokens=800,
         )

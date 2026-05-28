@@ -797,6 +797,7 @@ def _handle_chat_slash_command(
       /files                     List all currently loaded files.
       /files clear               Remove all loaded files from the context.
       /clear [--hard|--summarize] Clear conversation history (soft by default).
+      /summarize                 Generate today's daily summary now and archive history.
       /status                    Show context management state (pressure, turns, etc.)
       /budget                    Show token budget breakdown.
       /topic                     Show the currently detected conversation topic.
@@ -1208,6 +1209,25 @@ def _handle_chat_slash_command(
         chat_console.print(f"[green]{escape(msg)}[/green]")
         return
 
+    if cmd == "/summarize":
+        if export_config is None:
+            chat_console.print(
+                "[yellow]/summarize requires workspace config; if you see this, file a bug.[/yellow]"
+            )
+            return
+        from engineering_hub.journaler.daemon import _end_of_day_clear
+
+        chat_console.print("[bold]Generating daily summary and archiving history...[/bold]")
+        try:
+            _end_of_day_clear(engine, export_config)
+            summary_path = export_config.state_dir / "daily_summaries"
+            chat_console.print(
+                f"[green]Daily summary written to[/green] [cyan]{summary_path}[/cyan]"
+            )
+        except Exception as exc:
+            chat_console.print(f"[red]Summary generation failed:[/red] {escape(str(exc))}")
+        return
+
     if cmd == "/status":
         status = engine.get_status()
         table = Table(title="Context Status")
@@ -1601,13 +1621,13 @@ def cmd_journaler(args: argparse.Namespace) -> int:
     if sub is None:
         console.print(
             "[yellow]Usage: engineering-hub journaler"
-            " {start|chat|briefing|export|status|scan|clear|download|pipeline}[/yellow]"
+            " {start|chat|briefing|summarize|export|status|scan|clear|download|pipeline}[/yellow]"
         )
         return 1
 
     settings = load_settings(args.config)
 
-    needs_model = sub in ("start", "chat") or (
+    needs_model = sub in ("start", "chat", "summarize") or (
         sub == "briefing" and not getattr(args, "latest", False)
     ) or (sub == "export" and getattr(args, "summarize", False))
 
@@ -1722,6 +1742,13 @@ def cmd_journaler(args: argparse.Namespace) -> int:
             settings.journaler_conversation_summary_excerpt_chars
         ),
         org_link_on_relation=settings.journaler_org_link_on_relation,
+        discussion_briefing_enabled=settings.journaler_discussion_briefing_enabled,
+        discussion_briefing_time=settings.journaler_discussion_briefing_time,
+        personas_dir=settings.journaler_personas_dir,
+        discussion_persona_lookback_days=settings.journaler_discussion_persona_lookback_days,
+        discussion_max_tokens_per_persona=settings.journaler_discussion_max_tokens_per_persona,
+        coordination_scan_enabled=settings.journaler_coordination_scan_enabled,
+        coordination_scan_interval_min=settings.journaler_coordination_scan_interval_min,
     )
 
     if sub == "start":
@@ -1735,6 +1762,12 @@ def cmd_journaler(args: argparse.Namespace) -> int:
         )
         if config.briefing_enabled:
             console.print(f"  Briefing at: {config.briefing_time}")
+        if config.discussion_briefing_enabled:
+            console.print(f"  Discussion briefing at: {config.discussion_briefing_time}")
+        if config.coordination_scan_enabled and config.coordination_scan_interval_min > 0:
+            console.print(
+                f"  Coordination scan every: {config.coordination_scan_interval_min}min"
+            )
         if config.chat_enabled:
             console.print(f"  Chat: http://{config.chat_host}:{config.chat_port}")
         try:
@@ -1822,6 +1855,9 @@ def cmd_journaler(args: argparse.Namespace) -> int:
             skills_dir=config.skills_dir,
             default_backend=config.agent_backend,
             output_dir=config.workspace_dir / "outputs",
+            proposal_dir=settings.zettelkasten_resolved_proposal_dir,
+            zettel_state_path=settings.journaler_state_dir / "zettelkasten_state.json",
+            org_journal_dir=settings.org_journal_dir,
         )
         if delegator is not None:
             skills_text = build_skills_block(delegator)
@@ -1973,20 +2009,127 @@ def cmd_journaler(args: argparse.Namespace) -> int:
         return 0
 
     elif sub == "briefing":
-        if args.latest:
-            briefing_dir = config.briefing_output_dir or (config.state_dir / "briefings")
+        briefing_dir = config.briefing_output_dir or (config.state_dir / "briefings")
+
+        if getattr(args, "latest_discussion", False):
             if briefing_dir and briefing_dir.exists():
-                files = sorted(briefing_dir.glob("*.md"), reverse=True)
+                files = sorted(briefing_dir.glob("discussion-*.md"), reverse=True)
+                if files:
+                    console.print(files[0].read_text(encoding="utf-8"))
+                    return 0
+            console.print("[dim]No discussion briefings available yet.[/dim]")
+            return 0
+
+        if args.latest:
+            if briefing_dir and briefing_dir.exists():
+                # Exclude discussion-*.md files from standard --latest
+                files = sorted(
+                    [f for f in briefing_dir.glob("*.md") if not f.name.startswith("discussion-")],
+                    reverse=True,
+                )
                 if files:
                     console.print(files[0].read_text(encoding="utf-8"))
                     return 0
             console.print("[dim]No briefings available yet.[/dim]")
             return 0
 
+        if getattr(args, "coordination_scan", False):
+            from engineering_hub.journaler.daemon import (
+                _coordination_scan,
+                generate_briefing_now,
+            )
+
+            console.print("[bold]Running Coordination Analyst scan...[/bold]")
+            try:
+                # Build minimal context + engine via generate_briefing_now's bootstrap path
+                from engineering_hub.journaler.context import JournalContext
+                from engineering_hub.journaler.engine import (
+                    ConversationalMLXBackend,
+                    ConversationEngine,
+                )
+
+                ptf = config.pending_tasks_file
+                if ptf is None:
+                    ptf = config.workspace_dir / ".journaler" / "pending-tasks.org"
+                ctx = JournalContext(
+                    org_roam_dir=config.org_roam_dir,
+                    journal_dir=config.journal_dir,
+                    workspace_dir=config.workspace_dir,
+                    memory_service=config.memory_service,
+                    state_dir=config.state_dir,
+                    watch_dirs=config.watch_dirs,
+                    scan_org_roam_tree=config.scan_org_roam_tree,
+                    journal_lookback_days=config.journal_lookback_days,
+                    journal_max_files=config.journal_max_files,
+                    pending_tasks_file=ptf,
+                    conversation_lookback_days=config.conversation_lookback_days,
+                    conversation_summary_excerpt_chars=config.conversation_summary_excerpt_chars,
+                )
+                ctx.scan()
+                backend = ConversationalMLXBackend(
+                    model_path=config.model_path,
+                    temp=config.temp,
+                    top_p=config.top_p,
+                    min_p=config.min_p,
+                    repetition_penalty=config.repetition_penalty,
+                    backend=config.mlx_backend,
+                    enable_thinking=config.enable_thinking,
+                )
+                eng = ConversationEngine(
+                    backend=backend,
+                    system_prompt="You are the Journaler.",
+                    log_dir=config.state_dir,
+                    max_tokens=config.max_tokens,
+                    pressure_config=config.get_pressure_config(),
+                    model_context_window=config.model_context_window,
+                    corpus_service=config.corpus_service,
+                    load_file_budget=config.get_load_file_budget(),
+                )
+                _coordination_scan(config=config, context=ctx, engine=eng)
+                output_dir = config.state_dir / "outputs" / "coordination"
+                from datetime import date as _date
+                today_str = _date.today().isoformat()
+                output_path = output_dir / f"{today_str}.md"
+                if output_path.exists():
+                    console.print(f"\n{escape(output_path.read_text(encoding='utf-8'))}")
+                else:
+                    console.print("[yellow]Coordination scan completed but produced no output.[/yellow]")
+            except Exception as exc:
+                console.print(f"[red]Error:[/red] {exc}")
+                return 1
+            return 0
+
+        if getattr(args, "discussion", False):
+            from engineering_hub.journaler.daemon import generate_discussion_now
+
+            console.print("[bold]Generating Topics Discussion Briefing...[/bold]")
+            try:
+                discussion = generate_discussion_now(config)
+                console.print(f"\n{escape(discussion)}")
+            except Exception as exc:
+                console.print(f"[red]Error:[/red] {exc}")
+                return 1
+            return 0
+
         console.print("[bold]Generating briefing on demand...[/bold]")
         try:
             briefing = generate_briefing_now(config)
             console.print(f"\n{escape(briefing)}")
+        except Exception as exc:
+            console.print(f"[red]Error:[/red] {exc}")
+            return 1
+        return 0
+
+    elif sub == "summarize":
+        from engineering_hub.journaler.daemon import generate_summary_now
+
+        console.print("[bold]Generating daily summary from today's conversation history...[/bold]")
+        try:
+            summary_path = generate_summary_now(config)
+            console.print(f"[green]Daily summary written to[/green] [cyan]{summary_path}[/cyan]")
+        except ValueError as exc:
+            console.print(f"[yellow]{escape(str(exc))}[/yellow]")
+            return 0
         except Exception as exc:
             console.print(f"[red]Error:[/red] {exc}")
             return 1
@@ -2188,6 +2331,9 @@ def cmd_journaler(args: argparse.Namespace) -> int:
                 mlx_backend,
                 anthropic_api_key=api_key,
                 output_dir=output_dir,
+                proposal_dir=settings.zettelkasten_resolved_proposal_dir,
+                zettel_state_path=settings.journaler_state_dir / "zettelkasten_state.json",
+                org_journal_dir=settings.org_journal_dir,
             )
         except Exception as exc:
             console.print(f"[red]Error:[/red] Could not initialise agent delegator: {exc}")
@@ -3229,7 +3375,25 @@ def main() -> int:
     briefing_p.add_argument(
         "--latest", action="store_true", help="View the latest briefing instead of generating"
     )
+    briefing_p.add_argument(
+        "--discussion",
+        action="store_true",
+        help="Generate a Topics Discussion Briefing (multi-persona roundtable) instead of the standard briefing",
+    )
+    briefing_p.add_argument(
+        "--latest-discussion",
+        action="store_true",
+        help="View the latest discussion briefing instead of generating",
+    )
+    briefing_p.add_argument(
+        "--coordination-scan",
+        action="store_true",
+        help="Run the Coordination Analyst against recent journal context",
+    )
 
+    journaler_sub.add_parser(
+        "summarize", help="Generate today's daily summary and archive conversation history"
+    )
     journaler_sub.add_parser("status", help="Show Journaler status")
     journaler_sub.add_parser("scan", help="Run a single org-roam scan")
     journaler_sub.add_parser(

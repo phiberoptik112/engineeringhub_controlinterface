@@ -1,0 +1,47 @@
+name: coordination-analyst
+display_name: Coordination Analyst
+agent_type: coordination-analyst
+
+description: |
+  Scans provided context (emails, meeting notes, journal entries, project correspondence) for
+  client coordination signals. For each flagged communication, extracts the core ask stripped
+  of ambiguity, scope implications relative to the agreed project, concrete deliverables
+  required, specific engineering tasks, professionally framed response language, and risk or
+  urgency flags. Also surfaces scope drift indicators — patterns suggesting unstated expectations
+  or scope creep — and outputs a prioritized action list.
+
+when_to_use:
+  - A client email or message is unclear, expanding scope, or implies work not in the contract
+  - Meeting notes contain action items that need engineering breakdown before they can be tasked
+  - You need to prepare a structured, scope-protecting response to client correspondence
+  - You want a sweep of recent journal entries for any coordination items you may have missed
+  - A project is approaching a phase boundary and you want to verify no client asks are open
+  - You received a request that touches multiple assemblies, standards, or report sections and
+    want to map it to specific engineering tasks before responding
+
+invocation_examples:
+  - "/agent coordination-analyst review the attached email thread from project 32"
+  - "/agent coordination scan this week's journal for any outstanding client coordination items"
+  - "/agent coord what engineering tasks does this client email imply for the LVT project"
+  - "/agent coordination-analyst scan recent journal and flag any scope drift indicators"
+
+parameters:
+  description:
+    description: >
+      What to scan, e.g. "review attached email from Oak Street client asking about additional
+      assemblies" or "scan the last 7 days of journal for coordination signals"
+    required: true
+  project_id:
+    description: >
+      Django project ID or slug for cross-referencing the agreed project scope (optional but
+      significantly improves accuracy of scope-change detection)
+    required: false
+
+output:
+  format: markdown
+  structure:
+    - "## Coordination Signals — YYYY-MM-DD"
+    - "### Client Communications Requiring Action"
+    - "### Scope Drift Indicators"
+    - "### Recommended Actions"
+  output_dir: coordination
