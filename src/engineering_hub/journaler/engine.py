@@ -14,7 +14,7 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Iterator
 
 from engineering_hub.memory.service import MemoryResult, MemoryService
 
@@ -28,6 +28,7 @@ from engineering_hub.journaler.context_manager import (
     ContextCompressor,
     ContextPressureManager,
     ConversationHistory,
+    DomainShiftDetector,
     PressureConfig,
     TokenBudget,
     TopicTracker,
@@ -220,9 +221,10 @@ def _detect_vlm(load_path: str) -> bool:
 
     try:
         cfg = json.loads(config_path.read_text(encoding="utf-8"))
-        if "vision_config" in cfg:
-            return True
         model_type = cfg.get("model_type", "").lower()
+        # Route only known VLMs to mlx-vlm.  Do not treat every model with a
+        # vision_config block as a VLM — e.g. Qwen3.6 (qwen3_5_moe) ships
+        # multimodal config but mlx-community text weights load via mlx-lm.
         return model_type in _VLM_MODEL_TYPES
     except Exception:
         return False
@@ -414,6 +416,74 @@ class ConversationalMLXBackend:
     def is_loaded(self) -> bool:
         return self._model is not None
 
+    # ------------------------------------------------------------------
+    # Runtime setters (no model reload required)
+    # ------------------------------------------------------------------
+
+    def set_enable_thinking(self, value: bool | None) -> None:
+        """Update the thinking-mode flag applied to the chat template."""
+        self._enable_thinking = value
+
+    def set_sampling_params(
+        self,
+        *,
+        temp: float | None = None,
+        top_p: float | None = None,
+        min_p: float | None = None,
+        repetition_penalty: float | None = None,
+    ) -> None:
+        """Update one or more sampling parameters in place."""
+        if temp is not None:
+            self._temp = temp
+        if top_p is not None:
+            self._top_p = top_p
+        if min_p is not None:
+            self._min_p = min_p
+        if repetition_penalty is not None:
+            self._repetition_penalty = repetition_penalty
+
+    def stream_generate(
+        self, messages: list[dict[str, str]], max_tokens: int
+    ) -> Iterator[str]:
+        """Yield tokens one-at-a-time via ``mlx_lm.stream_generate``.
+
+        Only available for text-only (non-VLM) models.  VLM models fall back
+        to a single blocking ``chat()`` call whose full response is yielded
+        as one chunk.
+        """
+        prompt = self._apply_chat_template_safe(messages)
+        if self._is_vlm:
+            yield self._chat_vlm(prompt, max_tokens)
+            return
+
+        sampler = self._make_sampler(  # type: ignore[misc]
+            temp=self._temp, top_p=self._top_p, min_p=self._min_p
+        )
+        logits_processors = self._make_logits_processors(  # type: ignore[misc]
+            repetition_penalty=self._repetition_penalty,
+            repetition_context_size=self._repetition_context_size,
+        )
+        try:
+            for result in self._mlx_lm.stream_generate(  # type: ignore[union-attr]
+                self._model,
+                self._tokenizer,
+                prompt=prompt,
+                max_tokens=max_tokens,
+                sampler=sampler,
+                logits_processors=logits_processors,
+            ):
+                # mlx_lm may yield strings or objects with a `.text` attribute.
+                if isinstance(result, str):
+                    yield result
+                else:
+                    text = getattr(result, "text", None)
+                    if text is not None:
+                        yield str(text)
+        except Exception as exc:
+            raise LLMBackendError(
+                f"Journaler MLX stream generation failed: {exc}", provider="mlx"
+            ) from exc
+
 
 class ConversationEngine:
     """Manages a persistent conversation session with a local model.
@@ -509,6 +579,11 @@ class ConversationEngine:
         self.task_planner = TaskPlannerSession(self.session_id, self.session_opened_at)
         self.pinned_state: dict[str, Any] = {"task_planner": self.task_planner}
 
+        # Persona state — populated by swap_persona() / /persona command.
+        self.active_persona: str = ""
+        self.base_system_prompt: str = system_prompt
+        self.domain_shift_detector: DomainShiftDetector | None = None
+
     def get_roam_edit_target(self) -> Path | None:
         """Session target for ``/edit`` (set via ``/open`` in journaler chat)."""
         return self._roam_edit_target
@@ -519,6 +594,114 @@ class ConversationEngine:
             self._roam_edit_target = None
         else:
             self._roam_edit_target = path.expanduser().resolve()
+
+    def swap_persona(
+        self,
+        skill_name: str,
+        display_name: str,
+        description: str,
+        *,
+        personas_dir: Path | None = None,
+    ) -> str:
+        """Hot-swap the main Journaler system prompt to a new persona domain.
+
+        Rebuilds ``_system_prompt`` by prepending a persona header derived from the
+        skill's description.  If a file ``prompts/personas/{skill_name}.txt`` exists
+        it is used as the full persona block instead.  A bracketed note is injected
+        into the conversation history so the model is aware of the transition.
+
+        Args:
+            skill_name: Canonical skill/agent name (e.g. ``"career-coach"``).
+            display_name: Human-readable persona label for the history note.
+            description: Skill description used as the persona header when no
+                ``personas/`` file is found.
+            personas_dir: Optional directory to search for a ``{skill_name}.txt``
+                persona file.  Falls back to a ``prompts/personas/`` sibling of the
+                default prompts directory.
+
+        Returns:
+            Status message suitable for display in the chat UI.
+        """
+        persona_block = self._load_persona_block(
+            skill_name, description, personas_dir=personas_dir
+        )
+        self._system_prompt = persona_block + "\n\n" + self.base_system_prompt
+        self.budget.system_prompt_tokens = estimate_tokens(self._system_prompt)
+        self.active_persona = skill_name
+
+        note = (
+            f"[Persona switched to **{display_name}**. "
+            f"Previous conversation context retained.]"
+        )
+        now = datetime.now().isoformat(timespec="seconds")
+        self.history.add("assistant", note)
+        self._log_turn("assistant", note, now)
+
+        if self.domain_shift_detector is not None:
+            skill = self.domain_shift_detector._skills.get(skill_name)
+            domain = (skill.domain if skill is not None else "") or skill_name
+            self.domain_shift_detector.confirm_shift(skill_name)
+            self.domain_shift_detector.set_active_domain(domain)
+
+        logger.info("Persona swapped to '%s'", skill_name)
+        return note
+
+    def reset_persona(self) -> str:
+        """Restore the base system prompt, clearing any active persona."""
+        self._system_prompt = self.base_system_prompt
+        self.budget.system_prompt_tokens = estimate_tokens(self._system_prompt)
+        old = self.active_persona
+        self.active_persona = ""
+        if self.domain_shift_detector is not None:
+            self.domain_shift_detector.set_active_domain("")
+
+        note = "[Persona reset to default Journaler.]"
+        now = datetime.now().isoformat(timespec="seconds")
+        self.history.add("assistant", note)
+        self._log_turn("assistant", note, now)
+
+        logger.info("Persona reset from '%s' to default", old)
+        return note
+
+    def _load_persona_block(
+        self,
+        skill_name: str,
+        description: str,
+        *,
+        personas_dir: Path | None = None,
+    ) -> str:
+        """Return the persona system-prompt block for *skill_name*.
+
+        Checks for a ``prompts/personas/{skill_name}.txt`` file first; falls back
+        to a concise header built from the skill ``description``.
+        """
+        if personas_dir is None:
+            # Try to locate prompts/personas/ relative to known locations.
+            for candidate in [
+                Path(__file__).parent.parent.parent.parent / "prompts" / "personas",
+                Path.cwd() / "prompts" / "personas",
+            ]:
+                if candidate.is_dir():
+                    personas_dir = candidate
+                    break
+
+        if personas_dir is not None:
+            persona_file = personas_dir / f"{skill_name}.txt"
+            if persona_file.is_file():
+                try:
+                    return persona_file.read_text(encoding="utf-8").strip()
+                except OSError as exc:
+                    logger.warning(
+                        "Could not read persona file %s: %s", persona_file, exc
+                    )
+
+        first_line = description.splitlines()[0] if description else skill_name
+        return (
+            f"## Active persona: {skill_name}\n\n"
+            f"{first_line}\n\n"
+            f"You are now operating in **{skill_name}** mode. "
+            f"Apply the expertise and style appropriate to this domain."
+        )
 
     def replace_backend(
         self,
@@ -537,6 +720,17 @@ class ConversationEngine:
         if model_context_window is not None:
             self._pressure_config.model_context_window = model_context_window
             self.budget.window_size = model_context_window
+
+    def update_max_tokens(self, value: int) -> None:
+        """Update the per-turn generation budget without reloading the model."""
+        self._max_tokens = value
+        self.budget.reserved_for_generation = max(
+            self._pressure_config.reserved_for_generation, value
+        )
+
+    def update_sampling_params(self, **kwargs: Any) -> None:
+        """Forward sampling-parameter changes to the active backend."""
+        self._backend.set_sampling_params(**kwargs)
 
     def update_context(self, context_block: str) -> None:
         """Replace the rolling context section of the system prompt."""
@@ -648,6 +842,102 @@ class ConversationEngine:
 
         self.budget.corpus_injection_tokens = 0
         return response
+
+    def stream_chat(self, message: str) -> Iterator[str]:
+        """Streaming counterpart to :meth:`chat` — yields token strings as they arrive.
+
+        Performs all the same pre-call setup (corpus RAG, relation search, pressure
+        management) and post-call bookkeeping (history, logging, topic tracking) as
+        :meth:`chat`.  The full response is assembled from yielded tokens and stored
+        in history only after the generator is fully consumed by the caller.
+        """
+        self.budget.corpus_injection_tokens = 0
+        self.budget.history_tokens = self.history.total_tokens
+        self._sync_loaded_files_budget()
+
+        extra_suffix: str | None = None
+        cs = self._corpus_service
+        if cs is not None and cs.is_available() and message.strip():
+            try:
+                results = cs.search(message)
+                if results:
+                    extra_suffix = cs.format_for_context(results)
+            except Exception as exc:
+                logger.warning("Journaler corpus RAG failed (non-fatal): %s", exc)
+
+        if references_past_session(message):
+            try:
+                session_hits = retrieve_past_sessions(
+                    message,
+                    state_dir=self._log_dir,
+                    max_results=self._pressure_config.past_session_search_k,
+                    excerpt_chars=self._pressure_config.past_session_excerpt_chars,
+                )
+                session_block = format_past_session_block(session_hits)
+                if session_block:
+                    extra_suffix = (
+                        (extra_suffix + "\n\n" + session_block) if extra_suffix else session_block
+                    )
+            except Exception as exc:
+                logger.warning("Journaler past-session retrieval failed: %s", exc)
+
+        if self._memory_service and message.strip():
+            try:
+                relation_hits = self._memory_service.search(
+                    message,
+                    source="journaler",
+                    threshold=self._relation_threshold,
+                    k=self._pressure_config.conversation_relation_k,
+                )
+                if relation_hits:
+                    relation_block = _format_relation_block(
+                        relation_hits,
+                        excerpt_chars=self._pressure_config.conversation_relation_excerpt_chars,
+                    )
+                    extra_suffix = (
+                        (extra_suffix + "\n\n" + relation_block) if extra_suffix else relation_block
+                    )
+                    if self._org_link_on_relation and self._journal_dir:
+                        _write_relation_link(self._journal_dir, relation_hits[0])
+            except Exception as exc:
+                logger.warning("Journaler relation search failed (non-fatal): %s", exc)
+
+        if extra_suffix:
+            self.budget.corpus_injection_tokens = estimate_tokens(extra_suffix)
+        else:
+            self.budget.corpus_injection_tokens = 0
+
+        pre_actions = self.pressure_manager.pre_call_check()
+        messages = self._build_messages(extra_system_suffix=extra_suffix)
+        messages.append({"role": "user", "content": message})
+
+        chunks: list[str] = []
+        for token in self._backend.stream_generate(messages, self._max_tokens):
+            chunks.append(token)
+            yield token
+
+        response = "".join(chunks)
+
+        now = datetime.now().isoformat(timespec="seconds")
+        resp_time = datetime.now().isoformat(timespec="seconds")
+        self.history.add("user", message)
+        self.history.add("assistant", response)
+        self.budget.history_tokens = self.history.total_tokens
+
+        self.pressure_manager.post_call_check(message, response)
+
+        self._log_turn("user", message, now)
+        self._log_turn("assistant", response, resp_time)
+
+        archived = self.history.flush_archive()
+        if archived:
+            self._log_archived_turns(archived)
+
+        if pre_actions and self._pressure_config.notify_user_on_action:
+            action_text = "\n".join(pre_actions)
+            logger.info("Context pressure actions (streaming mode): %s", action_text)
+
+        self.budget.corpus_injection_tokens = 0
 
     def inject_turn(self, user: str, assistant: str) -> None:
         """Inject a pre-computed (user, assistant) exchange into history and the log.

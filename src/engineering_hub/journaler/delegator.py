@@ -159,6 +159,21 @@ _AGENT_ALIASES: dict[str, str] = {
     "acoustic-sim": "acoustic-sim-expert",
     "sim-expert": "acoustic-sim-expert",
     "nora": "acoustic-sim-expert",
+    "rental-scout": "rental-scout",
+    "rental": "rental-scout",
+    "scout": "rental-scout",
+    "housing": "rental-scout",
+    "career-coach": "career-coach",
+    "career": "career-coach",
+    "coach": "career-coach",
+    "job-search": "career-coach",
+    "product-manager": "product-manager",
+    "product": "product-manager",
+    "pm": "product-manager",
+    "roadmap": "product-manager",
+    "compliance-advisor": "compliance-advisor",
+    "compliance": "compliance-advisor",
+    "legal-review": "compliance-advisor",
 }
 
 
@@ -220,6 +235,8 @@ class SkillDef:
     description: str
     when_to_use: list[str] = field(default_factory=list)
     invocation_examples: list[str] = field(default_factory=list)
+    domain: str = ""
+    domain_triggers: list[str] = field(default_factory=list)
 
 
 def _load_skills(skills_dir: Path) -> dict[str, SkillDef]:
@@ -239,6 +256,8 @@ def _load_skills(skills_dir: Path) -> dict[str, SkillDef]:
                 description=data.get("description", "").strip(),
                 when_to_use=data.get("when_to_use", []),
                 invocation_examples=data.get("invocation_examples", []),
+                domain=data.get("domain", ""),
+                domain_triggers=data.get("domain_triggers", []),
             )
             skills[skill.name] = skill
             logger.debug(f"Loaded skill: {skill.name} ({skill.display_name})")

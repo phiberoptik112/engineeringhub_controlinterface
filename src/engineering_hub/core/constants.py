@@ -28,6 +28,10 @@ class AgentType(str, Enum):
     LVT_TASK_EXTRACTOR = "lvt-task-extractor"
     COORDINATION_ANALYST = "coordination-analyst"
     ACOUSTIC_SIM_EXPERT = "acoustic-sim-expert"
+    RENTAL_SCOUT = "rental-scout"
+    CAREER_COACH = "career-coach"
+    PRODUCT_MANAGER = "product-manager"
+    COMPLIANCE_ADVISOR = "compliance-advisor"
 
 
 def is_ingest_task(description: str) -> bool:
@@ -54,4 +58,8 @@ AGENT_PROMPT_FILES = {
     AgentType.LVT_TASK_EXTRACTOR: "lvt-task-extractor.txt",
     AgentType.COORDINATION_ANALYST: "coordination-analyst.txt",
     AgentType.ACOUSTIC_SIM_EXPERT: "acoustic-sim-expert.txt",
+    AgentType.RENTAL_SCOUT: "rental-scout.txt",
+    AgentType.CAREER_COACH: "career-coach.txt",
+    AgentType.PRODUCT_MANAGER: "product-manager.txt",
+    AgentType.COMPLIANCE_ADVISOR: "compliance-advisor.txt",
 }

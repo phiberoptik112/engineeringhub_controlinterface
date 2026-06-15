@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
+from typing import Literal
 
 
 @dataclass
@@ -41,26 +43,91 @@ class OrgFileInfo:
         return _collect_tasks(self.entries, checked=True)
 
 
+FileChangeStatus = Literal["unchanged", "mtime_only", "content_changed"]
+
+
 @dataclass
 class ScanState:
-    """Persisted scan state (file mtimes) for incremental scanning."""
+    """Persisted scan state (canonical paths, mtimes, content hashes)."""
 
     last_scan: str = ""
     file_mtimes: dict[str, float] = field(default_factory=dict)
+    file_hashes: dict[str, str] = field(default_factory=dict)
 
-    def is_changed(self, path: Path) -> bool:
-        key = str(path)
+    @staticmethod
+    def path_key(path: Path) -> str:
+        return str(path.expanduser().resolve())
+
+    @staticmethod
+    def compute_hash(path: Path) -> str | None:
         try:
-            current_mtime = path.stat().st_mtime
+            return hashlib.sha256(path.read_bytes()).hexdigest()
         except OSError:
-            return False
-        return self.file_mtimes.get(key) != current_mtime
+            return None
 
-    def record(self, path: Path) -> None:
+    def inspect(self, path: Path) -> tuple[FileChangeStatus, str | None]:
+        """Classify a file without updating state.
+
+        Fast path: matching mtime + stored hash → unchanged (no disk read).
+        Slow path: mtime differs or hash missing → read bytes and compare hash.
+        """
+        key = self.path_key(path)
         try:
-            self.file_mtimes[str(path)] = path.stat().st_mtime
+            mtime = path.stat().st_mtime
+        except OSError:
+            return "unchanged", None
+
+        stored_mtime = self.file_mtimes.get(key)
+        stored_hash = self.file_hashes.get(key)
+
+        if stored_mtime == mtime and stored_hash is not None:
+            return "unchanged", stored_hash
+
+        current_hash = self.compute_hash(path)
+        if current_hash is None:
+            return "unchanged", None
+
+        if stored_hash is None:
+            if stored_mtime == mtime:
+                return "unchanged", current_hash
+            return "content_changed", current_hash
+
+        if stored_hash != current_hash:
+            return "content_changed", current_hash
+
+        return "mtime_only", current_hash
+
+    def record(self, path: Path, file_hash: str | None = None) -> None:
+        key = self.path_key(path)
+        try:
+            self.file_mtimes[key] = path.stat().st_mtime
         except OSError:
             pass
+        if file_hash is None:
+            file_hash = self.compute_hash(path)
+        if file_hash:
+            self.file_hashes[key] = file_hash
+
+    def normalize_legacy_keys(self) -> None:
+        """Re-key persisted state through path_key() after upgrades."""
+        if not self.file_mtimes and not self.file_hashes:
+            return
+
+        new_mtimes: dict[str, float] = {}
+        for key, mtime in self.file_mtimes.items():
+            try:
+                new_mtimes[self.path_key(Path(key))] = mtime
+            except OSError:
+                new_mtimes[key] = mtime
+        self.file_mtimes = new_mtimes
+
+        new_hashes: dict[str, str] = {}
+        for key, digest in self.file_hashes.items():
+            try:
+                new_hashes[self.path_key(Path(key))] = digest
+            except OSError:
+                new_hashes[key] = digest
+        self.file_hashes = new_hashes
 
 
 @dataclass

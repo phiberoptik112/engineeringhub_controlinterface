@@ -23,7 +23,16 @@ _PALETTE_SENTINEL = "///cmdpalette"
 
 COMMAND_CATALOG: list[CommandEntry] = [
     # Context Management
-    CommandEntry("/model", "[profile|path]", "Show or switch model profile", "Context Management"),
+    CommandEntry("/model", "", "Show active model and all adjustable settings", "Context Management"),
+    CommandEntry("/model", "<profile>", "Switch to a named profile (full reload)", "Context Management"),
+    CommandEntry("/model", "path <hf-id-or-path>", "Load model by path (full reload)", "Context Management"),
+    CommandEntry("/model", "set thinking on|off|auto", "Toggle thinking mode (live, no reload)", "Context Management"),
+    CommandEntry("/model", "set streaming on|off", "Toggle per-token streaming output (live)", "Context Management"),
+    CommandEntry("/model", "set temp <float>", "Adjust temperature live (no reload)", "Context Management"),
+    CommandEntry("/model", "set top_p <float>", "Adjust top-p sampling live", "Context Management"),
+    CommandEntry("/model", "set min_p <float>", "Adjust min-p sampling live", "Context Management"),
+    CommandEntry("/model", "set max_tokens <int>", "Adjust max generation tokens live", "Context Management"),
+    CommandEntry("/model_browse", "", "Browse mlx-community models and profiles", "Context Management"),
     CommandEntry("/status", "", "Show context pressure and turn count", "Context Management"),
     CommandEntry("/budget", "", "Token budget breakdown", "Context Management"),
     CommandEntry("/topic", "", "Show the currently detected conversation topic", "Context Management"),
@@ -52,7 +61,19 @@ COMMAND_CATALOG: list[CommandEntry] = [
         "Agent Delegation",
     ),
     CommandEntry("/skills", "", "List available agent personas", "Agent Delegation"),
+    CommandEntry(
+        "/integrate",
+        "[status]",
+        "Run the Task-Integrator: interview inline in today's journal, propose agent tasks",
+        "Agent Delegation",
+    ),
     CommandEntry("/agent_browse", "", "Interactive skill picker for agent delegation", "Agent Delegation"),
+    CommandEntry(
+        "/persona",
+        "[<name>|reset|list]",
+        "Show, swap, reset, or list active Journaler persona",
+        "Agent Delegation",
+    ),
     CommandEntry("/validate-latex", "<path>", "Compile a .tex file and report errors", "Agent Delegation"),
     # Zettelkasten
     CommandEntry(
@@ -83,6 +104,13 @@ COMMAND_CATALOG: list[CommandEntry] = [
         "[--format raw|--summarize] [-o <path>] …",
         "Export transcript to org-roam (default: conversation_exports/)",
         "Export",
+    ),
+    # Quick Context
+    CommandEntry(
+        "/context",
+        "[number]",
+        "Show suggested files to load (top 10 by frequency/recency)",
+        "Quick Context",
     ),
     # Session
     CommandEntry("/help", "", "Show available slash commands", "Session"),

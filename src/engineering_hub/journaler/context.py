@@ -13,7 +13,7 @@ import re
 from collections import defaultdict
 from datetime import date, datetime, timedelta
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 from engineering_hub.journaler.models import ContextSnapshot, OrgFileInfo, ScanState
 from engineering_hub.journaler.org_parser import (
@@ -80,6 +80,7 @@ class JournalContext:
         self.cache_file = state_dir / "context_cache.json"
 
         self._state = self._load_state()
+        self._state.normalize_legacy_keys()
         self._snapshot = self._load_cache()
 
     def _resolved_journal_dir(self) -> Path:
@@ -137,16 +138,128 @@ class JournalContext:
             return True
         return r in journal_sel
 
-    def _append_changed_org(
-        self, org_file: Path, changed_files: list[Path], seen: set[str]
-    ) -> None:
-        key = str(org_file.resolve())
+    def _resolved_pending_tasks_path(self) -> Path:
+        if self._pending_tasks_file is not None:
+            return self._pending_tasks_file.expanduser().resolve()
+        return (self.workspace_dir / ".journaler" / "pending-tasks.org").resolve()
+
+    def _classify_org_file(
+        self, org_file: Path, journal_sel: set[Path]
+    ) -> Literal["journal", "roam", "pending"]:
+        pending_path = self._resolved_pending_tasks_path()
+        try:
+            if org_file.resolve() == pending_path:
+                return "pending"
+        except OSError:
+            pass
+        try:
+            r = org_file.resolve()
+        except OSError:
+            return "roam"
+        jd = self._resolved_journal_dir()
+        if jd.exists():
+            try:
+                r.relative_to(jd)
+                if r in journal_sel:
+                    return "journal"
+                return "roam"
+            except ValueError:
+                pass
+        return "roam"
+
+    def _entry_signature(self, entry: dict[str, str]) -> tuple[str, str]:
+        return (entry.get("time", ""), entry.get("heading", ""))
+
+    def _diff_journal_entries(
+        self,
+        old_entries: list[dict[str, str]],
+        new_entries: list[dict[str, str]],
+    ) -> list[str]:
+        """Return labels for journal entries present in new but not old."""
+        old_sigs = {self._entry_signature(e) for e in old_entries if e.get("heading")}
+        added: list[str] = []
+        for entry in new_entries:
+            if not entry.get("heading"):
+                continue
+            sig = self._entry_signature(entry)
+            if sig not in old_sigs:
+                added.append(entry["heading"])
+        return added
+
+    def _build_change_summary(
+        self,
+        *,
+        journal_diffs: list[tuple[str, list[str]]],
+        new_outputs: list[Path],
+        content_changed_count: int,
+        mtime_only_count: int,
+        unchanged_count: int,
+        roam_content_count: int,
+        checked_count: int,
+    ) -> str:
+        parts: list[str] = []
+        for filename, headings in journal_diffs:
+            if not headings:
+                parts.append(f"journal {filename}: updated")
+            elif len(headings) == 1:
+                parts.append(f"journal {filename}: +1 entry ({headings[0]})")
+            else:
+                preview = ", ".join(headings[:3])
+                if len(headings) > 3:
+                    preview += f", +{len(headings) - 3} more"
+                parts.append(
+                    f"journal {filename}: +{len(headings)} entries ({preview})"
+                )
+        if new_outputs:
+            parts.append(
+                f"{len(new_outputs)} output"
+                f"{'' if len(new_outputs) == 1 else 's'} changed"
+            )
+        if parts:
+            return "; ".join(parts)
+        return (
+            f"no content changes ({content_changed_count} significant; "
+            f"{mtime_only_count} mtime-only; {unchanged_count} unchanged; "
+            f"{checked_count} checked"
+            + (f"; {roam_content_count} roam updated" if roam_content_count else "")
+            + ")"
+        )
+
+    def _merge_recent_project_changes(
+        self,
+        new_changes: list[dict[str, str]],
+        *,
+        cap: int = 12,
+    ) -> list[dict[str, str]]:
+        merged = list(self._snapshot.recent_project_changes)
+        for change in new_changes:
+            file_key = change["file"]
+            merged = [c for c in merged if c.get("file") != file_key]
+            merged.insert(0, change)
+        return merged[:cap]
+
+    def _track_org_file(
+        self,
+        org_file: Path,
+        *,
+        seen: set[str],
+        content_changed: list[Path],
+    ) -> Literal["unchanged", "mtime_only", "content_changed", "duplicate"]:
+        key = ScanState.path_key(org_file)
         if key in seen:
-            return
-        if self._state.is_changed(org_file):
-            changed_files.append(org_file)
-            self._state.record(org_file)
-            seen.add(key)
+            return "duplicate"
+        seen.add(key)
+
+        status, file_hash = self._state.inspect(org_file)
+        if status == "unchanged":
+            return "unchanged"
+        if status == "mtime_only":
+            self._state.record(org_file, file_hash=file_hash)
+            return "mtime_only"
+
+        content_changed.append(org_file)
+        self._state.record(org_file, file_hash=file_hash)
+        return "content_changed"
 
     def _journal_window_entries(self, info: OrgFileInfo) -> list[dict[str, str]]:
         """Return daily journal entries plus file-level topic signals."""
@@ -179,7 +292,7 @@ class JournalContext:
         return day_entries
 
     def _prune_journal_state(self, journal_sel: set[Path]) -> None:
-        """Drop mtime entries for daily files outside the current journal window."""
+        """Drop scan state for daily files outside the current journal window."""
         try:
             jd = self._resolved_journal_dir()
         except OSError:
@@ -187,24 +300,33 @@ class JournalContext:
         if not jd.exists():
             return
         keep = {p.resolve() for p in journal_sel}
-        new_mtimes: dict[str, float] = {}
-        for key, mtime in self._state.file_mtimes.items():
-            p = Path(key)
-            try:
-                rp = p.resolve()
-            except OSError:
-                continue
-            try:
-                rp.relative_to(jd)
-            except ValueError:
-                new_mtimes[key] = mtime
-                continue
-            if rp in keep:
-                new_mtimes[key] = mtime
-        self._state.file_mtimes = new_mtimes
+
+        def _prune_dict(store: dict[str, object]) -> dict[str, object]:
+            pruned: dict[str, object] = {}
+            for key, value in store.items():
+                p = Path(key)
+                try:
+                    rp = p.resolve()
+                except OSError:
+                    continue
+                try:
+                    rp.relative_to(jd)
+                except ValueError:
+                    pruned[key] = value
+                    continue
+                if rp in keep:
+                    pruned[key] = value
+            return pruned
+
+        self._state.file_mtimes = {
+            k: float(v) for k, v in _prune_dict(self._state.file_mtimes).items()
+        }
+        self._state.file_hashes = {
+            k: str(v) for k, v in _prune_dict(self._state.file_hashes).items()
+        }
 
     def scan(self) -> ContextSnapshot:
-        """Incremental scan. Reads only changed files since last scan.
+        """Incremental scan using content hashes and journal-centric significance.
 
         Updates state.json and context_cache.json. Returns the new snapshot.
         """
@@ -213,8 +335,27 @@ class JournalContext:
         journal_sel = self._selected_journal_files(today)
         self._prune_journal_state(journal_sel)
 
-        changed_files: list[Path] = []
+        content_changed: list[Path] = []
         seen_keys: set[str] = set()
+        unchanged_count = 0
+        mtime_only_count = 0
+        roam_content_count = 0
+
+        def _walk_org(org_file: Path) -> None:
+            nonlocal unchanged_count, mtime_only_count
+            result = self._track_org_file(
+                org_file, seen=seen_keys, content_changed=content_changed
+            )
+            if result == "duplicate":
+                return
+            if result == "unchanged":
+                unchanged_count += 1
+            elif result == "mtime_only":
+                mtime_only_count += 1
+
+        pending_path = self._resolved_pending_tasks_path()
+        if pending_path.is_file():
+            _walk_org(pending_path)
 
         if self.scan_org_roam_tree:
             scan_dirs = [self.org_roam_dir] + self.watch_dirs
@@ -222,79 +363,112 @@ class JournalContext:
                 if not scan_dir.exists():
                     continue
                 for org_file in scan_dir.rglob("*.org"):
-                    self._append_changed_org(org_file, changed_files, seen_keys)
+                    _walk_org(org_file)
         else:
             for org_file in journal_sel:
                 if org_file.exists():
-                    self._append_changed_org(org_file, changed_files, seen_keys)
+                    _walk_org(org_file)
             for scan_dir in self.watch_dirs:
                 if not scan_dir.exists():
                     continue
                 for org_file in scan_dir.rglob("*.org"):
-                    self._append_changed_org(org_file, changed_files, seen_keys)
+                    _walk_org(org_file)
 
-        # Also check workspace outputs directory
         outputs_dir = self.workspace_dir / "outputs"
         new_outputs: list[Path] = []
         if outputs_dir.exists():
             for output_file in outputs_dir.rglob("*.md"):
-                if self._state.is_changed(output_file):
-                    new_outputs.append(output_file)
-                    self._state.record(output_file)
+                key = ScanState.path_key(output_file)
+                if key in seen_keys:
+                    continue
+                seen_keys.add(key)
+                status, file_hash = self._state.inspect(output_file)
+                if status == "unchanged":
+                    unchanged_count += 1
+                    continue
+                if status == "mtime_only":
+                    mtime_only_count += 1
+                    self._state.record(output_file, file_hash=file_hash)
+                    continue
+                new_outputs.append(output_file)
+                self._state.record(output_file, file_hash=file_hash)
 
-        # Parse changed org files
         all_pending: list[str] = []
         all_completed: list[str] = []
         today_entries: list[dict[str, str]] = []
-        project_changes: list[dict[str, str]] = []
-        # journal_window_delta accumulates entries from changed journal files only;
-        # merged with the cached window at snapshot time.
+        journal_project_changes: list[dict[str, str]] = []
         journal_window_delta: dict[str, list[dict[str, str]]] = {}
+        journal_diffs: list[tuple[str, list[str]]] = []
+        significant_journal_changes = 0
 
-        for org_file in changed_files:
-            if not self._should_parse_org_file(org_file, journal_sel):
+        for org_file in content_changed:
+            file_kind = self._classify_org_file(org_file, journal_sel)
+            if file_kind == "roam":
+                roam_content_count += 1
                 continue
+
+            if file_kind == "journal" and not self._should_parse_org_file(
+                org_file, journal_sel
+            ):
+                continue
+
             info = parse_org_file(org_file)
             all_pending.extend(extract_pending_tasks(info.entries))
             all_completed.extend(extract_completed_tasks(info.entries))
+            significant_journal_changes += 1
 
             file_date = self._extract_date_from_filename(org_file)
+            rel_file = (
+                str(org_file.relative_to(self.org_roam_dir))
+                if self._is_under(org_file, self.org_roam_dir)
+                else org_file.name
+            )
 
-            # today_entries: today + yesterday (backward-compatible)
-            if file_date and file_date >= today - timedelta(days=1):
-                for entry in info.entries:
-                    ts_str = ""
-                    if entry.timestamp:
-                        ts_str = entry.timestamp.strftime("%H:%M")
-                    today_entries.append({
-                        "time": ts_str,
-                        "heading": entry.title,
-                        "content": entry.body[:300] if entry.body else "",
+            if file_kind == "journal" and file_date:
+                date_key = file_date.isoformat()
+                old_entries = self._snapshot.journal_window.get(date_key, [])
+                new_entries = self._journal_window_entries(info)
+                added = self._diff_journal_entries(old_entries, new_entries)
+                if added:
+                    journal_diffs.append((org_file.name, added))
+
+                journal_window_delta[date_key] = new_entries
+
+                if file_date >= today - timedelta(days=1):
+                    for entry in info.entries:
+                        ts_str = ""
+                        if entry.timestamp:
+                            ts_str = entry.timestamp.strftime("%H:%M")
+                        today_entries.append({
+                            "time": ts_str,
+                            "heading": entry.title,
+                            "content": entry.body[:300] if entry.body else "",
+                        })
+
+                summary = summarize_file(info, max_chars=300)
+                if summary:
+                    journal_project_changes.append({
+                        "file": rel_file,
+                        "changed": now.isoformat(timespec="seconds"),
+                        "summary": summary,
+                    })
+            elif file_kind == "pending":
+                journal_diffs.append((org_file.name, ["pending queue updated"]))
+                summary = summarize_file(info, max_chars=300)
+                if summary:
+                    journal_project_changes.append({
+                        "file": rel_file,
+                        "changed": now.isoformat(timespec="seconds"),
+                        "summary": summary,
                     })
 
-            # journal_window: full lookback window, grouped by date
-            if file_date:
-                date_key = file_date.isoformat()
-                journal_window_delta[date_key] = self._journal_window_entries(info)
-
-            # Track project note changes
-            summary = summarize_file(info, max_chars=300)
-            if summary:
-                project_changes.append({
-                    "file": str(org_file.relative_to(self.org_roam_dir))
-                    if self._is_under(org_file, self.org_roam_dir)
-                    else str(org_file),
-                    "changed": now.isoformat(timespec="seconds"),
-                    "summary": summary,
-                })
-
-        # Ensure today's journal is always represented in the window, even when unchanged
         today_journal = self.journal_dir / f"{today.isoformat()}.org"
         tj_resolved = today_journal.expanduser().resolve()
+        content_changed_keys = {ScanState.path_key(f) for f in content_changed}
         if (
             today_journal.exists()
             and tj_resolved in journal_sel
-            and not any(f.resolve() == tj_resolved for f in changed_files)
+            and ScanState.path_key(today_journal) not in content_changed_keys
         ):
             info = parse_org_file(today_journal)
             for task in extract_pending_tasks(info.entries):
@@ -303,12 +477,10 @@ class JournalContext:
             for task in extract_completed_tasks(info.entries):
                 if task not in all_completed:
                     all_completed.append(task)
-            # Add today to window even when not changed, for completeness
             date_key = today.isoformat()
             if date_key not in journal_window_delta:
                 journal_window_delta[date_key] = self._journal_window_entries(info)
 
-        # Fetch recent agent outputs from memory
         recent_agent_outputs: list[dict[str, str]] = []
         if self.memory_service:
             try:
@@ -322,8 +494,6 @@ class JournalContext:
             except Exception as exc:
                 logger.warning(f"Memory browse failed during scan (non-fatal): {exc}")
 
-        # Merge the incremental window delta with the cached window, then prune
-        # dates outside the lookback window.
         merged_window = dict(self._snapshot.journal_window)
         merged_window.update(journal_window_delta)
         lookback_cutoff = today - timedelta(days=self.journal_lookback_days)
@@ -332,7 +502,6 @@ class JournalContext:
             if _parse_date_key(k) is not None and _parse_date_key(k) >= lookback_cutoff  # type: ignore[operator]
         }
 
-        # Carry over previous task_first_seen and record any new pending tasks
         task_first_seen = dict(self._snapshot.task_first_seen)
         today_str = today.isoformat()
         new_pending = all_pending or self._snapshot.pending_tasks
@@ -341,31 +510,40 @@ class JournalContext:
             if key not in task_first_seen:
                 task_first_seen[key] = today_str
 
-        # Build derived topic data from the full merged window
         recurring_topics = self._build_recurring_topics(merged_window)
         active_roam_nodes = self._build_active_roam_nodes()
         stale_tasks = self._flag_stale_tasks(new_pending, merged_window, task_first_seen)
 
-        # Detect significance
-        has_significant = bool(changed_files) or bool(new_outputs)
-        change_parts: list[str] = []
-        if changed_files:
-            change_parts.append(f"{len(changed_files)} org files changed")
-        if new_outputs:
-            change_parts.append(f"{len(new_outputs)} new outputs")
+        checked_count = (
+            len(content_changed) + mtime_only_count + unchanged_count + len(new_outputs)
+        )
+        content_changed_count = significant_journal_changes + len(new_outputs)
+        has_significant = bool(significant_journal_changes) or bool(new_outputs)
+        change_summary = self._build_change_summary(
+            journal_diffs=journal_diffs,
+            new_outputs=new_outputs,
+            content_changed_count=content_changed_count,
+            mtime_only_count=mtime_only_count,
+            unchanged_count=unchanged_count,
+            roam_content_count=roam_content_count,
+            checked_count=checked_count,
+        )
 
-        # Merge into snapshot (keep previous data for unchanged items)
+        merged_project_changes = self._merge_recent_project_changes(
+            journal_project_changes
+        )
+
         self._snapshot = ContextSnapshot(
             last_scan=now.isoformat(timespec="seconds"),
             today_date=today.isoformat(),
             today_entries=today_entries or self._snapshot.today_entries,
             pending_tasks=new_pending,
             completed_tasks=all_completed or self._snapshot.completed_tasks,
-            recent_project_changes=project_changes or self._snapshot.recent_project_changes,
+            recent_project_changes=merged_project_changes,
             recent_agent_outputs=recent_agent_outputs or self._snapshot.recent_agent_outputs,
             active_projects=self._snapshot.active_projects,
             has_significant_changes=has_significant,
-            change_summary="; ".join(change_parts) if change_parts else "no changes",
+            change_summary=change_summary,
             journal_window=merged_window,
             recurring_topics=recurring_topics,
             active_roam_nodes=active_roam_nodes,
@@ -377,10 +555,20 @@ class JournalContext:
         self._save_state()
         self._save_cache()
 
+        if has_significant:
+            log_detail = change_summary
+        else:
+            log_detail = (
+                f"no content changes "
+                f"({checked_count} checked, "
+                f"{mtime_only_count} mtime-only, {unchanged_count} unchanged"
+                + (f", {roam_content_count} roam updated" if roam_content_count else "")
+                + ")"
+            )
         logger.info(
-            f"Scan complete: {len(changed_files)} org files, "
-            f"{len(new_outputs)} outputs, "
-            f"{len(all_pending)} pending tasks, "
+            f"Scan complete: {content_changed_count} content change"
+            f"{'' if content_changed_count == 1 else 's'} — {log_detail}; "
+            f"{len(new_pending)} pending tasks, "
             f"{len(recurring_topics)} recurring topics, "
             f"{len(stale_tasks)} stale tasks"
         )
@@ -406,7 +594,7 @@ class JournalContext:
             info = parse_org_file(org_file)
             date_key = file_date.isoformat()
             journal_window[date_key] = self._journal_window_entries(info)
-            # Update mtime record so incremental scan won't re-parse unchanged files
+            # Record mtime + hash so incremental scan won't re-parse unchanged files
             self._state.record(org_file)
 
         recurring_topics = self._build_recurring_topics(journal_window)
@@ -477,6 +665,41 @@ class JournalContext:
                 continue
         return results
 
+    def _load_agent_work_status(self) -> str:
+        """Read today's background agent work status, if any."""
+        path = self.state_dir / "agent_work_status" / f"{date.today().isoformat()}.md"
+        if not path.is_file():
+            return ""
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace").strip()
+        except OSError:
+            return ""
+        if not text:
+            return ""
+        lines = text.splitlines()
+        if lines and lines[0].startswith("#"):
+            lines = lines[1:]
+        return "\n".join(lines).strip()
+
+    def _load_topic_hints(self) -> str:
+        """Read today's proactive topic scout output, if any."""
+        path = self.state_dir / "topic_hints" / f"{date.today().isoformat()}.md"
+        if not path.is_file():
+            return ""
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace").strip()
+        except OSError:
+            return ""
+        if not text:
+            return ""
+        lines = text.splitlines()
+        if lines and lines[0].startswith("#"):
+            lines = lines[1:]
+        body = "\n".join(lines).strip()
+        if not body:
+            return ""
+        return body[:1200] + ("..." if len(body) > 1200 else "")
+
     def get_current_context(self) -> str:
         """Format the cached snapshot as a markdown context block
         suitable for injection into the model's system prompt.
@@ -488,6 +711,17 @@ class JournalContext:
             f"## Current Context (updated {s.last_scan or 'never'})",
             "",
         ]
+
+        topic_hints = self._load_topic_hints()
+        if topic_hints:
+            lines.append("### Topic hints (auto)")
+            lines.append(
+                "_Generated after the latest significant journal scan. "
+                "Use as conversation starters or delegation suggestions._"
+            )
+            lines.append("")
+            lines.append(topic_hints)
+            lines.append("")
 
         if s.pending_tasks:
             lines.append("### Pending Tasks")
@@ -597,6 +831,12 @@ class JournalContext:
                 )
             lines.append("")
 
+        work_status = self._load_agent_work_status()
+        if work_status:
+            lines.append("### Background Agent Work (today)")
+            lines.append(work_status)
+            lines.append("")
+
         if self.conversation_lookback_days > 0:
             summaries = self._load_daily_summaries(self.conversation_lookback_days)
             if summaries:
@@ -616,11 +856,6 @@ class JournalContext:
                 lines.append("")
 
         return "\n".join(lines)
-
-    def _resolved_pending_tasks_path(self) -> Path:
-        if self._pending_tasks_file is not None:
-            return self._pending_tasks_file.expanduser().resolve()
-        return (self.workspace_dir / ".journaler" / "pending-tasks.org").resolve()
 
     def _format_pending_queue_for_briefing(self) -> str:
         """Summarize Journaler queue entries from the last ~36h for briefing context."""
@@ -851,6 +1086,12 @@ class JournalContext:
                 )
             lines.append("")
 
+        work_status = self._load_agent_work_status()
+        if work_status:
+            lines.append("### Background Agent Work (today)")
+            lines.append(work_status)
+            lines.append("")
+
         # Memory stats
         if self.memory_service:
             try:
@@ -1030,6 +1271,7 @@ class JournalContext:
                 return ScanState(
                     last_scan=data.get("last_scan", ""),
                     file_mtimes=data.get("file_mtimes", {}),
+                    file_hashes=data.get("file_hashes", {}),
                 )
             except (json.JSONDecodeError, OSError) as exc:
                 logger.warning(f"Could not load scan state (starting fresh): {exc}")
@@ -1040,6 +1282,7 @@ class JournalContext:
         data = {
             "last_scan": self._state.last_scan,
             "file_mtimes": self._state.file_mtimes,
+            "file_hashes": self._state.file_hashes,
         }
         self.state_file.write_text(
             json.dumps(data, indent=2), encoding="utf-8"

@@ -1,10 +1,33 @@
 from __future__ import annotations
 
-from datetime import datetime
+import json
+import os
+from datetime import date, datetime
 from pathlib import Path
 
 from engineering_hub.journaler.context import JournalContext
-from engineering_hub.journaler.models import OrgEntry, OrgFileInfo
+from engineering_hub.journaler.models import OrgEntry, OrgFileInfo, ScanState
+
+
+def _make_ctx(tmp_path: Path, *, scan_tree: bool = True) -> JournalContext:
+    journal_dir = tmp_path / "journals"
+    journal_dir.mkdir()
+    roam_dir = tmp_path / "roam"
+    roam_dir.mkdir()
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    state = workspace / ".journaler"
+    state.mkdir(parents=True)
+    return JournalContext(
+        org_roam_dir=roam_dir,
+        journal_dir=journal_dir,
+        workspace_dir=workspace,
+        memory_service=None,
+        state_dir=state,
+        scan_org_roam_tree=scan_tree,
+        journal_lookback_days=30,
+        journal_max_files=30,
+    )
 
 
 def test_journal_window_entries_include_topic_keywords(tmp_path: Path) -> None:
@@ -37,3 +60,132 @@ def test_journal_window_entries_include_topic_keywords(tmp_path: Path) -> None:
     assert "acoustics" in entries[0]["keywords"]
     assert "meeting: Client call" in entries[0]["keywords"]
     assert "ASTM E336" in entries[0]["keywords"]
+
+
+def test_path_key_canonical(tmp_path: Path) -> None:
+    target = tmp_path / "note.org"
+    target.write_text("* Heading\n", encoding="utf-8")
+
+    assert ScanState.path_key(target) == ScanState.path_key(Path(str(target)))
+    assert ScanState.path_key(target) == ScanState.path_key(
+        target.resolve().parent / "note.org"
+    )
+
+
+def test_second_scan_zero_content_changes(tmp_path: Path) -> None:
+    ctx = _make_ctx(tmp_path)
+    for name in ("alpha.org", "beta.org", "gamma.org"):
+        (ctx.org_roam_dir / name).write_text(f"* {name}\n", encoding="utf-8")
+
+    first = ctx.scan()
+    assert first.change_summary  # baseline scan establishes hashes
+
+    second = ctx.scan()
+    assert not second.has_significant_changes
+    assert "no content changes" in second.change_summary
+    assert "0 significant" in second.change_summary
+
+
+def test_mtime_bump_not_significant(tmp_path: Path) -> None:
+    ctx = _make_ctx(tmp_path)
+    today = date.today().isoformat()
+    journal = ctx.journal_dir / f"{today}.org"
+    journal.write_text("* Morning notes\n", encoding="utf-8")
+
+    ctx.scan()
+    original_mtime = journal.stat().st_mtime
+    os.utime(journal, (original_mtime + 60, original_mtime + 60))
+
+    snapshot = ctx.scan()
+    assert not snapshot.has_significant_changes
+    assert "mtime-only" in snapshot.change_summary or "0 significant" in snapshot.change_summary
+
+
+def test_journal_entry_diff(tmp_path: Path) -> None:
+    ctx = _make_ctx(tmp_path, scan_tree=False)
+    today = date.today().isoformat()
+    journal = ctx.journal_dir / f"{today}.org"
+    journal.write_text("* First entry\n", encoding="utf-8")
+
+    ctx.scan()
+    journal.write_text("* First entry\n* Second entry\n", encoding="utf-8")
+
+    snapshot = ctx.scan()
+    assert snapshot.has_significant_changes
+    assert "+1 entry" in snapshot.change_summary or "+2 entries" in snapshot.change_summary
+    assert "Second entry" in snapshot.change_summary
+
+
+def test_roam_content_not_significant(tmp_path: Path) -> None:
+    ctx = _make_ctx(tmp_path)
+    roam_note = ctx.org_roam_dir / "projects" / "client.org"
+    roam_note.parent.mkdir(parents=True)
+    roam_note.write_text("* Project alpha\n", encoding="utf-8")
+
+    ctx.scan()
+    roam_note.write_text("* Project alpha\n* New roam heading\n", encoding="utf-8")
+
+    snapshot = ctx.scan()
+    assert not snapshot.has_significant_changes
+    assert "roam updated" in snapshot.change_summary
+
+
+def test_state_persists_hashes(tmp_path: Path) -> None:
+    ctx = _make_ctx(tmp_path)
+    (ctx.org_roam_dir / "note.org").write_text("* Test\n", encoding="utf-8")
+
+    ctx.scan()
+
+    state_path = ctx.state_dir / "state.json"
+    data = json.loads(state_path.read_text(encoding="utf-8"))
+    assert "file_hashes" in data
+    assert len(data["file_hashes"]) >= 1
+
+
+def test_diff_journal_entries() -> None:
+    ctx = JournalContext(
+        org_roam_dir=Path("/tmp"),
+        journal_dir=Path("/tmp"),
+        workspace_dir=Path("/tmp"),
+        memory_service=None,
+        state_dir=Path("/tmp/state"),
+    )
+    old = [{"time": "09:00", "heading": "Existing", "content": ""}]
+    new = [
+        {"time": "09:00", "heading": "Existing", "content": ""},
+        {"time": "10:00", "heading": "Added", "content": ""},
+    ]
+    added = ctx._diff_journal_entries(old, new)
+    assert added == ["Added"]
+
+
+def test_journal_changes_merge_into_recent_project_changes(tmp_path: Path) -> None:
+    ctx = _make_ctx(tmp_path, scan_tree=False)
+    today = date.today().isoformat()
+    journal = ctx.journal_dir / f"{today}.org"
+    journal.write_text("* Initial\n", encoding="utf-8")
+    ctx.scan()
+
+    journal.write_text("* Initial\n* Follow-up task\n", encoding="utf-8")
+    snapshot = ctx.scan()
+
+    assert snapshot.recent_project_changes
+    assert any(today in c["file"] for c in snapshot.recent_project_changes)
+
+
+def test_pending_tasks_file_counts_as_significant(tmp_path: Path) -> None:
+    ctx = _make_ctx(tmp_path, scan_tree=False)
+    pending = ctx.workspace_dir / ".journaler" / "pending-tasks.org"
+    pending.parent.mkdir(parents=True, exist_ok=True)
+    today = date.today().isoformat()
+    pending.write_text(
+        f"** {today} 10:00 :STATUS: PENDING\n- [ ] Queue item\n",
+        encoding="utf-8",
+    )
+    ctx._pending_tasks_file = pending
+
+    first = ctx.scan()
+    assert first.has_significant_changes
+
+    second = ctx.scan()
+    assert not second.has_significant_changes

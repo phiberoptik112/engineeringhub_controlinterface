@@ -94,6 +94,20 @@ class Settings(BaseSettings):
         description="Path to org-roam daily journal directory (YYYY-MM-DD.org files)",
     )
 
+    # Rental scout workspace (criteria.yaml, seen_listings.db, latest_digest.json)
+    rental_scout_workspace_dir: Path = Field(
+        default=Path.home() / "dev" / "rental_scout",
+        description="Workspace directory for the Bay Area Rental Scout pipeline and artifacts",
+    )
+    rental_scout_python_path: Path | None = Field(
+        default=None,
+        description=(
+            "Python interpreter for rental-scout pipeline subprocesses. "
+            "When unset, uses {workspace_dir}/.venv/bin/python if present, "
+            "otherwise the current process interpreter."
+        ),
+    )
+
     # Org mode: use org-roam daily journals as the task source instead of journal.md
     use_org_mode: bool = Field(
         default=False,
@@ -312,6 +326,92 @@ class Settings(BaseSettings):
         default=0,
         description="Interval in minutes between coordination scans (0 = disabled)",
     )
+    journaler_proactive_topic_scout_enabled: bool = Field(
+        default=True,
+        description="Run a one-shot MLX topic scout when a scan tick detects significant journal changes",
+    )
+    journaler_proactive_topic_scout_max_tokens: int = Field(
+        default=512,
+        ge=64,
+        le=4096,
+        description="Max tokens for proactive topic scout generation on significant scan ticks",
+    )
+
+    # Background agent work loop
+    journaler_background_work_enabled: bool = Field(
+        default=False,
+        description="Enable background agent work loop that extracts tasks from briefings and delegates them",
+    )
+    journaler_background_work_interval_min: int = Field(
+        default=60,
+        ge=10,
+        description="Interval in minutes between background work loop ticks",
+    )
+    journaler_background_work_max_tasks_per_day: int = Field(
+        default=6,
+        ge=1,
+        le=20,
+        description="Maximum number of background tasks to run per day",
+    )
+    journaler_background_work_auto_approve: bool = Field(
+        default=False,
+        description="When True, background work loop auto-delegates extracted tasks without user confirmation",
+    )
+    journaler_background_work_agent_backend: str = Field(
+        default="mlx",
+        description="Agent backend for background work tasks (mlx, claude, auto)",
+    )
+    journaler_background_work_chat_lookback_days: int = Field(
+        default=3,
+        ge=0,
+        le=30,
+        description="Days of conversation.jsonl chat history to include in task extraction and delegation context",
+    )
+
+    # Task-Integrator: inline call-and-response loop over the daily journal
+    journaler_task_integrator_enabled: bool = Field(
+        default=False,
+        description="Enable the Task-Integrator loop that interviews the user inline in the daily journal and proposes agent tasks",
+    )
+    journaler_task_integrator_interval_min: int = Field(
+        default=15,
+        ge=5,
+        description="Interval in minutes between Task-Integrator cycles",
+    )
+    journaler_task_integrator_conversation_section: str = Field(
+        default="Agent Conversation",
+        description="Daily-journal heading where the Task-Integrator writes interview questions and proposals",
+    )
+    journaler_task_integrator_output_section: str = Field(
+        default="Overnight Agent Tasks",
+        description="Daily-journal heading where approved @agent: tasks are queued for the Orchestrator",
+    )
+    journaler_task_integrator_excluded_sections: list[str] = Field(
+        default_factory=lambda: [
+            "Agent Conversation",
+            "Overnight Agent Tasks",
+            "Completed Agent Tasks",
+            "Pending Agent Tasks",
+            "Timesheet",
+            "Journaler Cross-References",
+        ],
+        description="Daily-journal headings the Task-Integrator must not read as intake (agent-managed sections)",
+    )
+    journaler_task_integrator_max_questions: int = Field(
+        default=3,
+        ge=1,
+        le=10,
+        description="Maximum interview questions the Task-Integrator asks per topic",
+    )
+    journaler_task_integrator_weekdays_only: bool = Field(
+        default=True,
+        description="When True, the Task-Integrator only queues approved tasks Mon-Fri",
+    )
+    journaler_task_integrator_max_tokens: int = Field(
+        default=1024,
+        ge=128,
+        description="Max tokens for Task-Integrator interview/resolution model calls",
+    )
 
     journaler_chat_enabled: bool = Field(
         default=True,
@@ -340,6 +440,11 @@ class Settings(BaseSettings):
     journaler_max_tokens: int = Field(
         default=4096,
         description="Max tokens for Journaler model responses",
+    )
+    journaler_thinking_max_tokens: int = Field(
+        default=16384,
+        description="Minimum generation budget when enable_thinking is true "
+        "(thinking + answer share one cap)",
     )
     journaler_temp: float = Field(
         default=0.7,
@@ -768,6 +873,17 @@ class Settings(BaseSettings):
             if staging.get("manifest_name"):
                 flat_config["staging_manifest_name"] = staging["manifest_name"]
 
+        if "rental_scout" in config:
+            rental_scout = config["rental_scout"]
+            if rental_scout.get("workspace_dir"):
+                flat_config["rental_scout_workspace_dir"] = Path(
+                    rental_scout["workspace_dir"]
+                ).expanduser()
+            if rental_scout.get("python_path"):
+                flat_config["rental_scout_python_path"] = Path(
+                    rental_scout["python_path"]
+                ).expanduser()
+
         if "ollama" in config:
             ollama = config["ollama"]
             if ollama.get("host"):
@@ -876,6 +992,70 @@ class Settings(BaseSettings):
                 flat_config["journaler_coordination_scan_interval_min"] = int(
                     j["coordination_scan_interval_min"]
                 )
+            if j.get("proactive_topic_scout_enabled") is not None:
+                flat_config["journaler_proactive_topic_scout_enabled"] = bool(
+                    j["proactive_topic_scout_enabled"]
+                )
+            if j.get("proactive_topic_scout_max_tokens") is not None:
+                flat_config["journaler_proactive_topic_scout_max_tokens"] = int(
+                    j["proactive_topic_scout_max_tokens"]
+                )
+            if j.get("background_work_enabled") is not None:
+                flat_config["journaler_background_work_enabled"] = bool(
+                    j["background_work_enabled"]
+                )
+            if j.get("background_work_interval_min") is not None:
+                flat_config["journaler_background_work_interval_min"] = int(
+                    j["background_work_interval_min"]
+                )
+            if j.get("background_work_max_tasks_per_day") is not None:
+                flat_config["journaler_background_work_max_tasks_per_day"] = int(
+                    j["background_work_max_tasks_per_day"]
+                )
+            if j.get("background_work_auto_approve") is not None:
+                flat_config["journaler_background_work_auto_approve"] = bool(
+                    j["background_work_auto_approve"]
+                )
+            if j.get("background_work_agent_backend"):
+                flat_config["journaler_background_work_agent_backend"] = str(
+                    j["background_work_agent_backend"]
+                )
+            if j.get("background_work_chat_lookback_days") is not None:
+                flat_config["journaler_background_work_chat_lookback_days"] = int(
+                    j["background_work_chat_lookback_days"]
+                )
+            if j.get("task_integrator_enabled") is not None:
+                flat_config["journaler_task_integrator_enabled"] = bool(
+                    j["task_integrator_enabled"]
+                )
+            if j.get("task_integrator_interval_min") is not None:
+                flat_config["journaler_task_integrator_interval_min"] = int(
+                    j["task_integrator_interval_min"]
+                )
+            if j.get("task_integrator_conversation_section"):
+                flat_config["journaler_task_integrator_conversation_section"] = str(
+                    j["task_integrator_conversation_section"]
+                )
+            if j.get("task_integrator_output_section"):
+                flat_config["journaler_task_integrator_output_section"] = str(
+                    j["task_integrator_output_section"]
+                )
+            if isinstance(j.get("task_integrator_excluded_sections"), list):
+                flat_config["journaler_task_integrator_excluded_sections"] = [
+                    str(s) for s in j["task_integrator_excluded_sections"]
+                ]
+            if j.get("task_integrator_max_questions") is not None:
+                flat_config["journaler_task_integrator_max_questions"] = int(
+                    j["task_integrator_max_questions"]
+                )
+            if j.get("task_integrator_weekdays_only") is not None:
+                flat_config["journaler_task_integrator_weekdays_only"] = bool(
+                    j["task_integrator_weekdays_only"]
+                )
+            if j.get("task_integrator_max_tokens") is not None:
+                flat_config["journaler_task_integrator_max_tokens"] = int(
+                    j["task_integrator_max_tokens"]
+                )
             if j.get("chat_enabled") is not None:
                 flat_config["journaler_chat_enabled"] = j["chat_enabled"]
             if j.get("chat_host"):
@@ -890,6 +1070,8 @@ class Settings(BaseSettings):
                 flat_config["journaler_max_conversation_history"] = j["max_conversation_history"]
             if j.get("max_tokens") is not None:
                 flat_config["journaler_max_tokens"] = j["max_tokens"]
+            if j.get("thinking_max_tokens") is not None:
+                flat_config["journaler_thinking_max_tokens"] = j["thinking_max_tokens"]
             if j.get("temp") is not None:
                 flat_config["journaler_temp"] = j["temp"]
             if j.get("top_p") is not None:

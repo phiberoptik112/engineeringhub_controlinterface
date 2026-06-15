@@ -1,6 +1,16 @@
 name: zettelkasten-curator
 display_name: Zettelkasten Curator
 agent_type: zettelkasten-curator
+
+domain: pkm
+domain_triggers:
+  - permanent note
+  - atomic note
+  - zettelkasten
+  - org-roam link
+  - note proposal
+  - evergreen note
+
 description: Extracts atomic permanent-note proposals from org-roam daily journals and suggests conservative links.
 when_to_use:
   - Use when marked daily-journal fragments should become reviewable permanent org-roam notes.

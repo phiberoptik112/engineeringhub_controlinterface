@@ -58,7 +58,7 @@ def build_corpus_service_from_settings(settings: Settings) -> Any:
         logger.warning("Failed to initialize CorpusService: %s", exc)
         return None
     if service.is_available():
-        logger.info("PDF corpus service ready (DB: %s).", expanded)
+        logger.debug("PDF corpus service initialized (DB: %s).", expanded)
     else:
         logger.warning(
             "CorpusService initialized but embedder unavailable; "

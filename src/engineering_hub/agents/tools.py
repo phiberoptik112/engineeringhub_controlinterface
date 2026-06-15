@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from engineering_hub.actions.file_ingest import FileIngestAction
+from engineering_hub.rental_scout import service as rental_service
 
 logger = logging.getLogger(__name__)
 
@@ -186,6 +187,273 @@ def handle_search_memory(args: dict[str, Any], ctx: ToolContext) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Rental scout tools
+# ---------------------------------------------------------------------------
+
+RENTAL_GET_CRITERIA_TOOL = {
+    "name": "rental_get_criteria",
+    "description": (
+        "Return the current Bay Area rental search criteria (cities, price range, "
+        "bedrooms, amenities) from the rental scout workspace. Use to answer "
+        "'what are my current rental search settings?'"
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {},
+        "required": [],
+    },
+}
+
+
+def handle_rental_get_criteria(args: dict[str, Any], ctx: ToolContext) -> str:
+    """Read criteria.yaml from the rental scout workspace."""
+    workspace = rental_service.resolve_workspace()
+    return json.dumps(rental_service.get_criteria(workspace))
+
+
+RENTAL_UPDATE_CRITERIA_TOOL = {
+    "name": "rental_update_criteria",
+    "description": (
+        "Patch one or more fields of the rental search criteria and save. "
+        "Only supplied fields change; everything else is preserved. "
+        "Returns the full updated criteria."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "cities": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Cities to scan, e.g. ['Oakland', 'San Francisco']",
+            },
+            "price_min": {"type": "integer", "description": "Minimum monthly rent"},
+            "price_max": {"type": "integer", "description": "Maximum monthly rent"},
+            "bedrooms_min": {"type": "integer", "description": "Minimum bedrooms"},
+            "bedrooms_max": {"type": "integer", "description": "Maximum bedrooms"},
+            "amenities_required": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Required amenities, e.g. ['in_unit_laundry', 'allows_cats']",
+            },
+            "amenities_preferred": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Preferred (nice-to-have) amenities",
+            },
+        },
+        "required": [],
+    },
+}
+
+
+def handle_rental_update_criteria(args: dict[str, Any], ctx: ToolContext) -> str:
+    """Patch criteria.yaml in the rental scout workspace."""
+    workspace = rental_service.resolve_workspace()
+    result = rental_service.update_criteria(
+        workspace,
+        cities=args.get("cities"),
+        price_min=args.get("price_min"),
+        price_max=args.get("price_max"),
+        bedrooms_min=args.get("bedrooms_min"),
+        bedrooms_max=args.get("bedrooms_max"),
+        amenities_required=args.get("amenities_required"),
+        amenities_preferred=args.get("amenities_preferred"),
+    )
+    return json.dumps(result)
+
+
+RENTAL_RUN_SCAN_TOOL = {
+    "name": "rental_run_scan",
+    "description": (
+        "Trigger a rental listing scan via the rental scout pipeline. Writes "
+        "results to the workspace digest; call rental_get_top_matches afterwards. "
+        "May take a few minutes."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "sources": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": (
+                    "Optional source names to restrict the scan, "
+                    "e.g. ['craigslist', 'zumper']. Defaults to all enabled sources."
+                ),
+            },
+            "dry_run": {
+                "type": "boolean",
+                "description": "Scrape and score without sending digest or marking seen",
+            },
+        },
+        "required": [],
+    },
+}
+
+
+def handle_rental_run_scan(args: dict[str, Any], ctx: ToolContext) -> str:
+    """Run the rental scout scan pipeline."""
+    workspace = rental_service.resolve_workspace()
+    result = rental_service.run_scan(
+        workspace,
+        sources=args.get("sources"),
+        dry_run=args.get("dry_run", False),
+    )
+    return json.dumps(result)
+
+
+RENTAL_GET_TOP_MATCHES_TOOL = {
+    "name": "rental_get_top_matches",
+    "description": (
+        "Return top rental matches from the most recent scan digest. Each "
+        "listing has url, score, price, beds, city, neighborhood, summary, "
+        "pros, cons, and red_flags."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "limit": {"type": "integer", "description": "Max listings to return (default 10)"},
+            "min_score": {
+                "type": "integer",
+                "description": "Only listings scoring >= this (default 6)",
+            },
+            "city_filter": {
+                "type": "string",
+                "description": "Restrict to one city, e.g. 'Oakland'",
+            },
+        },
+        "required": [],
+    },
+}
+
+
+def handle_rental_get_top_matches(args: dict[str, Any], ctx: ToolContext) -> str:
+    """Read top matches from the latest rental scan digest."""
+    workspace = rental_service.resolve_workspace()
+    result = rental_service.get_top_matches(
+        workspace,
+        limit=args.get("limit", 10),
+        min_score=args.get("min_score", 6),
+        city_filter=args.get("city_filter"),
+    )
+    return json.dumps(result)
+
+
+RENTAL_GET_LISTING_STATS_TOOL = {
+    "name": "rental_get_listing_stats",
+    "description": (
+        "Summary statistics from the rental scout deduplication database: total "
+        "listings seen, counts by source, last-seen timestamp, last-scan metadata."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {},
+        "required": [],
+    },
+}
+
+
+def handle_rental_get_listing_stats(args: dict[str, Any], ctx: ToolContext) -> str:
+    """Read stats from the rental scout dedup database."""
+    workspace = rental_service.resolve_workspace()
+    return json.dumps(rental_service.get_listing_stats(workspace))
+
+
+RENTAL_FORMAT_DIGEST_FOR_ORG_TOOL = {
+    "name": "rental_format_digest_for_org",
+    "description": (
+        "Return today's top rental matches formatted as org-mode text, ready to "
+        "append to a journal entry or org-roam node."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "limit": {"type": "integer", "description": "Max listings to include (default 5)"},
+            "min_score": {
+                "type": "integer",
+                "description": "Only listings scoring >= this (default 6)",
+            },
+        },
+        "required": [],
+    },
+}
+
+
+def handle_rental_format_digest_for_org(args: dict[str, Any], ctx: ToolContext) -> str:
+    """Format the latest rental digest as org-mode text."""
+    workspace = rental_service.resolve_workspace()
+    return rental_service.format_digest_for_org(
+        workspace,
+        limit=args.get("limit", 5),
+        min_score=args.get("min_score", 6),
+    )
+
+
+RENTAL_CLEAR_SEEN_LISTINGS_TOOL = {
+    "name": "rental_clear_seen_listings",
+    "description": (
+        "Clear the rental scout deduplication database so all listings are "
+        "re-evaluated on the next scan. Dry-run unless confirm=True. Use after "
+        "changing cities or criteria when the user wants a fresh pass."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "confirm": {
+                "type": "boolean",
+                "description": "Must be true to actually delete seen listings",
+            },
+        },
+        "required": [],
+    },
+}
+
+
+def handle_rental_clear_seen_listings(args: dict[str, Any], ctx: ToolContext) -> str:
+    """Clear or dry-run the rental scout dedup database."""
+    workspace = rental_service.resolve_workspace()
+    result = rental_service.clear_seen_listings(
+        workspace,
+        confirm=args.get("confirm", False),
+    )
+    return json.dumps(result)
+
+
+RENTAL_ADD_JOURNAL_TASK_TOOL = {
+    "name": "rental_add_journal_task",
+    "description": (
+        "Write an @rental-scout task to today's org-roam journal so the "
+        "Orchestrator picks it up on its next scan. Use when the user wants "
+        "to queue an overnight or deferred rental scout run."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "task_description": {
+                "type": "string",
+                "description": "What the rental scout should do when the task runs",
+            },
+            "org_journal_dir": {
+                "type": "string",
+                "description": (
+                    "Optional override for journal.org_journal_dir from config"
+                ),
+            },
+        },
+        "required": ["task_description"],
+    },
+}
+
+
+def handle_rental_add_journal_task(args: dict[str, Any], ctx: ToolContext) -> str:
+    """Queue a rental-scout org journal task for the orchestrator."""
+    result = rental_service.add_journal_task(
+        args["task_description"],
+        org_journal_dir=args.get("org_journal_dir"),
+    )
+    return json.dumps(result)
+
+
+# ---------------------------------------------------------------------------
 # Tool Registry
 # ---------------------------------------------------------------------------
 
@@ -205,6 +473,38 @@ TOOL_REGISTRY: dict[str, ToolDefinition] = {
             project_id=args.get("project_id") or ctx.project_id or 0,
             output_dir=ctx.output_dir,
         ),
+    ),
+    "rental_get_criteria": ToolDefinition(
+        schema=RENTAL_GET_CRITERIA_TOOL,
+        handler=handle_rental_get_criteria,
+    ),
+    "rental_update_criteria": ToolDefinition(
+        schema=RENTAL_UPDATE_CRITERIA_TOOL,
+        handler=handle_rental_update_criteria,
+    ),
+    "rental_run_scan": ToolDefinition(
+        schema=RENTAL_RUN_SCAN_TOOL,
+        handler=handle_rental_run_scan,
+    ),
+    "rental_get_top_matches": ToolDefinition(
+        schema=RENTAL_GET_TOP_MATCHES_TOOL,
+        handler=handle_rental_get_top_matches,
+    ),
+    "rental_get_listing_stats": ToolDefinition(
+        schema=RENTAL_GET_LISTING_STATS_TOOL,
+        handler=handle_rental_get_listing_stats,
+    ),
+    "rental_format_digest_for_org": ToolDefinition(
+        schema=RENTAL_FORMAT_DIGEST_FOR_ORG_TOOL,
+        handler=handle_rental_format_digest_for_org,
+    ),
+    "rental_clear_seen_listings": ToolDefinition(
+        schema=RENTAL_CLEAR_SEEN_LISTINGS_TOOL,
+        handler=handle_rental_clear_seen_listings,
+    ),
+    "rental_add_journal_task": ToolDefinition(
+        schema=RENTAL_ADD_JOURNAL_TASK_TOOL,
+        handler=handle_rental_add_journal_task,
     ),
 }
 

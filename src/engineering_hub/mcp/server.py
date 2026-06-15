@@ -39,6 +39,7 @@ from fastmcp.server.lifespan import lifespan
 
 from engineering_hub.config.loader import find_config_file
 from engineering_hub.config.settings import Settings
+from engineering_hub.mcp.rental_scout import mcp as rental_scout_mcp
 from engineering_hub.memory import MemoryService
 
 logger = logging.getLogger(__name__)
@@ -73,10 +74,14 @@ mcp = FastMCP(
     instructions=(
         "Engineering Hub memory tools. Use search_brain to find relevant past work, "
         "browse_recent to see latest activity, capture_note to store observations, "
-        "and get_stats for a database overview."
+        "and get_stats for a database overview. Rental scout tools are mounted "
+        "under the rental_ namespace (rental_run_scan, rental_get_top_matches, ...)."
     ),
     lifespan=memory_lifespan,
 )
+
+# Bay Area Rental Scout tools (rental_get_criteria, rental_run_scan, ...)
+mcp.mount(rental_scout_mcp, namespace="rental")
 
 
 @mcp.tool

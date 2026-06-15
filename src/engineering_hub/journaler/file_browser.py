@@ -98,6 +98,20 @@ def browse_skills(skills: list[SkillDef]) -> SkillDef | None:
         return None
 
 
+def browse_models(catalog: list) -> object | None:
+    """Open an interactive MLX model picker (used by ``/model_browse``).
+
+    Returns the selected :class:`~engineering_hub.journaler.model_catalog.ModelCatalogEntry`,
+    or ``None`` on cancel.
+    """
+    if not catalog:
+        return None
+    try:
+        return curses.wrapper(_browse_models_inner, catalog)
+    except Exception:
+        return None
+
+
 def browse_commands(commands: list[CommandEntry]) -> str | None:
     """Open the command palette overlay.
 
@@ -752,6 +766,156 @@ def _browse_skills_inner(
 
         elif key == curses.KEY_END:
             cursor = len(skills) - 1
+
+
+# ---------------------------------------------------------------------------
+# Model picker (used by /model_browse)
+# ---------------------------------------------------------------------------
+
+
+def _browse_models_inner(
+    stdscr: curses.window,
+    catalog: list,
+) -> object | None:
+    from engineering_hub.journaler.model_catalog import format_catalog_entry_line
+
+    _init_colors()
+    curses.curs_set(0)
+    stdscr.keypad(True)
+
+    cursor = 0
+    scroll_offset = 0
+    filter_text = ""
+    filter_mode = False
+
+    while True:
+        stdscr.erase()
+        max_y, max_x = stdscr.getmaxyx()
+
+        query = filter_text.lower()
+        if query:
+            visible = [
+                (i, e)
+                for i, e in enumerate(catalog)
+                if query in e.label.lower()
+                or query in e.load_value.lower()
+                or (e.profile_name and query in e.profile_name.lower())
+            ]
+        else:
+            visible = list(enumerate(catalog))
+
+        header_lines = 2
+        footer_lines = 2
+        list_height = max(1, max_y - header_lines - footer_lines)
+
+        header_text = " Browse: MLX Models"
+        if filter_text:
+            header_text += f"  filter: {filter_text}"
+        stdscr.attron(curses.color_pair(_CP_HEADER) | curses.A_BOLD)
+        stdscr.addnstr(0, 0, "─" * max_x, max_x)
+        stdscr.addnstr(0, 0, header_text, max_x - 1)
+        stdscr.attroff(curses.color_pair(_CP_HEADER) | curses.A_BOLD)
+        stdscr.addnstr(1, 0, "─" * max_x, max_x)
+
+        if not visible:
+            try:
+                stdscr.addnstr(header_lines, 0, "  (no matching models)", max_x - 1, curses.A_DIM)
+            except curses.error:
+                pass
+        else:
+            cursor = max(0, min(cursor, len(visible) - 1))
+            if cursor < scroll_offset:
+                scroll_offset = cursor
+            if cursor >= scroll_offset + list_height:
+                scroll_offset = cursor - list_height + 1
+            scroll_offset = max(0, scroll_offset)
+
+            for i in range(list_height):
+                vi = scroll_offset + i
+                if vi >= len(visible):
+                    break
+                _, entry = visible[vi]
+                row = header_lines + i
+                if row >= max_y - footer_lines:
+                    break
+                is_active = vi == cursor
+                line = format_catalog_entry_line(entry, width=max(20, max_x - 6))
+                if is_active:
+                    marker = f" > {line}"
+                    attr = curses.color_pair(_CP_CURSOR) | curses.A_BOLD
+                else:
+                    marker = f"   {line}"
+                    attr = curses.color_pair(_CP_FILE)
+                try:
+                    stdscr.addnstr(row, 0, marker.ljust(max_x), max_x - 1, attr)
+                except curses.error:
+                    pass
+
+        footer_y = max_y - footer_lines
+        if footer_y > header_lines:
+            try:
+                stdscr.addnstr(footer_y, 0, "─" * max_x, max_x)
+            except curses.error:
+                pass
+            stdscr.attron(curses.color_pair(_CP_FOOTER))
+            controls = " ↑↓ nav  / filter  Enter load  Esc cancel"
+            try:
+                stdscr.addnstr(footer_y + 1, 0, controls, max_x - 1)
+            except curses.error:
+                pass
+            stdscr.attroff(curses.color_pair(_CP_FOOTER))
+
+        stdscr.refresh()
+
+        if filter_mode:
+            curses.echo()
+            curses.curs_set(1)
+            try:
+                stdscr.addnstr(header_lines, 0, " filter: ", max_x - 1)
+                stdscr.refresh()
+                filter_text = ""
+                win = curses.newwin(1, max_x - 10, header_lines, 9)
+                curses.curs_set(1)
+                raw = win.getstr().decode("utf-8", errors="replace").strip()
+                filter_text = raw
+            except Exception:
+                pass
+            finally:
+                curses.noecho()
+                curses.curs_set(0)
+            filter_mode = False
+            cursor = 0
+            scroll_offset = 0
+            continue
+
+        key = stdscr.getch()
+
+        if key in (27, ord("q")):
+            return None
+
+        if key == ord("/"):
+            filter_mode = True
+            continue
+
+        if not visible:
+            continue
+
+        if key == curses.KEY_UP or key == ord("k"):
+            if cursor > 0:
+                cursor -= 1
+        elif key == curses.KEY_DOWN or key == ord("j"):
+            if cursor < len(visible) - 1:
+                cursor += 1
+        elif key == curses.KEY_SR:
+            cursor = max(0, cursor - _FAST_SCROLL_LINES)
+        elif key == curses.KEY_SF:
+            cursor = min(len(visible) - 1, cursor + _FAST_SCROLL_LINES)
+        elif key in (curses.KEY_ENTER, 10, 13):
+            return visible[cursor][1]
+        elif key == curses.KEY_HOME:
+            cursor = 0
+        elif key == curses.KEY_END:
+            cursor = len(visible) - 1
 
 
 # ---------------------------------------------------------------------------

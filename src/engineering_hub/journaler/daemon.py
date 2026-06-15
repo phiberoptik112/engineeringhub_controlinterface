@@ -19,6 +19,7 @@ import schedule
 
 from engineering_hub.config.settings import Settings
 from engineering_hub.journaler.context import JournalContext
+from engineering_hub.journaler.models import ContextSnapshot
 from engineering_hub.journaler.context_manager import PressureConfig
 from engineering_hub.journaler.engine import (
     ConversationalMLXBackend,
@@ -38,12 +39,41 @@ from engineering_hub.journaler.prompts import (
     load_briefing_prompt,
     load_system_prompt,
 )
+from engineering_hub.journaler.briefing_tasks import (
+    BackgroundWorkQueue,
+    BriefingTaskExtractor,
+    _read_recent_chat_context,
+    write_work_status,
+)
+from engineering_hub.journaler.task_integrator import (
+    TaskIntegrator,
+    build_task_integrator,
+)
 from engineering_hub.search import SearchProvider
 
 if TYPE_CHECKING:
     from engineering_hub.journaler.chat_server import ChatServer
+    from engineering_hub.journaler.delegator import AgentDelegator
     from engineering_hub.journaler.slack import SlackPoster
     from engineering_hub.memory.service import MemoryService
+
+TOPIC_SCOUT_PROMPT = """\
+You are the Journaler ambient assistant. The workspace scan just detected \
+meaningful journal or queue changes. Based on the change summary and recent \
+journal context below, produce a short markdown section with:
+
+1. **Conversation starters** — 3–5 bullet questions or topics worth discussing \
+today (reference specific headings or tasks when possible).
+2. **Suggested agent commands** — 1–2 concrete `/agent ...` lines the user could \
+run now (research, technical-writer, standards-checker, weekly-reviewer, etc.).
+
+Keep it under 200 words. No preamble — start with `### Conversation starters`.
+
+Change summary: {change_summary}
+
+Recent journal context:
+{journal_excerpt}
+"""
 
 logger = logging.getLogger(__name__)
 
@@ -150,6 +180,30 @@ class JournalerConfig:
     # org_link_on_relation: when a per-turn semantic match is found, append a
     #   cross-reference link to the current day's journal.
     org_link_on_relation: bool = True
+
+    # Proactive topic scout: one-shot MLX hint when a scan tick detects significant
+    # journal / pending-tasks / output changes.
+    proactive_topic_scout_enabled: bool = True
+    proactive_topic_scout_max_tokens: int = 512
+
+    # Background agent work loop: extracts tasks from briefings, delegates via
+    # AgentDelegator, and tracks progress in a daily work status file.
+    background_work_enabled: bool = False
+    background_work_interval_min: int = 60
+    background_work_max_tasks_per_day: int = 6
+    background_work_auto_approve: bool = False
+    background_work_agent_backend: str = "mlx"
+    background_work_chat_lookback_days: int = 3
+
+    # Task-Integrator: inline call-and-response loop over the daily journal.
+    task_integrator_enabled: bool = False
+    task_integrator_interval_min: int = 15
+    task_integrator_conversation_section: str = "Agent Conversation"
+    task_integrator_output_section: str = "Overnight Agent Tasks"
+    task_integrator_excluded_sections: list[str] | None = None
+    task_integrator_max_questions: int = 3
+    task_integrator_weekdays_only: bool = True
+    task_integrator_max_tokens: int = 1024
 
     def get_pressure_config(self) -> PressureConfig:
         """Return the PressureConfig, defaulting from scalar fields if not set."""
@@ -291,12 +345,39 @@ def run_daemon(config: JournalerConfig, settings: Settings | None = None) -> Non
             if settings is not None else None
         ),
         org_journal_dir=settings.org_journal_dir if settings is not None else None,
+        corpus_service=config.corpus_service,
+        memory_service=config.memory_service,
     )
     skills_suffix = ""
     if delegator is not None:
         skills_suffix = build_skills_block(delegator)
         if skills_suffix:
             engine._system_prompt = engine._system_prompt.rstrip() + "\n\n" + skills_suffix
+
+    # Init background work queue and task extractor
+    work_queue: BackgroundWorkQueue | None = None
+    task_extractor: BriefingTaskExtractor | None = None
+    if config.background_work_enabled:
+        work_queue = BackgroundWorkQueue(config.state_dir / "background_queue")
+        task_extractor = BriefingTaskExtractor(
+            engine=engine,
+            state_dir=config.state_dir,
+            delegator=delegator,
+            chat_lookback_days=config.background_work_chat_lookback_days,
+        )
+        logger.info("Background work loop enabled (interval: %dmin, max tasks/day: %d)",
+                     config.background_work_interval_min,
+                     config.background_work_max_tasks_per_day)
+
+    # Init Task-Integrator (inline call-and-response loop over daily journal)
+    task_integrator: TaskIntegrator | None = None
+    if config.task_integrator_enabled:
+        task_integrator = build_task_integrator(config, engine, delegator)
+        logger.info(
+            "Task-Integrator enabled (interval: %dmin, conversation section: '* %s')",
+            config.task_integrator_interval_min,
+            config.task_integrator_conversation_section,
+        )
 
     # Init optional components
     slack: SlackPoster | None = None
@@ -328,11 +409,13 @@ def run_daemon(config: JournalerConfig, settings: Settings | None = None) -> Non
             delegator=delegator,
             model_context=runtime_model,
             pending_tasks_file=pending_pf,
+            task_integrator=task_integrator,
         )
 
     # Schedule recurring tasks
     schedule.every(config.scan_interval_min).minutes.do(
         _tick,
+        config=config,
         context=context,
         engine=engine,
         system_template=system_template,
@@ -362,6 +445,8 @@ def run_daemon(config: JournalerConfig, settings: Settings | None = None) -> Non
             engine=engine,
             briefing_template=briefing_template,
             slack=slack,
+            task_extractor=task_extractor,
+            work_queue=work_queue,
         )
         logger.info(f"Morning briefing scheduled at {config.briefing_time}")
 
@@ -371,6 +456,8 @@ def run_daemon(config: JournalerConfig, settings: Settings | None = None) -> Non
             config=config,
             context=context,
             engine=engine,
+            task_extractor=task_extractor,
+            work_queue=work_queue,
         )
         logger.info(
             "Discussion briefing scheduled at %s", config.discussion_briefing_time
@@ -381,11 +468,35 @@ def run_daemon(config: JournalerConfig, settings: Settings | None = None) -> Non
             _coordination_scan,
             config=config,
             context=context,
-            engine=engine,
+            delegator=delegator,
         )
         logger.info(
             "Coordination scan scheduled every %d min",
             config.coordination_scan_interval_min,
+        )
+
+    if config.background_work_enabled and work_queue is not None:
+        schedule.every(config.background_work_interval_min).minutes.do(
+            _background_work_tick,
+            config=config,
+            context=context,
+            engine=engine,
+            delegator=delegator,
+            work_queue=work_queue,
+        )
+        logger.info(
+            "Background work loop scheduled every %d min",
+            config.background_work_interval_min,
+        )
+
+    if config.task_integrator_enabled and task_integrator is not None:
+        schedule.every(config.task_integrator_interval_min).minutes.do(
+            _task_integrator_tick,
+            integrator=task_integrator,
+        )
+        logger.info(
+            "Task-Integrator loop scheduled every %d min",
+            config.task_integrator_interval_min,
         )
 
     # Schedule end-of-day context clear
@@ -682,7 +793,58 @@ def generate_summary_now(config: JournalerConfig) -> Path:
 # ---------------------------------------------------------------------------
 
 
+def _topic_hints_path(state_dir: Path, day: date | None = None) -> Path:
+    day_str = (day or date.today()).isoformat()
+    return state_dir / "topic_hints" / f"{day_str}.md"
+
+
+def _briefing_excerpt_for_scout(context: JournalContext, *, max_chars: int = 4000) -> str:
+    """Trim briefing context to recent journal days for the topic scout prompt."""
+    full = context.get_briefing_context()
+    if len(full) <= max_chars:
+        return full
+    return full[:max_chars] + "\n\n...(truncated)..."
+
+
+def _topic_scout_tick(
+    config: JournalerConfig,
+    context: JournalContext,
+    engine: ConversationEngine,
+    snapshot: ContextSnapshot,
+) -> str | None:
+    """One-shot MLX hint after significant journal changes."""
+    try:
+        hint = engine._raw_complete(
+            TOPIC_SCOUT_PROMPT.format(
+                change_summary=snapshot.change_summary,
+                journal_excerpt=_briefing_excerpt_for_scout(context),
+            ),
+            max_tokens=config.proactive_topic_scout_max_tokens,
+        )
+    except Exception as exc:
+        logger.warning("Topic scout failed (non-fatal): %s", exc)
+        return None
+
+    hint = hint.strip()
+    if not hint:
+        return None
+
+    hints_dir = config.state_dir / "topic_hints"
+    hints_dir.mkdir(parents=True, exist_ok=True)
+    path = _topic_hints_path(config.state_dir)
+    stamped = (
+        f"# Topic hints — {date.today().isoformat()}\n\n"
+        f"_Generated {datetime.now().isoformat(timespec='seconds')} "
+        f"after: {snapshot.change_summary}_\n\n"
+        f"{hint}\n"
+    )
+    path.write_text(stamped, encoding="utf-8")
+    logger.info("Topic scout written: %s", path)
+    return hint
+
+
 def _tick(
+    config: JournalerConfig,
     context: JournalContext,
     engine: ConversationEngine,
     system_template: str,
@@ -702,6 +864,16 @@ def _tick(
 
     if snapshot.has_significant_changes:
         logger.info(f"Significant changes detected: {snapshot.change_summary}")
+        if config.proactive_topic_scout_enabled:
+            _topic_scout_tick(config, context, engine, snapshot)
+            refreshed = context.get_current_context()
+            engine.update_context(refreshed)
+            prompt = format_system_prompt(
+                system_template, refreshed, workspace_map=workspace_map
+            )
+            if skills_suffix:
+                prompt = prompt.rstrip() + "\n\n" + skills_suffix
+            engine._system_prompt = prompt
 
 
 def _deep_scan_tick(
@@ -735,12 +907,52 @@ def _deep_scan_tick(
     )
 
 
+def _task_integrator_tick(integrator: TaskIntegrator) -> None:
+    """Run one Task-Integrator cycle (interview / resolution / approval)."""
+    try:
+        result = integrator.run_cycle()
+    except Exception as exc:
+        logger.warning("Task-Integrator cycle failed (non-fatal): %s", exc)
+        return
+    if result.questions_asked or result.proposals_written or result.tasks_queued:
+        logger.info(result.summary())
+    else:
+        logger.debug(result.summary())
+
+
+def _extract_and_queue_tasks(
+    extractor: BriefingTaskExtractor,
+    queue: BackgroundWorkQueue,
+    briefing_text: str,
+    source: str,
+    config: JournalerConfig,
+) -> None:
+    """Extract tasks from a briefing and add them to today's work queue."""
+    try:
+        tasks = extractor.extract(briefing_text, source)
+    except Exception as exc:
+        logger.warning("Task extraction from %s failed: %s", source, exc)
+        return
+    if not tasks:
+        logger.info("No background tasks extracted from %s", source)
+        return
+    added = queue.add_tasks(tasks)
+    logger.info(
+        "Background work: extracted %d tasks from %s, %d new (queue: %s)",
+        len(tasks), source, added,
+        ", ".join(f"{t.suggested_agent}: {t.description[:60]}" for t in tasks[:3]),
+    )
+    write_work_status(config.state_dir, queue)
+
+
 def _morning_briefing(
     config: JournalerConfig,
     context: JournalContext,
     engine: ConversationEngine,
     briefing_template: str,
     slack: SlackPoster | None,
+    task_extractor: BriefingTaskExtractor | None = None,
+    work_queue: BackgroundWorkQueue | None = None,
 ) -> None:
     """Generate and deliver the morning briefing."""
     context.scan()
@@ -766,11 +978,18 @@ def _morning_briefing(
     if slack:
         slack.post_briefing(briefing)
 
+    if task_extractor is not None and work_queue is not None:
+        _extract_and_queue_tasks(
+            task_extractor, work_queue, briefing, "morning_briefing", config
+        )
+
 
 def _discussion_briefing(
     config: JournalerConfig,
     context: JournalContext,
     engine: ConversationEngine,
+    task_extractor: BriefingTaskExtractor | None = None,
+    work_queue: BackgroundWorkQueue | None = None,
 ) -> None:
     """Generate the Topics Discussion Briefing (multi-persona roundtable)."""
     from engineering_hub.journaler.discussion_briefing import (
@@ -784,7 +1003,6 @@ def _discussion_briefing(
 
     personas_dir = config.personas_dir
     if personas_dir is None:
-        # Walk up from this file to find repo root personas/ directory
         here = Path(__file__).parent
         for parent in [here, here.parent, here.parent.parent, here.parent.parent.parent]:
             candidate = parent / "personas"
@@ -820,11 +1038,16 @@ def _discussion_briefing(
     discussion_path.write_text(discussion, encoding="utf-8")
     logger.info("Discussion briefing generated: %s", discussion_path)
 
+    if task_extractor is not None and work_queue is not None:
+        _extract_and_queue_tasks(
+            task_extractor, work_queue, discussion, "discussion_briefing", config
+        )
+
 
 def _coordination_scan(
     config: JournalerConfig,
     context: JournalContext,
-    engine: ConversationEngine,
+    delegator: AgentDelegator | None,
 ) -> None:
     """Run the Coordination Analyst agent against recent journal context.
 
@@ -832,57 +1055,156 @@ def _coordination_scan(
     appends the result to the coordination-liaison persona history store so it
     surfaces in the next discussion briefing.
     """
+    if delegator is None:
+        logger.warning(
+            "Coordination scan skipped: AgentDelegator not available."
+        )
+        return
+
     context.scan()
     today_str = date.today().isoformat()
-
     journal_context = context.get_briefing_context()
 
-    from engineering_hub.agents.worker import AgentWorker
-    from engineering_hub.core.constants import AgentType, TaskStatus
-    from engineering_hub.core.models import ParsedTask
-    from engineering_hub.journaler.delegator import JournalerMLXBackendAdapter
     from engineering_hub.journaler.persona_history import PersonaHistoryStore
 
     try:
-        adapted_backend = JournalerMLXBackendAdapter(engine._backend)
-        worker = AgentWorker(backend=adapted_backend)
-        task = ParsedTask(
-            agent=AgentType.COORDINATION_ANALYST.value,
-            status=TaskStatus.PENDING,
+        output = delegator.delegate(
+            "coordination-analyst",
             description=(
-                f"Scan the provided journal context for client coordination signals, "
-                f"scope drift indicators, and implied engineering tasks. "
+                "Scan the provided journal context for client coordination signals, "
+                "scope drift indicators, and implied engineering tasks. "
                 f"Context date: {today_str}."
             ),
-            start_line=0,
-            end_line=0,
-            raw_block="",
+            backend="mlx",
+            journaler_context=journal_context,
         )
-        result = worker.execute_with_options(task, context=journal_context)
     except Exception as exc:
         logger.warning("Coordination scan failed: %s", exc)
         return
 
-    if not result.success or not result.output:
-        logger.warning("Coordination scan returned no output: %s", result.error_message)
+    if not output or output.strip().startswith("Agent task failed"):
+        logger.warning("Coordination scan returned no output: %s", output[:200])
         return
 
-    # Write output file
     output_dir = config.state_dir / "outputs" / "coordination"
     output_dir.mkdir(parents=True, exist_ok=True)
     output_path = output_dir / f"{today_str}.md"
-    output_path.write_text(result.output, encoding="utf-8")
+    output_path.write_text(output, encoding="utf-8")
     logger.info("Coordination scan written: %s", output_path)
 
-    # Feed result into coordination-liaison persona history
     history_store = PersonaHistoryStore(config.state_dir / "personas")
     history_store.append(
         "coordination-liaison",
         today_str,
         "coordination scan",
-        result.output,
+        output,
         source="coordination_scan",
     )
+
+
+def _background_work_tick(
+    config: JournalerConfig,
+    context: JournalContext,
+    engine: ConversationEngine,
+    delegator: AgentDelegator | None,
+    work_queue: BackgroundWorkQueue,
+) -> None:
+    """Periodic background work loop: pick a task, delegate, track output."""
+    if delegator is None:
+        return
+
+    today_str = date.today().isoformat()
+
+    if work_queue.completed_today_count() >= config.background_work_max_tasks_per_day:
+        logger.debug("Background work: daily task cap reached (%d)",
+                      config.background_work_max_tasks_per_day)
+        return
+
+    task = work_queue.next_pending()
+    if task is None:
+        logger.debug("Background work: no pending tasks in queue")
+        return
+
+    if not config.background_work_auto_approve:
+        logger.info(
+            "Background work: task pending approval — %s (%s agent, %s priority)",
+            task.description[:80], task.suggested_agent, task.priority,
+        )
+        return
+
+    work_queue.mark_in_progress(task.id)
+    logger.info(
+        "Background work: delegating '%s' to %s agent",
+        task.description[:80], task.suggested_agent,
+    )
+
+    briefing_context = context.get_briefing_context()
+    chat_excerpt = _read_recent_chat_context(
+        config.state_dir, lookback_days=config.background_work_chat_lookback_days
+    )
+    enriched_context = briefing_context
+    if chat_excerpt and chat_excerpt != "(no recent chat activity)":
+        enriched_context += f"\n\n### Recent Chat Activity\n{chat_excerpt}"
+
+    try:
+        result = delegator.delegate(
+            task.suggested_agent,
+            task.description,
+            backend=config.background_work_agent_backend,
+            journaler_context=enriched_context,
+        )
+    except Exception as exc:
+        logger.warning("Background work task failed: %s", exc)
+        work_queue.mark_skipped(task.id, reason=f"delegation error: {exc}")
+        write_work_status(config.state_dir, work_queue)
+        return
+
+    if not result or result.strip().startswith("Agent task failed"):
+        work_queue.mark_skipped(task.id, reason="agent returned no output")
+        write_work_status(config.state_dir, work_queue)
+        return
+
+    output_dir = config.state_dir / "outputs" / "background" / today_str
+    output_dir.mkdir(parents=True, exist_ok=True)
+    output_path = output_dir / f"{task.id}.md"
+    output_path.write_text(
+        f"# Background Task: {task.description}\n\n"
+        f"Agent: {task.suggested_agent} | Source: {task.source}\n"
+        f"Priority: {task.priority} | Completed: "
+        f"{datetime.now().isoformat(timespec='seconds')}\n\n"
+        f"---\n\n{result}\n",
+        encoding="utf-8",
+    )
+
+    work_queue.mark_completed(task.id, output_path=str(output_path))
+    write_work_status(config.state_dir, work_queue)
+    logger.info("Background work completed: %s → %s", task.description[:60], output_path)
+
+
+def _read_todays_briefing(config: JournalerConfig) -> str:
+    """Read this morning's briefing for EOD reconciliation."""
+    today_str = date.today().isoformat()
+    output_dir = config.briefing_output_dir or (config.state_dir / "briefings")
+    path = output_dir / f"{today_str}.md"
+    if not path.is_file():
+        return ""
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+        return text[:4000]
+    except OSError:
+        return ""
+
+
+def _read_todays_work_status(config: JournalerConfig) -> str:
+    """Read today's background agent work status."""
+    today_str = date.today().isoformat()
+    path = config.state_dir / "agent_work_status" / f"{today_str}.md"
+    if not path.is_file():
+        return ""
+    try:
+        return path.read_text(encoding="utf-8", errors="replace")[:2000]
+    except OSError:
+        return ""
 
 
 def _end_of_day_clear(
@@ -911,16 +1233,49 @@ def _end_of_day_clear(
         for t in all_turns
     )
 
+    briefing_text = _read_todays_briefing(config)
+    work_status_text = _read_todays_work_status(config)
+    chat_excerpt = _read_recent_chat_context(
+        config.state_dir, lookback_days=0, max_chars=3000
+    )
+
+    eod_prompt_parts = [
+        "Summarize today's activity for archival. ",
+        "Include the following sections:\n\n",
+        "## Planned vs. Done\n",
+        "What the morning briefing identified vs. what was actually accomplished "
+        "(by the user in chat and by background agents). Note which briefing items "
+        "the user actively engaged with in chat vs. which were ignored — this tells "
+        "tomorrow's briefing what matters.\n\n",
+        "## Key Decisions\n",
+        "Important decisions made during the day.\n\n",
+        "## Open Questions\n",
+        "Unresolved questions that carry into tomorrow.\n\n",
+        "## Still Outstanding\n",
+        "Items from the briefing or background queue that weren't addressed and why.\n\n",
+        "## Workflow Friction\n",
+        "Repeated context-switching, unclear task scope, missing information, "
+        "tools or commands that could have helped.\n\n",
+        "## Tomorrow's Seed\n",
+        "1-3 concrete items the morning briefing should prioritize tomorrow, "
+        "based on unfinished work and user engagement patterns.\n\n",
+        "---\n\n",
+    ]
+
+    if briefing_text:
+        eod_prompt_parts.append(f"## Morning Briefing\n{briefing_text}\n\n")
+    if work_status_text:
+        eod_prompt_parts.append(
+            f"## Background Agent Work Status\n{work_status_text}\n\n"
+        )
+    if chat_excerpt and chat_excerpt != "(no recent chat activity)":
+        eod_prompt_parts.append(f"## Chat History (today)\n{chat_excerpt}\n\n")
+    eod_prompt_parts.append(f"## Conversation Turns\n{all_text}")
+
     try:
         summary = engine._raw_complete(
-            f"Summarize today's conversation for archival. "
-            f"Include: (1) key decisions made, (2) open questions, "
-            f"(3) action items, (4) any workflow friction observed "
-            f"(repeated context-switching, unclear task scope, missing information "
-            f"that slowed progress, tools or commands that could have helped), and "
-            f"(5) one concrete workflow improvement to try tomorrow.\n\n"
-            f"{all_text}",
-            max_tokens=800,
+            "".join(eod_prompt_parts),
+            max_tokens=1200,
         )
     except Exception as exc:
         logger.warning(f"End-of-day summary generation failed: {exc}")

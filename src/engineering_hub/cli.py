@@ -30,9 +30,14 @@ from engineering_hub.journaler.engine import (
 )
 from engineering_hub.journaler.model_profiles import (
     JournalerChatModelContext,
+    JournalerModelSpec,
     build_journaler_mlx_backend,
+    effective_generation_max_tokens,
     ensure_spec_model_path,
+    journaler_model_display_label,
     journaler_slash_model_command,
+    model_status_data,
+    parse_model_slash_message,
     resolve_journaler_model_spec,
 )
 from engineering_hub.journaler.timesheet_slash import handle_timesheet_slash_command
@@ -328,6 +333,16 @@ def _execute_journaler_export(
     return 0
 
 
+_NOISY_LOGGERS = (
+    "httpx",
+    "httpcore",
+    "huggingface_hub",
+    "transformers",
+    "sentence_transformers",
+    "urllib3",
+)
+
+
 def setup_logging(verbose: bool = False) -> None:
     """Set up logging with rich handler."""
     level = logging.DEBUG if verbose else logging.INFO
@@ -337,6 +352,9 @@ def setup_logging(verbose: bool = False) -> None:
         datefmt="[%X]",
         handlers=[RichHandler(console=console, rich_tracebacks=True)],
     )
+    if not verbose:
+        for name in _NOISY_LOGGERS:
+            logging.getLogger(name).setLevel(logging.WARNING)
 
 
 def load_settings(config_path: Path | None = None) -> Settings:
@@ -741,6 +759,63 @@ def cmd_mcp_server(args: argparse.Namespace) -> int:
     return 0
 
 
+def _handle_domain_shift_confirmation(
+    engine: ConversationEngine,
+    delegator: object | None,
+    console: Console,
+) -> None:
+    """Display the domain-shift confirmation prompt and act on the user's reply.
+
+    Called after a chat turn when ``engine.domain_shift_detector.pending_shift``
+    is set.  Handles three responses:
+      - ``y`` / ``yes``   → swap persona immediately
+      - ``a`` / ``always`` → swap persona (config persistence is a future enhancement)
+      - anything else     → reject and suppress for the configured number of turns
+    """
+    detector = engine.domain_shift_detector
+    if detector is None or detector.pending_shift is None:
+        return
+
+    shift = detector.pending_shift
+    console.print(
+        f"\n[cyan]Domain shift detected:[/cyan] The conversation appears to be moving "
+        f"toward [bold]{shift.new_domain}[/bold] territory.\n"
+        f"[cyan]Activate[/cyan] [bold]{shift.display_name}[/bold] [cyan]persona?[/cyan] "
+        f"[dim]([y]es / [a]lways / Enter to stay)[/dim]"
+    )
+    try:
+        reply = input("Activate? [y/a/N]: ").strip().lower()
+    except (KeyboardInterrupt, EOFError):
+        reply = ""
+
+    if reply in ("y", "yes", "a", "always"):
+        skill_def = None
+        if delegator is not None and hasattr(delegator, "list_skills"):
+            skill_def = next(
+                (s for s in delegator.list_skills() if s.name == shift.skill_name),
+                None,
+            )
+        if skill_def is not None:
+            swap_note = engine.swap_persona(
+                skill_def.name,
+                skill_def.display_name,
+                skill_def.description,
+            )
+            console.print(f"[green]{escape(swap_note)}[/green]\n")
+        else:
+            detector.reject_shift()
+            console.print(
+                f"[yellow]Could not find skill '{shift.skill_name}'. "
+                "Staying in current persona.[/yellow]\n"
+            )
+    else:
+        detector.reject_shift()
+        console.print(
+            "[dim]Staying in current persona. "
+            f"You can switch manually with /persona {shift.skill_name}[/dim]\n"
+        )
+
+
 def _build_status_bar(engine: ConversationEngine, model_label: str) -> Panel:
     """Render a one-line status panel for the journaler chat loop."""
     status = engine.get_status()
@@ -773,6 +848,27 @@ def _print_chat_markdown(console: Console, text: str) -> None:
     console.print(Markdown(text))
 
 
+def _render_model_status_table(
+    spec: JournalerModelSpec,
+    *,
+    thinking_floor: int = 16_384,
+) -> Table:
+    """Build a Rich Table for ``/model`` status output.
+
+    Three columns: Setting / Current value / How to change.
+    Adjustable settings show the exact ``/model set`` command in the
+    third column so the output is self-documenting.
+    """
+    table = Table(title="Active Model", show_header=True, header_style="bold cyan")
+    table.add_column("Setting", style="cyan", no_wrap=True)
+    table.add_column("Value", style="green")
+    table.add_column("How to change", style="dim")
+
+    for setting, value, how in model_status_data(spec, thinking_floor=thinking_floor):
+        table.add_row(setting, value, how)
+    return table
+
+
 def _handle_chat_slash_command(
     raw: str,
     engine: ConversationEngine,
@@ -785,11 +881,13 @@ def _handle_chat_slash_command(
     export_settings: Settings | None = None,
     export_config: object | None = None,
     export_spec: object | None = None,
+    task_integrator: object | None = None,
 ) -> None:
     """Intercept and execute a /slash command from the journaler chat loop.
 
     Recognised commands:
       /model                     Show or switch HF model (profile or path).
+      /model_browse              Interactive picker for mlx-community models.
       /load <path> [-r]          Load a file or directory into context.
       /load_browse               Interactive file browser for org-roam files.
       /agent_browse              Interactive skill picker for agent delegation.
@@ -801,6 +899,7 @@ def _handle_chat_slash_command(
       /status                    Show context management state (pressure, turns, etc.)
       /budget                    Show token budget breakdown.
       /topic                     Show the currently detected conversation topic.
+      /persona [<name>|reset|list]  Show, swap, reset, or list active Journaler persona.
       /find <title fragment>     Search org-roam files by #+title:.
       /timesheet <hours> project "<project>" :: <description>
                                   Log hours to today's journal, grouped by project.
@@ -836,8 +935,54 @@ def _handle_chat_slash_command(
                 "[yellow]/model requires internal context; if you see this, file a bug.[/yellow]"
             )
             return
-        msg = journaler_slash_model_command(
-            raw,
+        mode, _arg1, _arg2 = parse_model_slash_message(raw)
+        if mode == "status":
+            chat_console.print(
+                _render_model_status_table(
+                    journaler_model_ctx.spec,
+                    thinking_floor=journaler_model_ctx.settings.journaler_thinking_max_tokens,
+                )
+            )
+        else:
+            msg = journaler_slash_model_command(
+                raw,
+                settings=journaler_model_ctx.settings,
+                model_ctx=journaler_model_ctx,
+                engine=engine,
+                delegator=delegator,
+            )
+            chat_console.print(f"[green]{escape(msg)}[/green]")
+        return
+
+    if cmd == "/model_browse":
+        if journaler_model_ctx is None:
+            chat_console.print(
+                "[yellow]/model_browse requires internal context; if you see this, file a bug.[/yellow]"
+            )
+            return
+        from engineering_hub.journaler.file_browser import browse_models
+        from engineering_hub.journaler.model_catalog import build_model_catalog
+        from engineering_hub.journaler.model_profiles import load_model_from_catalog_entry
+
+        catalog = build_model_catalog(
+            journaler_model_ctx.settings,
+            journaler_model_ctx.spec,
+        )
+        if not catalog:
+            chat_console.print(
+                "[yellow]No mlx-community models found in HF cache and no journaler.models "
+                "profiles configured. Run [cyan]engineering-hub journaler download[/cyan] first.[/yellow]"
+            )
+            return
+        chat_console.print(
+            f"[dim]Opening model picker ({len(catalog)} entries)… (Esc or q to cancel)[/dim]"
+        )
+        selected = browse_models(catalog)
+        if selected is None:
+            chat_console.print("[dim]No model selected.[/dim]")
+            return
+        msg = load_model_from_catalog_entry(
+            selected,
             settings=journaler_model_ctx.settings,
             model_ctx=journaler_model_ctx,
             engine=engine,
@@ -1146,6 +1291,7 @@ def _handle_chat_slash_command(
             "  [cyan]/model[/cyan]                     Show active MLX model / profile\n"
             "  [cyan]/model <profile>[/cyan]           Switch to a named journaler.models profile\n"
             "  [cyan]/model path <id-or-path>[/cyan]   Load a Hugging Face id or local path\n"
+            "  [cyan]/model_browse[/cyan]              Browse mlx-community models and profiles\n"
             "  [cyan]/files[/cyan]                     List loaded files\n"
             "  [cyan]/files clear[/cyan]               Remove all loaded files from context\n"
             "  [cyan]/clear[/cyan]                     Clear conversation history (keeps context snapshot)\n"
@@ -1265,6 +1411,98 @@ def _handle_chat_slash_command(
             chat_console.print(f"[cyan]Current topic:[/cyan] {topic}")
         else:
             chat_console.print("[dim]No topic detected yet.[/dim]")
+        return
+
+    if cmd == "/persona":
+        action = parts[1].lower() if len(parts) >= 2 else ""
+
+        if action == "reset":
+            note = engine.reset_persona()
+            chat_console.print(f"[green]{escape(note)}[/green]")
+            return
+
+        if action == "list":
+            if delegator is not None and hasattr(delegator, "list_skills"):
+                skills = delegator.list_skills()
+                domain_skills = [s for s in skills if s.domain]
+                if domain_skills:
+                    chat_console.print("[bold]Domain-aware personas:[/bold]")
+                    for s in sorted(domain_skills, key=lambda x: x.domain):
+                        active_marker = (
+                            " [green](active)[/green]"
+                            if s.name == engine.active_persona
+                            else ""
+                        )
+                        chat_console.print(
+                            f"  [cyan]{s.name}[/cyan]{active_marker} "
+                            f"[dim](domain: {s.domain})[/dim] — "
+                            f"{s.description.splitlines()[0]}"
+                        )
+                else:
+                    chat_console.print(
+                        "[dim]No skills with domain fields loaded. "
+                        "Add 'domain:' to skill YAML files to enable routing.[/dim]"
+                    )
+            else:
+                chat_console.print("[dim]Delegator not available.[/dim]")
+            return
+
+        if not action:
+            if engine.active_persona:
+                chat_console.print(
+                    f"[cyan]Active persona:[/cyan] [bold]{engine.active_persona}[/bold]"
+                )
+                if engine.domain_shift_detector is not None:
+                    chat_console.print(
+                        f"[dim]Active domain:[/dim] "
+                        f"{engine.domain_shift_detector.active_domain or '—'}"
+                    )
+            else:
+                chat_console.print("[dim]No persona active (default Journaler).[/dim]")
+                if engine.domain_shift_detector is not None:
+                    chat_console.print(
+                        "[dim]Use /persona list to see domain-aware personas, "
+                        "/persona <name> to switch.[/dim]"
+                    )
+            return
+
+        # /persona <name> — immediate swap
+        skill_name = action
+        skill_def = None
+        if delegator is not None and hasattr(delegator, "list_skills"):
+            skill_def = next(
+                (s for s in delegator.list_skills() if s.name == skill_name),
+                None,
+            )
+            if skill_def is None:
+                # Try alias resolution
+                resolved = delegator.resolve_agent_type(skill_name) if hasattr(delegator, "resolve_agent_type") else None
+                if resolved:
+                    skill_def = next(
+                        (s for s in delegator.list_skills() if s.name == resolved),
+                        None,
+                    )
+
+        if skill_def is not None:
+            note = engine.swap_persona(
+                skill_def.name,
+                skill_def.display_name,
+                skill_def.description,
+            )
+            chat_console.print(f"[green]{escape(note)}[/green]")
+        else:
+            available = (
+                ", ".join(
+                    s.name for s in delegator.list_skills() if s.domain
+                )
+                if delegator is not None and hasattr(delegator, "list_skills")
+                else "none"
+            )
+            chat_console.print(
+                f"[yellow]Unknown persona '{skill_name}'.[/yellow] "
+                f"Available domain personas: {available or '(none loaded)'}\n"
+                "[dim]Use /persona list to see all options.[/dim]"
+            )
         return
 
     if cmd == "/load":
@@ -1610,6 +1848,26 @@ def _handle_chat_slash_command(
             chat_console.print(f"[green]Opened for /edit:[/green] {res}")
         return
 
+    if cmd == "/integrate":
+        if task_integrator is None:
+            chat_console.print(
+                "[yellow]/integrate requires a configured Task-Integrator "
+                "(start from a configured workspace).[/yellow]"
+            )
+            return
+        sub = parts[1].lower() if len(parts) > 1 else ""
+        if sub == "status":
+            chat_console.print(f"[green]{escape(task_integrator.status_summary())}[/green]")
+            return
+        chat_console.print("[dim]Running Task-Integrator cycle…[/dim]")
+        result = task_integrator.run_cycle()
+        chat_console.print(f"[green]{escape(result.summary())}[/green]")
+        chat_console.print(
+            f"[dim]Review and reply inline under "
+            f"'* {task_integrator.conversation_section}' in today's journal.[/dim]"
+        )
+        return
+
     chat_console.print(
         f"[yellow]Unknown command '{cmd}'. Type /help for available commands.[/yellow]"
     )
@@ -1621,13 +1879,13 @@ def cmd_journaler(args: argparse.Namespace) -> int:
     if sub is None:
         console.print(
             "[yellow]Usage: engineering-hub journaler"
-            " {start|chat|briefing|summarize|export|status|scan|clear|download|pipeline}[/yellow]"
+            " {start|chat|tui|briefing|summarize|export|status|scan|clear|download|pipeline}[/yellow]"
         )
         return 1
 
     settings = load_settings(args.config)
 
-    needs_model = sub in ("start", "chat", "summarize") or (
+    needs_model = sub in ("start", "chat", "tui", "summarize") or (
         sub == "briefing" and not getattr(args, "latest", False)
     ) or (sub == "export" and getattr(args, "summarize", False))
 
@@ -1702,7 +1960,10 @@ def cmd_journaler(args: argparse.Namespace) -> int:
         slack_enabled=settings.journaler_slack_enabled,
         slack_webhook_url=settings.journaler_slack_webhook_url,
         max_conversation_history=settings.journaler_max_conversation_history,
-        max_tokens=spec.max_tokens,
+        max_tokens=effective_generation_max_tokens(
+            spec,
+            thinking_floor=settings.journaler_thinking_max_tokens,
+        ),
         model_context_window=spec.model_context_window,
         context_management=pressure_config_from_settings(
             settings,
@@ -1749,6 +2010,24 @@ def cmd_journaler(args: argparse.Namespace) -> int:
         discussion_max_tokens_per_persona=settings.journaler_discussion_max_tokens_per_persona,
         coordination_scan_enabled=settings.journaler_coordination_scan_enabled,
         coordination_scan_interval_min=settings.journaler_coordination_scan_interval_min,
+        proactive_topic_scout_enabled=settings.journaler_proactive_topic_scout_enabled,
+        proactive_topic_scout_max_tokens=settings.journaler_proactive_topic_scout_max_tokens,
+        background_work_enabled=settings.journaler_background_work_enabled,
+        background_work_interval_min=settings.journaler_background_work_interval_min,
+        background_work_max_tasks_per_day=settings.journaler_background_work_max_tasks_per_day,
+        background_work_auto_approve=settings.journaler_background_work_auto_approve,
+        background_work_agent_backend=settings.journaler_background_work_agent_backend,
+        background_work_chat_lookback_days=settings.journaler_background_work_chat_lookback_days,
+        task_integrator_enabled=settings.journaler_task_integrator_enabled,
+        task_integrator_interval_min=settings.journaler_task_integrator_interval_min,
+        task_integrator_conversation_section=settings.journaler_task_integrator_conversation_section,
+        task_integrator_output_section=settings.journaler_task_integrator_output_section,
+        task_integrator_excluded_sections=list(
+            settings.journaler_task_integrator_excluded_sections
+        ),
+        task_integrator_max_questions=settings.journaler_task_integrator_max_questions,
+        task_integrator_weekdays_only=settings.journaler_task_integrator_weekdays_only,
+        task_integrator_max_tokens=settings.journaler_task_integrator_max_tokens,
     )
 
     if sub == "start":
@@ -1858,11 +2137,23 @@ def cmd_journaler(args: argparse.Namespace) -> int:
             proposal_dir=settings.zettelkasten_resolved_proposal_dir,
             zettel_state_path=settings.journaler_state_dir / "zettelkasten_state.json",
             org_journal_dir=settings.org_journal_dir,
+            corpus_service=config.corpus_service,
+            memory_service=config.memory_service,
         )
         if delegator is not None:
             skills_text = build_skills_block(delegator)
             if skills_text:
                 engine._system_prompt = engine._system_prompt.rstrip() + "\n\n" + skills_text
+            # Sync base_system_prompt so persona swaps preserve the skills block.
+            engine.base_system_prompt = engine._system_prompt
+            # Wire domain-shift detection to the loaded skills.
+            from engineering_hub.journaler.context_manager import DomainShiftDetector
+            skills_map = {s.name: s for s in delegator.list_skills()}
+            engine.domain_shift_detector = DomainShiftDetector(skills_map)
+
+        from engineering_hub.journaler.task_integrator import build_task_integrator
+
+        task_integrator = build_task_integrator(config, engine, delegator)
 
         configure_chat_readline(
             config.state_dir,
@@ -1871,11 +2162,10 @@ def cmd_journaler(args: argparse.Namespace) -> int:
 
         transcript_path = config.state_dir / "conversation.jsonl"
         max_hist = config.max_conversation_history
-        model_label = spec.profile_name or Path(spec.model_path).name
         console.print(
             "[green]Journaler ready. "
             "Type your questions (Ctrl-C, /exit, or exit to leave).[/green]\n"
-            "[dim]Tip: /agent and /skills for agent personas; /model to switch profile; "
+            "[dim]Tip: /agent and /skills for agent personas; /model_browse to switch model; "
             "/load for files; /load_browse to browse; /help for commands.[/dim]\n"
             "[dim]Ctrl+P opens the command palette. Tab completes slash commands.[/dim]\n"
             "[dim]Context: /status, /budget, /topic — "
@@ -1885,7 +2175,11 @@ def cmd_journaler(args: argparse.Namespace) -> int:
             f"Longer model memory: raise journaler.max_conversation_history "
             f"(now {max_hist}).[/dim]\n"
         )
-        console.print(_build_status_bar(engine, model_label))
+        console.print(
+            _build_status_bar(
+                engine, journaler_model_display_label(chat_model_ctx.spec)
+            )
+        )
         log = logging.getLogger(__name__)
         try:
             while True:
@@ -1916,6 +2210,7 @@ def cmd_journaler(args: argparse.Namespace) -> int:
                             export_settings=settings,
                             export_config=config,
                             export_spec=spec,
+                            task_integrator=task_integrator,
                         )
                     except JournalerChatExit:
                         break
@@ -1925,7 +2220,12 @@ def cmd_journaler(args: argparse.Namespace) -> int:
                             f"[red]Command failed:[/red] {escape(str(exc))}\n"
                             "[dim]Type /help for commands. You can keep chatting.[/dim]\n"
                         )
-                    console.print(_build_status_bar(engine, model_label))
+                    console.print(
+                        _build_status_bar(
+                            engine,
+                            journaler_model_display_label(chat_model_ctx.spec),
+                        )
+                    )
                     continue
                 try:
                     from engineering_hub.journaler.chat_router import (
@@ -1954,10 +2254,28 @@ def cmd_journaler(args: argparse.Namespace) -> int:
                         console.print("\n[bold]Journaler:[/bold]")
                         _print_chat_markdown(console, routed_result.response)
                         console.print()
-                        console.print(_build_status_bar(engine, model_label))
+                        console.print(
+                            _build_status_bar(
+                                engine,
+                                journaler_model_display_label(chat_model_ctx.spec),
+                            )
+                        )
                         continue
 
-                    raw_response = engine.chat(user_input)
+                    # Observe the message for domain shifts before the model call.
+                    if engine.domain_shift_detector is not None:
+                        engine.domain_shift_detector.observe(user_input)
+
+                    if chat_model_ctx.spec.streaming:
+                        console.print("\n[bold]Journaler:[/bold]")
+                        _chunks: list[str] = []
+                        for _tok in engine.stream_chat(user_input):
+                            console.print(_tok, end="", highlight=False)
+                            _chunks.append(_tok)
+                        console.print()
+                        raw_response = "".join(_chunks)
+                    else:
+                        raw_response = engine.chat(user_input)
                 except Exception as exc:
                     log.exception("Journaler chat turn failed")
                     console.print(
@@ -1972,8 +2290,13 @@ def cmd_journaler(args: argparse.Namespace) -> int:
                 )
 
                 response, dispatch_cmd = _extract_dispatch(raw_response)
-                console.print("\n[bold]Journaler:[/bold]")
-                _print_chat_markdown(console, response)
+                if not chat_model_ctx.spec.streaming:
+                    console.print("\n[bold]Journaler:[/bold]")
+                    _print_chat_markdown(console, response)
+                else:
+                    # In streaming mode the tokens were already printed above;
+                    # still parse for dispatch commands but skip re-printing.
+                    pass
                 console.print()
 
                 if dispatch_cmd and ctx is not None:
@@ -2002,10 +2325,116 @@ def cmd_journaler(args: argparse.Namespace) -> int:
                     else:
                         console.print("[dim]Dispatch cancelled.[/dim]\n")
 
-                console.print(_build_status_bar(engine, model_label))
+                # Domain shift confirmation — propose persona swap when warranted.
+                if (
+                    engine.domain_shift_detector is not None
+                    and engine.domain_shift_detector.pending_shift is not None
+                ):
+                    _handle_domain_shift_confirmation(
+                        engine, delegator, console
+                    )
+
+                console.print(
+                    _build_status_bar(
+                        engine, journaler_model_display_label(chat_model_ctx.spec)
+                    )
+                )
         except (KeyboardInterrupt, EOFError):
             pass
         console.print("\n[dim]Chat ended.[/dim]")
+        return 0
+
+    elif sub == "tui":
+        from engineering_hub.journaler.delegator import build_delegator
+        from engineering_hub.journaler.engine import ConversationEngine
+        from engineering_hub.journaler.prompts import (
+            build_skills_block,
+            build_workspace_layout,
+            format_system_prompt,
+            load_system_prompt,
+        )
+
+        console.print("[bold]Loading Journaler for TUI mode...[/bold]")
+        backend = build_journaler_mlx_backend(spec)
+        ctx = JournalContext(
+            org_roam_dir=config.org_roam_dir,
+            journal_dir=config.journal_dir,
+            workspace_dir=config.workspace_dir,
+            memory_service=config.memory_service,
+            state_dir=config.state_dir,
+            watch_dirs=config.watch_dirs,
+            scan_org_roam_tree=config.scan_org_roam_tree,
+            journal_lookback_days=config.journal_lookback_days,
+            journal_max_files=config.journal_max_files,
+            pending_tasks_file=settings.resolved_journaler_pending_tasks_file,
+            conversation_lookback_days=config.conversation_lookback_days,
+            conversation_summary_excerpt_chars=config.conversation_summary_excerpt_chars,
+        )
+        ctx.scan()
+
+        system_template = load_system_prompt(config.state_dir)
+        workspace_map = build_workspace_layout(
+            config.org_roam_dir, config.workspace_dir, config.journal_dir
+        )
+        system_prompt = format_system_prompt(
+            system_template,
+            ctx.get_current_context(),
+            workspace_map=workspace_map,
+        )
+        pressure_cfg_tui = config.get_pressure_config()
+        engine = ConversationEngine(
+            backend=backend,
+            system_prompt=system_prompt,
+            log_dir=config.state_dir,
+            max_history=config.max_conversation_history,
+            max_tokens=config.max_tokens,
+            pressure_config=pressure_cfg_tui,
+            model_context_window=config.model_context_window,
+            corpus_service=config.corpus_service,
+            load_file_budget=config.get_load_file_budget(),
+            memory_service=config.memory_service,
+            journal_dir=config.journal_dir,
+            relation_threshold=pressure_cfg_tui.conversation_relation_threshold,
+            org_link_on_relation=config.org_link_on_relation,
+            web_search_provider=config.web_search_provider,
+            web_search_enabled=config.web_search_enabled,
+            web_search_max_results=config.web_search_max_results,
+            web_search_max_chars=config.web_search_max_chars,
+            web_search_anthropic_backup_enabled=config.web_search_anthropic_backup_enabled,
+            web_search_anthropic_tool_version=config.web_search_anthropic_tool_version,
+            web_search_anthropic_max_uses=config.web_search_anthropic_max_uses,
+        )
+
+        delegator = build_delegator(
+            backend,
+            anthropic_api_key=settings.journaler_delegation_api_key(),
+            skills_dir=config.skills_dir,
+            default_backend=config.agent_backend,
+            output_dir=config.workspace_dir / "outputs",
+            proposal_dir=settings.zettelkasten_resolved_proposal_dir,
+            zettel_state_path=settings.journaler_state_dir / "zettelkasten_state.json",
+            org_journal_dir=settings.org_journal_dir,
+            corpus_service=config.corpus_service,
+            memory_service=config.memory_service,
+        )
+        if delegator is not None:
+            skills_text = build_skills_block(delegator)
+            if skills_text:
+                engine._system_prompt = engine._system_prompt.rstrip() + "\n\n" + skills_text
+
+        chat_model_ctx = JournalerChatModelContext(settings, spec)
+        model_label = spec.profile_name or Path(spec.model_path).name
+
+        from engineering_hub.journaler.tui import run_tui
+
+        run_tui(
+            engine=engine,
+            delegator=delegator,
+            config=config,
+            model_label=model_label,
+            settings=settings,
+            model_ctx=chat_model_ctx,
+        )
         return 0
 
     elif sub == "briefing":
@@ -2075,17 +2504,21 @@ def cmd_journaler(args: argparse.Namespace) -> int:
                     backend=config.mlx_backend,
                     enable_thinking=config.enable_thinking,
                 )
-                eng = ConversationEngine(
-                    backend=backend,
-                    system_prompt="You are the Journaler.",
-                    log_dir=config.state_dir,
-                    max_tokens=config.max_tokens,
-                    pressure_config=config.get_pressure_config(),
-                    model_context_window=config.model_context_window,
+                from engineering_hub.journaler.delegator import build_delegator
+
+                delegator = build_delegator(
+                    backend,
+                    anthropic_api_key=settings.journaler_delegation_api_key(),
+                    skills_dir=config.skills_dir,
+                    default_backend=config.agent_backend,
+                    output_dir=config.workspace_dir / "outputs",
+                    proposal_dir=settings.zettelkasten_resolved_proposal_dir,
+                    zettel_state_path=settings.journaler_state_dir / "zettelkasten_state.json",
+                    org_journal_dir=settings.org_journal_dir,
                     corpus_service=config.corpus_service,
-                    load_file_budget=config.get_load_file_budget(),
+                    memory_service=config.memory_service,
                 )
-                _coordination_scan(config=config, context=ctx, engine=eng)
+                _coordination_scan(config=config, context=ctx, delegator=delegator)
                 output_dir = config.state_dir / "outputs" / "coordination"
                 from datetime import date as _date
                 today_str = _date.today().isoformat()
@@ -3370,6 +3803,9 @@ def main() -> int:
     journaler_sub = journaler_parser.add_subparsers(dest="journaler_command")
     journaler_sub.add_parser("start", help="Start the Journaler daemon")
     journaler_sub.add_parser("chat", help="Interactive chat with the Journaler model")
+    journaler_sub.add_parser(
+        "tui", help="Full-screen Textual TUI with sidebar navigation and command menus"
+    )
 
     briefing_p = journaler_sub.add_parser("briefing", help="Generate or view a briefing")
     briefing_p.add_argument(

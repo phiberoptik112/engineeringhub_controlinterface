@@ -98,6 +98,17 @@ roam:
 staging:
   manifest_name: "manifest.json"
 
+# ── Rental Scout (Bay Area rental search agent) ───────────────────
+# Workspace holding the rental-scout pipeline (main.py) and its artifacts:
+# criteria.yaml, seen_listings.db, latest_digest.json.
+# Exposed to journaler agents via /agent rental-scout and to external MCP
+# clients via the rental-scout tools mounted in `engineering-hub mcp-server`.
+# rental_scout:
+#   workspace_dir: "~/dev/rental_scout"
+#   # Python for run_scan subprocesses. Defaults to {workspace_dir}/.venv/bin/python
+#   # when that venv exists, otherwise the engineering-hub interpreter.
+#   # python_path: "~/dev/rental_scout/.venv/bin/python"
+
 # ── MLX local model (Apple Silicon) ───────────────────────────────
 # Used when llm_provider is "mlx". Install with: pip install 'engineering-hub[mlx]'
 # Gemma 4 is a Vision-Language Model (VLM) — the engine auto-detects this and
@@ -252,7 +263,7 @@ chunking:
 #   # selects which entry to use. Override on the CLI:
 #   #   engineering-hub journaler --profile reasoning chat
 #   #   engineering-hub journaler --model mlx-community/other-id start
-#   # In chat (CLI or HTTP): /model , /model reasoning , /model path <hf-id>
+#   # In chat (CLI or HTTP): /model , /model_browse , /model reasoning , /model path <hf-id>
 #   #
 #   # The "reasoning" profile activates Qwen3 thinking mode, which produces
 #   # more exploratory, self-reflective responses at the cost of additional
@@ -272,6 +283,12 @@ chunking:
 #       temp: 0.6
 #       top_p: 0.95
 #       enable_thinking: true       # activates Qwen3 extended thinking template
+#       max_tokens: 4096            # base budget (non-thinking fallback)
+#       thinking_max_tokens: 16384  # optional explicit override when thinking is on
+#
+#   # Minimum generation budget when enable_thinking is true (thinking + answer
+#   # share one cap). Profiles may override with thinking_max_tokens per profile.
+#   # thinking_max_tokens: 16384
 #
 #   # The model's actual context window in tokens.
 #   # Used by the context pressure manager to calculate utilization.
@@ -296,12 +313,50 @@ chunking:
 #   # coordination_scan_enabled: false
 #   # coordination_scan_interval_min: 0    # 0 = disabled; e.g. 240 = every 4h
 #
+#   # Proactive topic scout: MLX one-shot when a scan tick detects journal changes
+#   # proactive_topic_scout_enabled: true
+#   # proactive_topic_scout_max_tokens: 512
+#
+#   # Background agent work loop: extracts tasks from briefings, delegates via
+#   # AgentDelegator, tracks progress in a daily work status file, and feeds
+#   # results into the end-of-day summary for tomorrow's briefing.
+#   # background_work_enabled: false         # off by default; opt in to activate
+#   # background_work_interval_min: 60       # how often the work loop checks the queue
+#   # background_work_max_tasks_per_day: 6   # cap to avoid runaway model usage
+#   # background_work_auto_approve: false     # when true, auto-delegates without confirmation
+#   # background_work_agent_backend: "mlx"   # "mlx" | "claude" | "auto"
+#   # background_work_chat_lookback_days: 3  # days of conversation.jsonl for priority signals
+#
+#   # Task-Integrator: inline call-and-response loop over the daily journal.
+#   # Reads the whole day's note (minus the agent-managed sections below),
+#   # interviews you inline under "* Agent Conversation", and after you reply
+#   # inline, proposes ready-to-run @agent: tasks behind a checkbox. Ticking a
+#   # box queues the task to "* Overnight Agent Tasks" for the Orchestrator —
+#   # so you never have to remember the delegation syntax. Run a cycle on demand
+#   # with /integrate (or /integrate status) in journaler chat.
+#   # task_integrator_enabled: false           # off by default; opt in to activate
+#   # task_integrator_interval_min: 15         # how often a cycle runs in the daemon
+#   # task_integrator_conversation_section: "Agent Conversation"  # where Q&A/proposals are written
+#   # task_integrator_output_section: "Overnight Agent Tasks"     # where approved tasks are queued
+#   # task_integrator_excluded_sections:       # daily-note headings treated as agent-managed (not intake)
+#   #   - "Agent Conversation"
+#   #   - "Overnight Agent Tasks"
+#   #   - "Completed Agent Tasks"
+#   #   - "Pending Agent Tasks"
+#   #   - "Timesheet"
+#   #   - "Journaler Cross-References"
+#   # task_integrator_max_questions: 3         # interview questions per topic
+#   # task_integrator_weekdays_only: true      # only queue approved tasks Mon-Fri
+#   # task_integrator_max_tokens: 1024         # model budget per interview/resolution call
+#
 #   # Daily conversation summary (end-of-day archive + /summarize command)
 #   end_of_day_time: "15:30"     # local time (HH:MM); default 15:30
 #                                # use 'journaler summarize' or /summarize to trigger on demand
 #
 #   # Scan scope: when false, only journal.org_journal_dir + watch_dirs are scanned
 #   # for *.org (not the full roam tree). Large journal years: pair with lookback below.
+#   # Incremental diff uses SHA-256 content hashes (state.json file_hashes); mtime-only
+#   # bumps are ignored. "Significant changes" logs are journal + pending-tasks + outputs only.
 #   # scan_org_roam_tree: true
 #   # watch_dirs: []             # extra org directories to rglob, e.g. ["~/org-roam/projects"]
 #   # journal_lookback_days: 30  # daily journal files within this many days (with cap)

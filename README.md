@@ -7,7 +7,7 @@ A persistent, agent-first workspace enabling collaboration between engineers and
 Engineering Hub provides two complementary modes of AI collaboration:
 
 1. **Orchestrator** (task-driven) -- watches your org-roam **daily journal** and the Journaler-owned **`pending-tasks.org`** queue for `@agent:` task lines, dispatches work to specialized agents via Claude API, local MLX models, or an Ollama server, and writes results back to the workspace. Optionally runs agent tasks in **Docker containers** for isolation.
-2. **Journaler** (ambient) -- a persistent daemon that runs a local ~32B model via MLX, continuously monitors your org-roam workspace, delivers morning briefings, and responds to ad-hoc questions through **`engineering-hub journaler chat`** (interactive) and an **HTTP** chat endpoint when the daemon is running.
+2. **Journaler** (ambient) -- a persistent daemon that runs a local ~32B model via MLX, continuously monitors your org-roam workspace, delivers morning briefings, and responds to ad-hoc questions through **`engineering-hub journaler chat`** (readline), **`engineering-hub journaler tui`** (full-screen Textual interface with sidebar navigation and quick context loading), and an **HTTP** chat endpoint when the daemon is running.
 
 They coexist cleanly: the Orchestrator processes explicit tasks while the Journaler maintains ambient awareness. The Journaler can read the full org-roam workspace, write to daily journals and roam nodes via slash commands where appropriate, and **delegate agent work** using **`/agent`**, **natural-language turns** (in **immediate** mode), or an **overnight queue** (`/queue`, `/tasks`) that writes only to **`pending-tasks.org`** — not to your daily journal. Delegation uses local MLX or Claude API execution.
 
@@ -25,6 +25,7 @@ They coexist cleanly: the Orchestrator processes explicit tasks while the Journa
 - **Task planner & overnight queue**: **`/queue`** and **`/tasks`** manage proposals and commits to **`pending-tasks.org`**; **`journaler.default_task_mode`** chooses **immediate** (inline / classifier-driven delegation) vs **propose** (`DISPATCH:` + confirmation). Morning briefings include a short summary of recent queue activity when present
 - **Skills System**: Extensible `skills/` directory of YAML files defines each agent personality's capabilities; drop a new `.yaml` to add a delegation skill without code changes
 - **Report Drafting Pipeline**: `/pipeline draft-section` chains technical-writer → standards-checker (loop-back) → technical-reviewer → latex-writer into a single command; receives pre-computed result tables from external scripts and produces a reviewed LaTeX section artifact — no calculation inside the pipeline
+- **TUI Mode**: Full-screen Textual interface (`journaler tui`) with sidebar category navigation, clickable command cards, fuzzy command palette (`Ctrl+P`), and quick context loading panel (`Ctrl+L`) for journals, briefings, project notes, and prompt histories
 - **Context Management**: Token-aware conversation history with automatic compression, topic-shift archival, end-of-day reset, and manual `/clear` controls — keeps the local model coherent across a full workday
 - **Org-Roam Write Skill**: Journaler chat can write properly-formatted org-roam files — add TODOs, mark tasks done, append notes to today's journal (`/note`), set a session target on any roam note (`/open`), append under a heading there (`/edit`), search by title (`/find`), and create new nodes — via slash commands
 - **Journaler Export**: CLI `journaler export` reads the persisted chat transcript (`conversation.jsonl`) and writes org-roam-friendly output to **stdout** by default (raw per-turn org, optional MLX **summary + open TODOs**); use `--note`, `--find-title`, `-o`, or `--new-node` for file targets. In **`journaler chat`**, bare **`/export`** writes under **`conversation_exports/`** in the configured org-roam root unless you pass one of those targets.
@@ -38,6 +39,7 @@ They coexist cleanly: the Orchestrator processes explicit tasks while the Journa
 
 - Python 3.11+
 - Access to Anthropic API (Claude), a local MLX model on Apple Silicon, or an Ollama server
+- [Textual](https://textual.textualize.io/) ≥ 3.0 (installed automatically with `pip install -e .`)
 - Django consultingmanager backend (optional, for full project context)
 - Ollama with `nomic-embed-text` (optional, for memory/embeddings and PDF corpus query embeddings; also serves as a generation backend)
 - **libraryfiles-corpus** (optional, `pip install -e …`) plus a built `corpus.db` when using PDF reference RAG
@@ -103,6 +105,9 @@ engineering-hub journaler start
 
 # Interactive chat (loads model, no daemon)
 engineering-hub journaler chat
+
+# Full-screen TUI with sidebar navigation, command menus, and quick context loading
+engineering-hub journaler tui
 
 # Generate a morning briefing on demand
 engineering-hub journaler briefing
@@ -249,7 +254,14 @@ engineeringhub_controlinterface/
 │   │   ├── task_planner_models.py   # ProposedTask, TaskPlannerSession
 │   │   ├── task_slash.py    # /tasks and /queue handlers
 │   │   ├── slack.py         # Slack webhook poster
-│   │   └── models.py        # ContextSnapshot, ScanState, OrgEntry
+│   │   ├── models.py        # ContextSnapshot, ScanState, OrgEntry
+│   │   └── tui/             # Full-screen Textual TUI interface
+│   │       ├── app.py           # JournalerApp main application
+│   │       ├── command_executor.py # Presentation-independent slash command dispatch
+│   │       ├── load_tracker.py  # File access frequency persistence
+│   │       ├── screens/         # Modal screens (palette, command input, sub-menus)
+│   │       ├── widgets/         # Sidebar, command cards, chat view, status bar, context panel
+│   │       └── styles/          # Textual CSS theming
 │   ├── mcp/             # FastMCP server integration
 │   ├── memory/          # Vector memory (SQLite + Ollama embeddings)
 │   ├── notes/           # Journal/org-roam parsing and task dispatch
@@ -272,7 +284,7 @@ The Journaler is a persistent daemon that runs a local ~32B model on Apple Silic
 
 ### How It Works
 
-- **Scans** org-roam (full tree or only `journal.org_journal_dir` plus optional `journaler.watch_dirs`) every 10 minutes (mtime-based incremental diff)
+- **Scans** org-roam (full tree or only `journal.org_journal_dir` plus optional `journaler.watch_dirs`) every 10 minutes using **content-hash incremental diff** (SHA-256 per file, canonical resolved paths in `state.json`). Mtime-only bumps (sync tools, metadata touches) are ignored. **Significant changes** — the lines logged on each tick — are limited to daily journal edits, `pending-tasks.org`, and `workspace/outputs/*.md`; roam-tree note updates are tracked quietly in scan stats only
 - **Extracts** headings, TODO/DONE items, timestamps, and `@agent:` tasks from `.org` files
 - **Reads** recent agent outputs from `memory.db` via `MemoryService.browse_recent()`
 - **Compresses** everything into a rolling context snapshot (~4000 tokens)
@@ -280,6 +292,8 @@ The Journaler is a persistent daemon that runs a local ~32B model on Apple Silic
 - **Loads agent personas** from `skills/*.yaml`: a concise **skills block** (display name, description, when-to-use, example `/agent` lines) is appended to the system prompt for **both** `journaler start` and **`journaler chat`**. On the daemon, each scheduled org-roam scan refreshes the rolling context snapshot **and re-attaches** that skills block so personas are not dropped mid-run
 - **Uses** `journaler.agent_backend`, optional `journaler.skills_dir`, and optional `journaler.anthropic_api_key` (else `anthropic.api_key` / `ENGINEERING_HUB_ANTHROPIC_API_KEY`) for delegation — same resolution for daemon and interactive chat
 - **Generates** a morning briefing at a configurable time (default 9:00 AM), with concise 2-3 sentence items that emphasize trends across the journal window and an extra **pending-tasks.org** summary when recent queue timestamps appear in that file
+- **Runs a proactive topic scout** on significant scan ticks (journal / pending-tasks / output changes): one light MLX call writes `topic_hints/YYYY-MM-DD.md` and injects **Topic hints (auto)** into the live system prompt for HTTP chat
+- **Delegates** scheduled coordination scans through the same `AgentDelegator` as `/agent` (local MLX by default, with corpus/memory when configured)
 - **Responds** to ad-hoc questions via an HTTP chat endpoint on `localhost:18790`
 - **Writes** to daily journals and org-roam nodes via slash commands where intended; **overnight queue** tasks go only to **`pending-tasks.org`** (see **`/tasks`** / **`/queue`**)
 - **Posts** briefings and alerts to Slack via incoming webhooks (optional)
@@ -296,7 +310,7 @@ journaler:
   scan_interval_min: 10
   briefing_enabled: true
   briefing_time: "09:00"
-  # scan_org_roam_tree: true        # false = only journal.org_journal_dir + watch_dirs
+  # scan_org_roam_tree: true        # false = only journal.org_journal_dir + watch_dirs (faster; significance is content-based either way)
   # journal_lookback_days: 30
   # journal_max_files: 30
   # watch_dirs: []
@@ -346,6 +360,18 @@ journaler:
   # Coordination Analyst scheduled scan (disabled by default)
   # coordination_scan_enabled: false
   # coordination_scan_interval_min: 0    # 0 = disabled; e.g. 240 = every 4h
+
+  # Proactive topic scout — one-shot MLX hint when a scan tick detects journal changes
+  # proactive_topic_scout_enabled: true
+  # proactive_topic_scout_max_tokens: 512
+
+  # Background agent work loop (disabled by default)
+  # background_work_enabled: false
+  # background_work_interval_min: 60
+  # background_work_max_tasks_per_day: 6
+  # background_work_auto_approve: false
+  # background_work_agent_backend: "mlx"
+  # background_work_chat_lookback_days: 3
 ```
 
 `model_path` is optional: if omitted, the Journaler falls back to `mlx.model_path` (the orchestrator MLX path), then to a built-in default (`mlx-community/gemma-4-31b-it-8bit`). Use `journaler download` after changing paths.
@@ -379,11 +405,14 @@ journaler:
       temp: 0.6
       top_p: 0.95
       enable_thinking: true
+      thinking_max_tokens: 16384   # optional; omit to use journaler.thinking_max_tokens floor
 ```
+
+**Thinking mode token budget:** Qwen3 thinking models emit a long internal reasoning block before the visible answer. Both share a single `max_tokens` cap passed to MLX. When `enable_thinking: true`, Journaler automatically uses at least **`journaler.thinking_max_tokens`** (default **16384**) unless the profile sets `thinking_max_tokens` or you raise it live with `/model set max_tokens <n>`. Check `/model` for **effective max_tokens** when thinking is on. Higher output budgets also increase **reserved for generation** in `/budget`, leaving less headroom for `/load` and history.
 
 Switching models at runtime (without restarting):
 
-- **Interactive chat:** `/model` (status), `/model reasoning` (named profile), `/model path <hf-id-or-path>` (one-off path).
+- **Interactive chat:** `/model` (status), `/model_browse` (picker for mlx-community cache + profiles), `/model reasoning` (named profile), `/model path <hf-id-or-path>` (one-off path). Cache folder names like `models--mlx-community--…` are normalized automatically when pasted after `/model path`.
 - **HTTP chat (daemon):** send the same text as the JSON `message`, e.g. `{"message": "/model reasoning"}`. Slash commands **`/agent`**, **`/tasks`**, **`/queue`**, **`/skills`**, and **`/model`** are handled the same way as in interactive chat (where applicable). The delegator’s local MLX backend stays in sync so `/agent --backend mlx` uses the newly loaded weights.
 
 Reloading a model loads weights again (seconds to tens of seconds, large RAM use). Conversation history is kept.
@@ -537,6 +566,79 @@ Journaler: Project 42 is active. You have two pending tasks...
 
 Set `notify_user_on_action: false` in `context_management` to suppress these notes.
 
+### TUI Mode (Full-Screen Interface)
+
+The TUI provides a full-screen Textual-based interface with persistent navigation, categorized command menus, and a quick context loading panel. Launch it with:
+
+```bash
+engineering-hub journaler tui
+```
+
+#### Layout
+
+- **Left sidebar** — category tree with all slash command groups (Quick Context, Context Management, File Ops, Agent Delegation, Zettelkasten, Capture Templates, Org-Roam Write, Export, Session)
+- **Main panel** — switches between chat view, command card grids, and the quick context panel
+- **Bottom bar** — model name, utilization gauge, turn count, topic indicator
+- **Input bar** — type messages or slash commands directly
+
+#### Key bindings
+
+| Key | Action |
+| --- | --- |
+| `Ctrl+P` | Open the fuzzy-filter command palette (search all 30+ commands by name, description, or category) |
+| `Ctrl+L` | Open the Quick Context panel (load journals, briefings, project notes, history) |
+| `Ctrl+Q` | Quit the TUI |
+| `Escape` | Return focus to the chat view |
+
+#### Quick Context Panel
+
+The Quick Context panel (`Ctrl+L`) provides one-click loading of frequently accessed content across four tabs:
+
+| Tab | Contents |
+| --- | --- |
+| **Journals** | Last 14 daily journal entries from `org_journal_dir` |
+| **Briefings** | Recent morning and discussion briefings from `.journaler/briefings/` |
+| **Projects** | Top 15 most recently modified `.org` files outside the journal directory |
+| **History** | Daily conversation summaries and the current session log |
+
+Click any item to load it into the conversation context. Files already loaded are marked with a visual indicator.
+
+#### Load Tracker (access frequency)
+
+The TUI tracks how often you load each file and surfaces frequently-used content first. Access data persists across sessions in `.journaler/load_tracker.json`. Files can be pinned to always appear at the top.
+
+The same feature is available in `journaler chat` via the `/context` slash command:
+
+```text
+/context              Show top 10 suggested files by frequency/recency
+/context 3            Load file #3 from the suggested list
+```
+
+#### Command cards
+
+Selecting a category from the sidebar shows a grid of command cards. Each card displays the command name, arguments hint, and description. Click or press Enter to:
+- Execute immediately (no-arg commands like `/status`, `/skills`, `/budget`)
+- Open a sub-menu with options (e.g., `/clear` shows soft/summarize/hard choices; `/agent` opens a persona picker; `/export` shows format options)
+
+#### Usage examples
+
+```bash
+# Launch the TUI (same model setup as journaler chat)
+engineering-hub journaler tui
+
+# Use with a specific model profile
+engineering-hub journaler --profile reasoning tui
+```
+
+Inside the TUI:
+1. Press `Ctrl+L` to open Quick Context, select a recent journal to load
+2. Type a question in the input bar to chat with the Journaler
+3. Click "Agent Delegation" in the sidebar to see all agent commands as cards
+4. Press `Ctrl+P`, type "export", and select `/export` to export the conversation
+5. Use the sidebar "Org-Roam Write" category to access `/task`, `/note`, `/open`, etc.
+
+---
+
 ### Interactive Chat: Slash Commands
 
 While in `engineering-hub journaler chat`, any input starting with `/` is handled as a command rather than forwarded to the model:
@@ -553,13 +655,21 @@ While in `engineering-hub journaler chat`, any input starting with `/` is handle
 | `/budget` | Show full token budget breakdown (system prompt, snapshot, history, available) |
 | `/topic` | Show the currently detected conversation topic |
 
+**Quick context loading**
+
+| Command | Description |
+| --- | --- |
+| `/context` | Show top 10 suggested files ranked by load frequency and recency |
+| `/context <number>` | Load the Nth file from the suggested list into conversation context |
+
 **Model switching** (requires `journaler.models` in config for profile names)
 
 | Command | Description |
 | --- | --- |
 | `/model` | Show active model path, profile name, context window, `enable_thinking`, and `mlx_backend` |
+| `/model_browse` | Interactive picker for configured profiles and cached `mlx-community/*` models (chat REPL and TUI) |
 | `/model <profile>` | Load the named profile from `journaler.models` (keeps chat history) |
-| `/model path <id-or-path>` | Load a Hugging Face id or local MLX snapshot path |
+| `/model path <id-or-path>` | Load a Hugging Face repo id or local MLX snapshot path |
 
 **File loading**
 
@@ -583,12 +693,13 @@ While in `engineering-hub journaler chat`, any input starting with `/` is handle
 
 | Command | Description |
 | --- | --- |
-| `/agent <type> <desc> [--project <id>] [--backend mlx\|claude]` | Delegate a task to a named agent and get the result inline. Types: `research`, `technical-writer`, `standards-checker`, `technical-reviewer`, `weekly-reviewer`, `latex-writer`, `zettelkasten-curator` |
+| `/agent <type> <desc> [--project <id>] [--backend mlx\|claude]` | Delegate a task to a named agent and get the result inline. Types: `research`, `technical-writer`, `standards-checker`, `technical-reviewer`, `weekly-reviewer`, `latex-writer`, `zettelkasten-curator`, `rental-scout` |
 | `/history <query>` | Retrieve matching excerpts from prior Journaler chat logs (`conversation.jsonl`) and daily summaries |
 | `/history --agent <type> [--backend mlx\|claude] <query>` | Dispatch retrieved prior-chat excerpts to a named agent for review, synthesis, or extraction |
 | `/pipeline draft-section --section "<section>" [--project <id>] [--backend mlx\|claude] [--loop-limit <n>]` | Run the multi-stage report drafting pipeline — gathers pre-computed result files, drafts prose, audits compliance, reviews tone, and emits LaTeX; see [Report Drafting Pipeline](#report-drafting-pipeline) |
 | `/agent_browse` | Interactive skill picker — arrow keys to browse agents, Enter to select, then type a task description |
 | `/skills` | List all available agent delegation skills with descriptions and examples |
+| `/integrate` | Run a Task-Integrator cycle now: interview inline in today's journal and propose approval-gated `@agent:` tasks; `/integrate status` shows awaiting/proposed/queued counts |
 | `/tasks` | Show session queue proposals, or use `/tasks confirm`, `/tasks commit`, `/tasks reject N`, `/tasks edit N <text>`, `/tasks clear`, `/tasks rollback [N \| --all]` |
 | `/queue <description>` | Shorthand to propose one overnight task (defaults agent to `research` until you edit/confirm); then `/tasks confirm` and `/tasks commit` |
 
@@ -662,7 +773,7 @@ Tasks added with `/task` use the `- [ ] @agent:` format understood by the Orches
 
 With **`journaler.default_task_mode: immediate`** (default), ordinary messages that describe agent work may be **classified** and **delegated inline** (no `/agent` prefix) unless you use explicit **queue** language (“run later”, “queue for tonight”, …) or **`/queue`**. With **`default_task_mode: propose`**, that auto-path is off; the model uses **`DISPATCH:`** lines and you confirm before the agent runs (interactive chat prompts **Run it? [y/N]**; HTTP `/chat` still auto-runs a `DISPATCH` after the model responds, as before).
 
-**`/model`** in interactive chat reloads the MLX weights but **keeps the delegator’s adapter in sync**, so `/agent --backend mlx` continues to use the active checkpoint (same behavior as HTTP `/chat`). **`/export`**, **`/open`**, **`/edit`**, and the **`/load_browse`** / **`/agent_browse`** / **`/edit_browse`** TUIs are only in interactive **`journaler chat`**; the HTTP endpoint handles **`/model`**, **`/agent`**, **`/tasks`**, **`/queue`**, **`/timesheet`**, and **`/skills`**. Loaded files are appended to the system prompt as fenced blocks and persist for the life of the chat session only.
+**`/model`** and **`/model_browse`** in interactive chat reload the MLX weights but **keep the delegator’s adapter in sync**, so `/agent --backend mlx` continues to use the active checkpoint (same behavior as HTTP `/chat` for `/model`). **`/export`**, **`/open`**, **`/edit`**, and the **`/load_browse`** / **`/agent_browse`** / **`/edit_browse`** / **`/model_browse`** TUIs are in interactive **`journaler chat`** and **`journaler tui`**; the HTTP endpoint handles **`/model`**, **`/agent`**, **`/tasks`**, **`/queue`**, **`/timesheet`**, and **`/skills`**. Loaded files are appended to the system prompt as fenced blocks and persist for the life of the chat session only.
 
 To persist files for long-term retrieval across sessions, use `engineering-hub load` instead (see [Load Files into Context](#6-load-files-into-context)).
 
@@ -819,6 +930,24 @@ Output: structured markdown under `outputs/coordination/`.
 
 ---
 
+**`rental-scout`** — Manage the Bay Area rental search: read/update criteria, trigger listing scans, report scored top matches, clear the dedup database, and queue overnight tasks. Aliases: `rental`, `scout`, `housing`. **Tool-use agent** — requires structured tool calling; use `--backend claude` or `--backend auto` when the Journaler default is MLX (see [Bay Area Rental Scout](#bay-area-rental-scout)).
+
+Output: markdown match report; org-mode digests ready for journal appends. Workspace set by `rental_scout.workspace_dir` (default `~/dev/rental_scout`).
+
+```text
+/agent rental-scout show today's top matches in Oakland
+/agent rental-scout set max price to 3800 and require in-unit laundry
+/agent rental --backend claude run a dry-run scan of craigslist and zumper
+/agent rental-scout format the top 5 matches for my journal
+/agent rental-scout how many listings have we seen, and from which sources?
+/agent rental-scout --backend auto clear the dedup database and rescan Oakland
+/agent rental-scout queue an overnight scan for tomorrow's digest
+```
+
+See [Bay Area Rental Scout](#bay-area-rental-scout) for setup, configuration, MCP wiring, and the full command reference.
+
+---
+
 If no live backend is configured, the command falls back to writing the task to today's journal under `* Overnight Agent Tasks` for the Orchestrator to pick up on its next scan.
 
 #### Backend selection
@@ -926,6 +1055,90 @@ journaler:
 ```
 
 Output is saved to `.journaler/briefings/discussion-YYYY-MM-DD.md`.
+
+### Background Agent Work Loop
+
+The Background Agent Work Loop closes the gap between briefings (which identify work) and agent execution (which does work). When enabled, the daemon extracts actionable tasks from morning and discussion briefings, queues them, and proactively delegates them through the existing `AgentDelegator` throughout the day.
+
+#### How it works
+
+1. **Task Extraction** -- After each morning or discussion briefing, the daemon runs an MLX extraction pass that identifies concrete tasks from the briefing content (agenda items, suggested paths forward, persona next-steps). Recent chat history from `conversation.jsonl` is included so the extractor can boost tasks the user has been discussing and skip tasks already addressed via interactive `/agent` commands.
+
+2. **Background Queue** -- Extracted tasks are stored in `{state_dir}/background_queue/YYYY-MM-DD.json` with priority, suggested agent, and source tracking. Tasks are deduplicated against the existing queue.
+
+3. **Work Loop** -- A scheduled tick (default: every 60 minutes) picks the highest-priority pending task, builds an enriched delegation context (briefing context + relevant chat history), and delegates via `AgentDelegator`. Output is written to `{state_dir}/outputs/background/YYYY-MM-DD/{task_id}.md`.
+
+4. **Work Status** -- A rolling status file at `{state_dir}/agent_work_status/YYYY-MM-DD.md` tracks what was planned vs. accomplished, grouped by source (morning briefing, discussion briefing, journal tasks). This file is injected into both `get_current_context()` and `get_briefing_context()` so the chat model and tomorrow's briefing see what the background agent did.
+
+5. **Enhanced EOD Summary** -- The end-of-day summary now incorporates the morning briefing agenda, background work status, and chat history to produce a reconciliation: what was planned, what got done, what the user engaged with, and what should seed tomorrow's briefing.
+
+#### Configuration
+
+```yaml
+journaler:
+  background_work_enabled: true            # off by default
+  background_work_interval_min: 60         # check queue every hour
+  background_work_max_tasks_per_day: 6     # cap to avoid runaway model usage
+  background_work_auto_approve: true       # auto-delegate without confirmation
+  background_work_agent_backend: "mlx"     # "mlx" | "claude" | "auto"
+  background_work_chat_lookback_days: 3    # days of chat history for priority signals
+```
+
+When `background_work_auto_approve` is `false` (default), extracted tasks are logged but not delegated automatically -- the daemon reports them in the work status file for the user to review. Set to `true` for fully autonomous operation.
+
+#### State files
+
+```text
+.journaler/
+├── background_queue/        # Daily JSON task queues
+│   └── YYYY-MM-DD.json
+├── agent_work_status/       # Daily work status markdown
+│   └── YYYY-MM-DD.md
+└── outputs/background/      # Background agent output files
+    └── YYYY-MM-DD/
+        └── {task_id}.md
+```
+
+### Task-Integrator (inline call-and-response)
+
+The Task-Integrator removes the need to remember the `- [ ] @agent-type: description` delegation syntax. You write free-form notes in your daily journal as usual; the integrator reads the whole note, interviews you inline, and converts your replies into correctly-formatted `@agent:` tasks — behind an approval checkbox.
+
+#### How it works
+
+1. **Read intake** -- Each cycle reads today's daily `.org` note, excluding the agent-managed sections (`task_integrator_excluded_sections`, e.g. `Agent Conversation`, `Overnight Agent Tasks`, `Timesheet`). New free-form content (deduplicated by content hash) becomes interview material.
+
+2. **Interview** -- For implied or explicit tasks, an MLX pass writes 1-3 clarifying questions into an `* Agent Conversation` section, anchored by a `:CONV_ID:` drawer, with a `Reply (type your answer below this line):` marker.
+
+3. **Resolution** -- When you type a reply inline under the marker, the next cycle drafts ready-to-run tasks as `- [ ] @agent: …` checkboxes under a `Proposed tasks (re: <id>)` block. You see the syntax but never write it.
+
+4. **Approval** -- Tick a proposal's checkbox to approve it. On the next cycle (Mon-Fri by default), each approved task is appended to `* Overnight Agent Tasks`, where the existing Orchestrator pipeline picks it up — closing the delegation gap.
+
+State lives in `{state_dir}/task_integrator/YYYY-MM-DD.json`; all org interaction is append-only to today's note.
+
+#### Running it
+
+- **Daemon:** set `task_integrator_enabled: true`; cycles run every `task_integrator_interval_min` minutes.
+- **On demand:** type `/integrate` in **`journaler chat`** (or the TUI, or send `/integrate` over HTTP `POST /chat`) to run one cycle now. `/integrate status` shows today's awaiting/proposed/queued counts.
+
+#### Configuration
+
+```yaml
+journaler:
+  task_integrator_enabled: true              # off by default
+  task_integrator_interval_min: 15           # cycle interval in the daemon
+  task_integrator_conversation_section: "Agent Conversation"  # where Q&A + proposals go
+  task_integrator_output_section: "Overnight Agent Tasks"     # where approved tasks are queued
+  task_integrator_excluded_sections:         # daily-note headings treated as agent-managed
+    - "Agent Conversation"
+    - "Overnight Agent Tasks"
+    - "Completed Agent Tasks"
+    - "Pending Agent Tasks"
+    - "Timesheet"
+    - "Journaler Cross-References"
+  task_integrator_max_questions: 3           # interview questions per topic
+  task_integrator_weekdays_only: true        # only queue approved tasks Mon-Fri
+  task_integrator_max_tokens: 1024           # model budget per interview/resolution call
+```
 
 ### LaTeX Writer Agent
 
@@ -1117,11 +1330,15 @@ The Journaler writes to `<workspace_dir>/.journaler/`:
 
 ```text
 .journaler/
-├── state.json           # File mtimes for incremental scanning
+├── state.json           # Canonical path keys, mtimes, and SHA-256 content hashes for incremental scanning
 ├── context_cache.json   # Compressed rolling context snapshot
 ├── conversation.jsonl   # Full chat history log (all turns, including archived/compressed)
 ├── briefings/           # Generated morning briefings (YYYY-MM-DD.md)
-└── daily_summaries/     # End-of-day conversation summaries (YYYY-MM-DD.md)
+├── topic_hints/         # Auto-generated conversation starters after significant scans
+├── daily_summaries/     # End-of-day conversation summaries (YYYY-MM-DD.md)
+├── background_queue/    # Daily JSON task queues extracted from briefings (YYYY-MM-DD.json)
+├── agent_work_status/   # Daily background agent work status (YYYY-MM-DD.md)
+└── outputs/background/  # Background agent output files (YYYY-MM-DD/{task_id}.md)
 ```
 
 `conversation.jsonl` is append-only and serves as the permanent audit trail. Archived and compressed turns are written here even after the in-memory history is cleared, so any day's conversation can be reconstructed from the log. Use **`engineering-hub journaler export`** to turn this file into org-mode: by default a deterministic **raw** transcript (headings plus `#+begin_src text` blocks per turn) on **stdout**; with **`--summarize`**, a single model pass adds **`* Summary`** and **`* Open TODOs`** (`- [ ]` items). In **`journaler chat`**, bare **`/export`** (no `-o` / `--note` / `--find-title` / `--new-node`) writes a new roam node under **`conversation_exports/`** instead of printing into the session. Target an existing file with **`--note`** or **`--find-title`** (substring match on `#+title:` under `org_journal_dir`'s parent), or **`--new-node`** to create a new org-roam node under that roam directory. Override the transcript path with **`--jsonl`**. See **`engineering-hub journaler export --help`** for all flags.
@@ -1334,6 +1551,188 @@ engineering-hub start --no-docker   # force local even if config says docker
 - **With host Ollama**: Task containers use `http://host.docker.internal:11434` (set `docker.ollama_host` accordingly)
 - **Anthropic API**: Containers make outbound HTTPS calls to `api.anthropic.com`
 
+## Bay Area Rental Scout
+
+Engineering Hub integrates with the separate **rental-scout** pipeline project (typically cloned to `~/dev/rental_scout`). Hub does **not** scrape listings itself — it orchestrates the pipeline via a shared service layer exposed to Journaler agents, the Orchestrator, and external MCP clients.
+
+```text
+┌─────────────────────┐     ┌──────────────────────────────┐     ┌─────────────────────┐
+│ Cursor / Journaler  │────▶│ engineering_hub.rental_scout │────▶│ ~/dev/rental_scout  │
+│ /agent rental-scout │     │ .service (criteria, scan,    │     │ main.py, criteria,  │
+│ engineering-hub     │     │  digest queries)             │     │ seen_listings.db    │
+│ mcp-server          │     └──────────────────────────────┘     └─────────────────────┘
+└─────────────────────┘
+```
+
+### Prerequisites
+
+1. **Clone the rental-scout project** into your workspace (default `~/dev/rental_scout`).
+2. **Create and install its virtualenv** (Playwright and scraper deps live here, not in Engineering Hub):
+
+```bash
+cd ~/dev/rental_scout
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+python -m playwright install chromium
+cp .env.example .env   # then edit API keys / LLM settings
+```
+
+3. **Configure listing scoring** in `rental_scout/.env`:
+   - `LLM_PROVIDER=anthropic` + `ANTHROPIC_API_KEY` (default), or
+   - `LLM_PROVIDER=ollama` + `OLLAMA_URL` / `OLLAMA_MODEL` for local scoring
+
+4. **Point Engineering Hub at the workspace** in `config.yaml` (or rely on the default):
+
+```yaml
+rental_scout:
+  workspace_dir: "~/dev/rental_scout"
+  # Optional — auto-detected when {workspace_dir}/.venv/bin/python exists:
+  # python_path: "~/dev/rental_scout/.venv/bin/python"
+```
+
+`rental_run_scan` uses `{workspace_dir}/.venv/bin/python` when present, sets `cwd` to the workspace (so `.env` loads), and exports `RENTAL_SCOUT_WORKSPACE`.
+
+### Agent tools (via `/agent rental-scout`)
+
+All eight rental tools are available in-process when the backend supports tool calling:
+
+| Tool | Purpose |
+| --- | --- |
+| `rental_get_criteria` | Read current search settings |
+| `rental_update_criteria` | Patch cities, price, bedrooms, amenities |
+| `rental_run_scan` | Run the scrape + score pipeline (may take several minutes) |
+| `rental_get_top_matches` | Read scored matches from the latest digest |
+| `rental_get_listing_stats` | Dedup DB stats and last-scan metadata |
+| `rental_format_digest_for_org` | Top matches as org-mode text |
+| `rental_clear_seen_listings` | Reset dedup DB (`confirm=true` required) |
+| `rental_add_journal_task` | Queue an `@rental-scout` org task for the Orchestrator |
+
+**Backend note:** Rental-scout is a tool-use agent. With Journaler default `agent_backend: "mlx"`, delegation falls back to single-shot text without real tool calls. For scans and criteria changes, prefer:
+
+```text
+/agent rental-scout --backend claude show today's top matches
+/agent rental-scout --backend auto run a dry-run scan of craigslist
+```
+
+Or set `journaler.agent_backend: "auto"` in config. For Orchestrator-dispatched org tasks, use `llm_provider: "anthropic"` or `llm_provider: "ollama"` with a tool-capable chat model.
+
+#### Sample Journaler commands
+
+```text
+# Read settings and recent matches (no new scan)
+/agent rental-scout what are my current search criteria?
+/agent rental-scout show today's top matches in Oakland with score >= 7
+
+# Adjust criteria, then scan
+/agent rental-scout --backend claude set max price to 3800 and require in-unit laundry
+/agent rental-scout --backend claude run a full scan of craigslist, redfin, and zumper
+
+# Preview without marking listings seen or sending digest
+/agent rental --backend claude run a dry-run scan of craigslist
+
+# Stats and journal output
+/agent rental-scout how many listings have we seen, and from which sources?
+/agent rental-scout format the top 5 matches for my journal
+
+# Reset dedup after changing cities (agent should confirm with user first)
+/agent rental-scout --backend claude clear the seen-listings database and rescan
+
+# Queue for Orchestrator instead of running immediately
+/agent rental-scout queue an overnight scan for tomorrow morning
+```
+
+Org tasks written by `rental_add_journal_task` use the format:
+
+```org
+* Overnight Agent Tasks
+- [ ] @rental-scout: run rental scan for Oakland
+```
+
+### Run the pipeline directly (without Hub)
+
+Useful for cron, debugging, or manual daily runs:
+
+```bash
+cd ~/dev/rental_scout
+source .venv/bin/activate
+
+# Full daily scan
+python main.py
+
+# Restrict sources / preview / skip LLM scoring
+python main.py --sources craigslist,redfin,zumper
+python main.py --dry-run --output-json latest_digest.json
+python main.py --skip-llm
+python main.py --schedule   # daily 07:00 loop
+```
+
+Artifacts in the workspace: `criteria.yaml`, `seen_listings.db`, `latest_digest.json`.
+
+### MCP client setup (Cursor / Claude Desktop)
+
+Add Engineering Hub's unified MCP server — rental tools are mounted under the `rental_` namespace:
+
+```json
+{
+  "mcpServers": {
+    "engineering-brain": {
+      "command": "/Users/you/dev/engineeringhub_controlinterface/.venv/bin/engineering-hub",
+      "args": ["mcp-server"]
+    }
+  }
+}
+```
+
+Start HTTP transport for remote clients:
+
+```bash
+engineering-hub mcp-server --transport http --port 8000
+```
+
+**MCP tool names:** `rental_get_criteria`, `rental_update_criteria`, `rental_run_scan`, `rental_get_top_matches`, `rental_get_listing_stats`, `rental_clear_seen_listings`, `rental_add_journal_task`, `rental_format_digest_for_org`
+
+**Example prompts in Cursor** (once MCP is connected):
+
+```text
+Use rental_get_criteria to show my current rental search settings.
+Use rental_run_scan with dry_run=true for craigslist only, then rental_get_top_matches for Oakland.
+Use rental_format_digest_for_org to give me org-mode output for the top 5 matches.
+```
+
+Standalone rental MCP (without memory tools):
+
+```bash
+python -m engineering_hub.mcp.rental_scout                # stdio
+python -m engineering_hub.mcp.rental_scout --transport sse  # HTTP on :18791
+```
+
+## MCP Server
+
+`engineering-hub mcp-server` exposes hub tools to external MCP clients (Cursor, Claude Desktop) over stdio (default) or HTTP (`--transport http`).
+
+Two toolsets are served from one process:
+
+- **engineering-brain memory tools** — `search_brain`, `browse_recent`, `capture_note`, `get_stats`
+- **Rental Scout tools** (mounted under the `rental_` namespace) — `rental_get_criteria`, `rental_update_criteria`, `rental_run_scan`, `rental_get_top_matches`, `rental_get_listing_stats`, `rental_clear_seen_listings`, `rental_add_journal_task`, `rental_format_digest_for_org`
+
+The rental tools operate on the workspace configured by `rental_scout.workspace_dir` (criteria.yaml, seen_listings.db, latest_digest.json). `rental_run_scan` shells out to the rental-scout pipeline's `main.py` using the workspace `.venv` Python when available. See [Bay Area Rental Scout](#bay-area-rental-scout) for full setup and sample commands.
+
+Cursor / Claude Desktop config:
+
+```json
+{
+  "mcpServers": {
+    "engineering-brain": {
+      "command": "/path/to/.venv/bin/engineering-hub",
+      "args": ["mcp-server"]
+    }
+  }
+}
+```
+
+The rental-scout sub-server can also run standalone: `python -m engineering_hub.mcp.rental_scout` (stdio) or `--transport sse`.
+
 ## Development
 
 ### Running Tests
@@ -1383,10 +1782,26 @@ See [config/config.example.yaml](config/config.example.yaml) for all available o
 - `journaler.*` - Journaler daemon settings (model, scan interval, briefing, chat, Slack)
 - `journaler.pending_tasks_file` - Org file for **`/tasks commit`** output (default: `workspace_dir/.journaler/pending-tasks.org`); Orchestrator scans it in org mode with daily journals
 - `journaler.default_task_mode` - **`immediate`** (default: classifier may auto-delegate) or **`propose`** (**`DISPATCH:`** + confirm in CLI)
-- `journaler.scan_org_roam_tree` - When false, scan only `journal.org_journal_dir` and `journaler.watch_dirs` (default: true)
+- `journaler.scan_org_roam_tree` - When false, scan only `journal.org_journal_dir` and `journaler.watch_dirs` (default: true). Significance logging uses content hashes either way; false reduces walk/CPU on large roam trees
 - `journaler.watch_dirs` - Extra org directories to include in scans
 - `journaler.journal_lookback_days` / `journaler.journal_max_files` - Window for parsing daily journals (defaults: 30 / 30)
 - `journaler.conversation_lookback_days` - Number of past daily conversation summaries included in the proactive context snapshot every tick (default: 7; independent of `journal_lookback_days`)
+- `journaler.proactive_topic_scout_enabled` - Run a one-shot MLX topic scout when a scan tick detects significant journal / queue / output changes (default: true)
+- `journaler.proactive_topic_scout_max_tokens` - Generation budget for the topic scout (default: 512)
+- `journaler.background_work_enabled` - Enable background agent work loop that extracts tasks from briefings and delegates them (default: false)
+- `journaler.background_work_interval_min` - Interval in minutes between background work loop ticks (default: 60)
+- `journaler.background_work_max_tasks_per_day` - Maximum background tasks per day (default: 6)
+- `journaler.background_work_auto_approve` - Auto-delegate extracted tasks without user confirmation (default: false)
+- `journaler.background_work_agent_backend` - Agent backend for background work tasks: `"mlx"`, `"claude"`, or `"auto"` (default: `"mlx"`)
+- `journaler.background_work_chat_lookback_days` - Days of `conversation.jsonl` chat history to include in task extraction and delegation context (default: 3)
+- `journaler.task_integrator_enabled` - Enable the inline call-and-response Task-Integrator loop over the daily journal (default: false)
+- `journaler.task_integrator_interval_min` - Minutes between Task-Integrator cycles in the daemon (default: 15)
+- `journaler.task_integrator_conversation_section` - Daily-journal heading where interview questions and proposals are written (default: "Agent Conversation")
+- `journaler.task_integrator_output_section` - Daily-journal heading where approved `@agent:` tasks are queued (default: "Overnight Agent Tasks")
+- `journaler.task_integrator_excluded_sections` - Daily-journal headings the integrator must not read as intake (agent-managed sections)
+- `journaler.task_integrator_max_questions` - Maximum interview questions per topic (default: 3)
+- `journaler.task_integrator_weekdays_only` - Only queue approved tasks Mon-Fri (default: true)
+- `journaler.task_integrator_max_tokens` - Max tokens for Task-Integrator interview/resolution model calls (default: 1024)
 - `journaler.org_link_on_relation` - When true, write a cross-reference link into today's journal whenever a related past conversation is detected via semantic search (default: true)
 - `journaler.model_profile` - Name of the active entry in `journaler.models` (when the map is non-empty)
 - `journaler.models` - Optional map of named MLX profiles (`model_path`, `model_context_window`, sampling, `mlx_backend`, `enable_thinking`)
@@ -1396,6 +1811,8 @@ See [config/config.example.yaml](config/config.example.yaml) for all available o
 - `journaler.skills_dir` - Path to skills YAML directory (default: `skills/` at repo root; loaded into the system prompt for daemon and interactive chat)
 - `journaler.context_management.*` - Token pressure thresholds, compression triggers, EOD reset time, topic-shift behavior
 - `memory.*` - Vector memory settings (enabled, search_k, threshold)
+- `rental_scout.workspace_dir` - Rental Scout workspace holding the pipeline and its artifacts (default: `~/dev/rental_scout`; used by `/agent rental-scout` and the `rental_` MCP tools)
+- `rental_scout.python_path` - Python interpreter for `rental_run_scan` subprocesses (default: auto-detect `{workspace_dir}/.venv/bin/python`, else current interpreter)
 - `corpus.enabled` - Enable PDF reference corpus RAG (requires `libraryfiles-corpus` and `corpus.db`)
 - `corpus.db_path` - Path to `corpus.db` from libraryfiles-corpus ingest
 - `corpus.search_k` / `corpus.threshold` - Max chunks and minimum similarity for corpus hits (defaults: 5 / 0.40)

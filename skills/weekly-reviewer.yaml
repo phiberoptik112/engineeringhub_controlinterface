@@ -2,6 +2,15 @@ name: weekly-reviewer
 display_name: Weekly Reviewer Agent
 agent_type: weekly-reviewer
 
+domain: pkm
+domain_triggers:
+  - weekly review
+  - week in review
+  - open loops
+  - what did I accomplish
+  - journal review
+  - what fell through
+
 description: |
   Analyzes a week's worth of org-roam journal entries, agent outputs, and project activity
   to surface patterns, open loops, and actionable focus areas. Looks for items falling

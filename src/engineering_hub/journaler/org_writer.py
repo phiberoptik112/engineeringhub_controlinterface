@@ -7,6 +7,8 @@ without raising.
 Supported operations
 --------------------
 - ``append_to_heading``     — add body text under a named heading
+- ``append_to_today_journal`` — append under a heading in today's daily journal
+- ``read_section_body``     — read the body under a named heading
 - ``assert_org_path_under_roam`` — verify a path is a writable ``.org`` under roam root
 - ``add_todo_to_journal``   — insert a ``- [ ]`` item in today's daily journal
 - ``mark_done_in_journal``  — flip a matching ``- [ ]`` to ``- [X]``
@@ -314,6 +316,63 @@ def add_todo_to_journal(
     if ok:
         return True, f"Added task to {today_path.name} under '* {section_heading}'"
     return ok, msg
+
+
+def append_to_today_journal(
+    journal_dir: Path,
+    heading: str,
+    text: str,
+    *,
+    create_heading_if_missing: bool = True,
+) -> tuple[bool, str]:
+    """Append ``text`` under ``heading`` in today's daily journal.
+
+    Resolves today's ``YYYY-MM-DD.org`` file under *journal_dir*, creating it
+    with minimal frontmatter if missing, then delegates to
+    :func:`append_to_heading`.  Used by the Task-Integrator to write inline
+    ``* Agent Conversation`` blocks and queued ``@agent:`` lines.
+
+    Returns:
+        ``(ok, message)``
+    """
+    journal_dir = journal_dir.expanduser().resolve()
+    today_path = _today_journal_path(journal_dir)
+    _create_journal_file(today_path)
+    return append_to_heading(
+        today_path,
+        heading,
+        text,
+        create_heading_if_missing=create_heading_if_missing,
+    )
+
+
+def read_section_body(path: Path, heading: str) -> str:
+    """Return the body text under the first ``* <heading>`` in an org file.
+
+    The body spans from just after the heading line to the next heading of the
+    same or higher level (or end of file).  Returns an empty string if the file
+    or heading is not found.
+    """
+    path = path.expanduser().resolve()
+    if not path.is_file():
+        return ""
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except OSError:
+        return ""
+
+    heading_pattern = re.compile(
+        r"^(\*+)\s+" + re.escape(heading) + r"\s*$", re.MULTILINE
+    )
+    match = heading_pattern.search(raw)
+    if not match:
+        return ""
+    star_count = len(match.group(1))
+    rest_start = match.end()
+    next_heading = re.compile(r"^\*{1," + str(star_count) + r"}\s+", re.MULTILINE)
+    next_match = next_heading.search(raw, rest_start)
+    end = next_match.start() if next_match else len(raw)
+    return raw[rest_start:end].strip("\n")
 
 
 def append_timesheet_entry(

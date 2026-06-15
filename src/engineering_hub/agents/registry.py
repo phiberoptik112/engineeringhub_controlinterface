@@ -126,6 +126,44 @@ DEFAULT_AGENT_CONFIGS = {
         tools=["search_corpus", "search_memory", "ingest_files"],
         max_tokens=6000,
     ),
+    AgentType.RENTAL_SCOUT: AgentConfig(
+        agent_type=AgentType.RENTAL_SCOUT,
+        prompt_file="rental-scout.txt",
+        model_class=ModelClass.TOOL_USE,
+        tools=[
+            "rental_get_criteria",
+            "rental_update_criteria",
+            "rental_run_scan",
+            "rental_get_top_matches",
+            "rental_get_listing_stats",
+            "rental_format_digest_for_org",
+            "rental_clear_seen_listings",
+            "rental_add_journal_task",
+            "search_memory",
+        ],
+        max_tokens=6000,
+    ),
+    AgentType.CAREER_COACH: AgentConfig(
+        agent_type=AgentType.CAREER_COACH,
+        prompt_file="career-coach.txt",
+        model_class=ModelClass.REASONING,
+        tools=[],
+        max_tokens=6000,
+    ),
+    AgentType.PRODUCT_MANAGER: AgentConfig(
+        agent_type=AgentType.PRODUCT_MANAGER,
+        prompt_file="product-manager.txt",
+        model_class=ModelClass.REASONING,
+        tools=[],
+        max_tokens=6000,
+    ),
+    AgentType.COMPLIANCE_ADVISOR: AgentConfig(
+        agent_type=AgentType.COMPLIANCE_ADVISOR,
+        prompt_file="compliance-advisor.txt",
+        model_class=ModelClass.REASONING,
+        tools=[],
+        max_tokens=6000,
+    ),
 }
 
 

@@ -98,6 +98,7 @@ class ChatServer:
         delegator: AgentDelegator | None = None,
         model_context: JournalerChatModelContext | None = None,
         pending_tasks_file: Path | None = None,
+        task_integrator: object | None = None,
     ) -> None:
         self.engine = engine
         self.context = context
@@ -106,6 +107,7 @@ class ChatServer:
         self.start_time = start_time or datetime.now()
         self.delegator = delegator
         self.model_context = model_context
+        self.task_integrator = task_integrator
         self.pending_tasks_file = (
             pending_tasks_file.expanduser().resolve()
             if pending_tasks_file is not None
@@ -123,6 +125,7 @@ class ChatServer:
             self.delegator,
             self.model_context,
             self.pending_tasks_file,
+            self.task_integrator,
         )
         self._server = ThreadingHTTPServer((self.host, self.port), handler)
         self._thread = threading.Thread(
@@ -146,6 +149,7 @@ def _make_handler(
     delegator: AgentDelegator | None = None,
     model_context: JournalerChatModelContext | None = None,
     pending_tasks_file: Path | None = None,
+    task_integrator: object | None = None,
 ) -> type[BaseHTTPRequestHandler]:
     """Create a request handler class with access to the engine and context."""
 
@@ -212,6 +216,16 @@ def _make_handler(
                     )
                 elif mlow == "/skills":
                     response = _handle_skills_command(delegator)
+                elif mlow.startswith("/integrate"):
+                    if task_integrator is None:
+                        response = (
+                            "Task-Integrator is not available on this server instance."
+                        )
+                    elif mlow.strip() == "/integrate status":
+                        response = task_integrator.status_summary()
+                    else:
+                        result = task_integrator.run_cycle()
+                        response = result.summary()
                 elif mlow.startswith("/history"):
                     response = _handle_history_command(
                         message, delegator, context, engine=engine

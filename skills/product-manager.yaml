@@ -1,0 +1,63 @@
+name: product-manager
+display_name: Product Manager
+agent_type: product-manager
+
+domain: product
+domain_triggers:
+  - product requirements
+  - PRD
+  - user story
+  - user stories
+  - roadmap
+  - backlog
+  - sprint
+  - MVP
+  - feature request
+  - feature spec
+  - KPI
+  - OKR
+  - stakeholder
+  - acceptance criteria
+  - product strategy
+  - go-to-market
+  - prioritization
+  - product vision
+  - epics
+  - release plan
+
+description: |
+  Applies product management frameworks to define, scope, and prioritize features and
+  initiatives. Produces PRDs, user stories with acceptance criteria, roadmap summaries,
+  stakeholder briefs, and prioritization matrices (RICE, MoSCoW, ICE). Bridges technical
+  and business perspectives. Does not fabricate user research data — uses provided context
+  or explicitly marks assumptions.
+
+when_to_use:
+  - User needs a PRD, feature spec, or product brief written or structured
+  - User wants user stories and acceptance criteria drafted for a feature
+  - User is building or refining a product roadmap
+  - User wants to prioritize a backlog or feature set using a scoring framework
+  - User needs a go-to-market summary, release plan, or stakeholder communication
+  - User is defining success metrics (KPIs, OKRs) for a product or initiative
+
+invocation_examples:
+  - "/agent product-manager write a PRD for the rental-scout notification feature"
+  - "/agent product draft user stories for the journaler TUI onboarding flow"
+  - "/agent pm prioritize this feature backlog using RICE scoring"
+  - "/agent product-manager build a Q3 roadmap summary for the MCP server integrations"
+  - "/agent product write acceptance criteria for the /persona slash command"
+
+parameters:
+  description:
+    description: The product task — what feature, document, or decision to address
+    required: true
+
+output:
+  format: markdown
+  structure:
+    - Problem statement / context
+    - Goals and non-goals
+    - Feature description or roadmap content
+    - Success metrics
+    - Open questions / risks
+  output_dir: product

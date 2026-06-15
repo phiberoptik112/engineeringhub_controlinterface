@@ -2,6 +2,20 @@ name: research
 display_name: Research Agent
 agent_type: research
 
+domain: acoustic
+domain_triggers:
+  - ASTM
+  - ISO
+  - IBC
+  - STC
+  - NRC
+  - absorption coefficient
+  - sound transmission
+  - noise isolation
+  - impact noise
+  - reverberation
+  - building acoustics
+
 description: |
   Gathers and synthesizes technical information from authoritative sources for acoustic
   engineering and building science topics. Produces structured research documents with
