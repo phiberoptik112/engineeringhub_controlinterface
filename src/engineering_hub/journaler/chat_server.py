@@ -216,6 +216,10 @@ def _make_handler(
                     )
                 elif mlow == "/skills":
                     response = _handle_skills_command(delegator)
+                elif mlow.startswith("/blender"):
+                    response = _handle_blender_command(message)
+                elif mlow.startswith("/horn"):
+                    response = _handle_horn_command(message)
                 elif mlow.startswith("/integrate"):
                     if task_integrator is None:
                         response = (
@@ -647,6 +651,24 @@ def _handle_skills_command(delegator: AgentDelegator | None) -> str:
             "then set `journaler.agent_backend` in your config."
         )
     return delegator.skills_summary()
+
+
+def _handle_blender_command(message: str) -> str:
+    """Handle ``/blender status`` connectivity checks."""
+    from engineering_hub.blender import service as blender_service
+
+    parts = message.split()
+    sub = parts[1].lower() if len(parts) > 1 else "status"
+    if sub != "status":
+        return "Usage: /blender status"
+    return blender_service.format_status_message()
+
+
+def _handle_horn_command(message: str) -> str:
+    """Handle ``/horn [sweep|defaults]`` parametric horn sweeps."""
+    from engineering_hub.horn_iterator import service as horn_service
+
+    return horn_service.handle_slash_command(message)
 
 
 def _handle_pipeline_command(

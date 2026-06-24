@@ -28,6 +28,11 @@ from engineering_hub.journaler.engine import (
     ConversationEngine,
     _is_model_cached,
 )
+from engineering_hub.journaler.output_limit import (
+    Action,
+    GenerationOutcome,
+    OutputLimitConfig,
+)
 from engineering_hub.journaler.model_profiles import (
     JournalerChatModelContext,
     JournalerModelSpec,
@@ -40,6 +45,7 @@ from engineering_hub.journaler.model_profiles import (
     parse_model_slash_message,
     resolve_journaler_model_spec,
 )
+from engineering_hub.horn_iterator import service as horn_service
 from engineering_hub.journaler.timesheet_slash import handle_timesheet_slash_command
 from engineering_hub.memory.service import MemoryService
 from engineering_hub.orchestration.orchestrator import Orchestrator
@@ -816,6 +822,110 @@ def _handle_domain_shift_confirmation(
         )
 
 
+_OUTPUT_POLICY_CHOICES = ("prompt", "auto_continue", "auto_summarize", "stop")
+_OUTPUT_CONTINUE_CHOICES = ("ask", "same_turn", "follow_up")
+_OUTPUT_SCOPE_CHOICES = ("history", "history_and_partial")
+
+
+def _render_output_limit_table(cfg: "OutputLimitConfig") -> Table:
+    """Build a Rich table summarizing the active output-limit policy."""
+    table = Table(title="Output Limit", show_header=True, header_style="bold cyan")
+    table.add_column("Setting", style="cyan", no_wrap=True)
+    table.add_column("Value", style="green")
+    table.add_column("How to change", style="dim")
+    table.add_row("policy", cfg.policy, "/output set policy prompt|auto_continue|auto_summarize|stop")
+    table.add_row("max_output_tokens", str(cfg.max_output_tokens), "/output set max_tokens <int>")
+    table.add_row("max_continuation_passes", str(cfg.max_continuation_passes), "/output set passes <int>")
+    table.add_row("continue_mode", cfg.continue_mode, "/output set continue_mode ask|same_turn|follow_up")
+    table.add_row(
+        "summarize_scope_default",
+        cfg.summarize_scope_default,
+        "/output set summarize_scope history|history_and_partial",
+    )
+    table.add_row("force_answer_on_thinking_cut", str(cfg.force_answer_on_thinking_cut), "(config)")
+    table.add_row("summarize_before_continue", str(cfg.summarize_before_continue), "(config)")
+    return table
+
+
+def _handle_output_command(
+    parts: list[str], engine: ConversationEngine, chat_console: Console
+) -> None:
+    """Handle ``/output`` and ``/output set <key> <value>`` slash commands."""
+    cfg = engine.get_output_limit()
+    if len(parts) == 1:
+        chat_console.print(_render_output_limit_table(cfg))
+        return
+
+    if parts[1].lower() != "set" or len(parts) < 4:
+        chat_console.print(
+            "[yellow]Usage:[/yellow] /output  |  /output set "
+            "policy|max_tokens|passes|continue_mode|summarize_scope <value>"
+        )
+        return
+
+    key = parts[2].lower()
+    val = parts[3]
+    try:
+        if key == "policy":
+            if val not in _OUTPUT_POLICY_CHOICES:
+                raise ValueError(f"policy must be one of {_OUTPUT_POLICY_CHOICES}")
+            cfg.policy = val  # type: ignore[assignment]
+        elif key in ("max_tokens", "max_output_tokens"):
+            cfg.max_output_tokens = int(val)
+        elif key in ("passes", "max_continuation_passes"):
+            cfg.max_continuation_passes = int(val)
+        elif key == "continue_mode":
+            if val not in _OUTPUT_CONTINUE_CHOICES:
+                raise ValueError(f"continue_mode must be one of {_OUTPUT_CONTINUE_CHOICES}")
+            cfg.continue_mode = val  # type: ignore[assignment]
+        elif key in ("summarize_scope", "summarize_scope_default"):
+            if val not in _OUTPUT_SCOPE_CHOICES:
+                raise ValueError(f"summarize_scope must be one of {_OUTPUT_SCOPE_CHOICES}")
+            cfg.summarize_scope_default = val  # type: ignore[assignment]
+        else:
+            raise ValueError(f"unknown setting {key!r}")
+        cfg.validate()
+        engine.set_output_limit(cfg)
+        chat_console.print(f"[green]output {key} → {val}[/green]")
+    except ValueError as exc:
+        chat_console.print(f"[red]Error:[/red] {escape(str(exc))}")
+
+
+def _interactive_output_choice(
+    chat_console: Console,
+) -> "Callable[[GenerationOutcome], Action | None]":
+    """Build a choice provider that prompts the user when output is truncated."""
+
+    def _provider(outcome: "GenerationOutcome") -> "Action | None":
+        phase_note = (
+            " (model was still reasoning — choosing continue will jump to the answer)"
+            if outcome.phase == "thinking"
+            else ""
+        )
+        chat_console.print(
+            f"\n[yellow]Output may be incomplete[/yellow] "
+            f"(reason: {outcome.reason}{phase_note}).\n"
+            "  [s] Summarize history and retry\n"
+            "  [S] Summarize history + partial answer, then retry\n"
+            "  [c] Continue (same turn)\n"
+            "  [f] Continue (new follow-up turn)\n"
+            "  [Enter] Stop and keep partial"
+        )
+        try:
+            choice = input("Choice [s/S/c/f/Enter]: ").strip()
+        except (KeyboardInterrupt, EOFError):
+            return "stop"
+        mapping: dict[str, Action] = {
+            "s": "summarize_history",
+            "S": "summarize_both",
+            "c": "continue_same",
+            "f": "continue_followup",
+        }
+        return mapping.get(choice, "stop")
+
+    return _provider
+
+
 def _build_status_bar(engine: ConversationEngine, model_label: str) -> Panel:
     """Render a one-line status panel for the journaler chat loop."""
     status = engine.get_status()
@@ -827,11 +937,15 @@ def _build_status_bar(engine: ConversationEngine, model_label: str) -> Panel:
     topic = status["current_topic"] or "—"
     turns = status["history_turns"]
     files = len(engine.list_loaded_files())
+    gen_headroom = status.get("gen_headroom", 0)
+    gen_color = "red" if gen_headroom < 512 else ("yellow" if gen_headroom < 2048 else "green")
 
     t = Text(overflow="ellipsis", no_wrap=True)
     t.append(f" Model: {model_label}", style="cyan")
     t.append(" │ ", style="dim")
     t.append(f"Context: {raw_pct} {gauge}", style=color)
+    t.append(" │ ", style="dim")
+    t.append(f"Gen: ~{gen_headroom:,}", style=gen_color)
     t.append(" │ ", style="dim")
     t.append(f"Turns: {turns}", style="white")
     t.append(" │ ", style="dim")
@@ -889,6 +1003,7 @@ def _handle_chat_slash_command(
       /model                     Show or switch HF model (profile or path).
       /model_browse              Interactive picker for mlx-community models.
       /load <path> [-r]          Load a file or directory into context.
+      /load_recent [N] [--days D] [--list]  Load most recently created files across the workspace.
       /load_browse               Interactive file browser for org-roam files.
       /agent_browse              Interactive skill picker for agent delegation.
       /edit_browse               Interactive file browser to set /edit target.
@@ -898,6 +1013,7 @@ def _handle_chat_slash_command(
       /summarize                 Generate today's daily summary now and archive history.
       /status                    Show context management state (pressure, turns, etc.)
       /budget                    Show token budget breakdown.
+      /output [set <k> <v>]      Show or change output-limit policy (summarize/continue/stop).
       /topic                     Show the currently detected conversation topic.
       /persona [<name>|reset|list]  Show, swap, reset, or list active Journaler persona.
       /find <title fragment>     Search org-roam files by #+title:.
@@ -1005,6 +1121,20 @@ def _handle_chat_slash_command(
 
         msg = _handle_skills_command(delegator)
         chat_console.print(f"[green]{escape(msg)}[/green]")
+        return
+
+    if cmd == "/blender":
+        from engineering_hub.blender import service as blender_service
+
+        sub = parts[1].lower() if len(parts) > 1 else "status"
+        if sub != "status":
+            chat_console.print("[yellow]Usage: /blender status[/yellow]")
+            return
+        chat_console.print(blender_service.format_status_message())
+        return
+
+    if cmd == "/horn":
+        chat_console.print(Markdown(horn_service.handle_slash_command(raw)))
         return
 
     if cmd in ("/tasks", "/queue"):
@@ -1287,6 +1417,7 @@ def _handle_chat_slash_command(
             "\n[bold cyan]Slash commands:[/bold cyan]\n"
             "  [cyan]/load <path> [-r][/cyan]          Load a file or directory into context\n"
             "                                 (-r / --recursive scans subdirectories)\n"
+            "  [cyan]/load_recent [N] [--days D] [--list][/cyan]  Load most recently created workspace files\n"
             "  [cyan]/load_browse[/cyan]               Browse and select org-roam files to load\n"
             "  [cyan]/model[/cyan]                     Show active MLX model / profile\n"
             "  [cyan]/model <profile>[/cyan]           Switch to a named journaler.models profile\n"
@@ -1299,6 +1430,7 @@ def _handle_chat_slash_command(
             "  [cyan]/clear --hard[/cyan]              Full reset: conversation + scan state\n"
             "  [cyan]/status[/cyan]                    Show context pressure and token usage\n"
             "  [cyan]/budget[/cyan]                    Show token budget breakdown\n"
+            "  [cyan]/output[/cyan]                    Show/set output-limit policy (summarize/continue/stop)\n"
             "  [cyan]/topic[/cyan]                     Show currently detected conversation topic\n"
             "  [cyan]/agent <type> <desc>[/cyan]      Delegate to a named agent (see README)\n"
             "  [cyan]/history <query>[/cyan]           Retrieve prior chat excerpts\n"
@@ -1401,8 +1533,19 @@ def _handle_chat_slash_command(
         table.add_row("─" * 20, "─" * 10)
         table.add_row("[bold]Used[/bold]", f"[bold]{b.used:,}[/bold]")
         table.add_row("[bold]Available[/bold]", f"[bold]{b.available:,}[/bold]")
+        gen_headroom = max(
+            0,
+            b.window_size - b.used - engine.get_output_limit().headroom_safety_tokens,
+        )
+        table.add_row(
+            "[bold]Generation headroom (est.)[/bold]", f"[bold]{gen_headroom:,}[/bold]"
+        )
         table.add_row("[bold]Utilization[/bold]", f"[bold]{b.utilization:.0%}[/bold]")
         chat_console.print(table)
+        return
+
+    if cmd == "/output":
+        _handle_output_command(parts, engine, chat_console)
         return
 
     if cmd == "/topic":
@@ -1533,6 +1676,82 @@ def _handle_chat_slash_command(
         color = "green" if ok else "red"
         for line in msg.splitlines():
             chat_console.print(f"[{color}]{escape(line)}[/{color}]")
+        return
+
+    if cmd == "/load_recent":
+        from datetime import datetime as _dt
+
+        from engineering_hub.journaler.recent_files import (
+            collect_recent_files,
+            default_recent_roots,
+        )
+
+        list_only = "--list" in parts
+        default_limit = int(
+            getattr(export_settings, "journaler_load_recent_max_files", 5) or 5
+        )
+        default_days = getattr(export_settings, "journaler_load_recent_days", 30)
+
+        limit = default_limit
+        days: int | None = default_days
+        positional = [p for p in parts[1:] if not p.startswith("-")]
+        if positional:
+            try:
+                limit = int(positional[0])
+            except ValueError:
+                chat_console.print(
+                    "[yellow]Usage: /load_recent [N] [--days D] [--list][/yellow]"
+                )
+                return
+        if "--days" in parts:
+            idx = parts.index("--days")
+            try:
+                days = int(parts[idx + 1])
+            except (IndexError, ValueError):
+                chat_console.print("[yellow]--days expects an integer[/yellow]")
+                return
+
+        roots = default_recent_roots(export_config, export_settings)
+        if not roots:
+            chat_console.print(
+                "[yellow]/load_recent could not resolve any scan roots "
+                "(start with 'journaler chat').[/yellow]"
+            )
+            return
+
+        files = collect_recent_files(
+            roots,
+            extensions=SUPPORTED_EXTENSIONS,
+            limit=limit,
+            days=days,
+        )
+        if not files:
+            window = f" in the last {days} day(s)" if days else ""
+            chat_console.print(f"[dim]No recent files found{window}.[/dim]")
+            return
+
+        if list_only:
+            chat_console.print(
+                f"[bold]Most recently created files (top {len(files)}):[/bold]"
+            )
+            for i, rf in enumerate(files, 1):
+                created = _dt.fromtimestamp(rf.created_ts).strftime("%Y-%m-%d %H:%M")
+                chat_console.print(
+                    f"  [cyan]{i}.[/cyan] [dim]{created}[/dim] "
+                    f"[magenta]{rf.root_label}[/magenta] {escape(str(rf.path))}"
+                )
+            chat_console.print("[dim]Run /load_recent without --list to load them.[/dim]")
+            return
+
+        for rf in files:
+            created = _dt.fromtimestamp(rf.created_ts).strftime("%Y-%m-%d %H:%M")
+            chat_console.print(
+                f"[dim]({rf.root_label}, created {created})[/dim] {escape(str(rf.path))}"
+            )
+            ok, msg = engine.load_file(rf.path, extensions=SUPPORTED_EXTENSIONS)
+            color = "green" if ok else "red"
+            for line in msg.splitlines():
+                chat_console.print(f"[{color}]{escape(line)}[/{color}]")
         return
 
     if cmd == "/load_browse":
@@ -1923,6 +2142,7 @@ def cmd_journaler(args: argparse.Namespace) -> int:
     from engineering_hub.journaler.daemon import (
         JournalerConfig,
         generate_briefing_now,
+        output_limit_config_from_settings,
         pressure_config_from_settings,
         run_daemon,
     )
@@ -1970,6 +2190,7 @@ def cmd_journaler(args: argparse.Namespace) -> int:
             model_context_window=spec.model_context_window,
             max_history_turns=settings.journaler_max_conversation_history,
         ),
+        output_limit=output_limit_config_from_settings(settings),
         temp=spec.temp,
         top_p=spec.top_p,
         min_p=spec.min_p,
@@ -2002,6 +2223,9 @@ def cmd_journaler(args: argparse.Namespace) -> int:
         conversation_summary_excerpt_chars=(
             settings.journaler_conversation_summary_excerpt_chars
         ),
+        roam_task_lookback_days=settings.journaler_roam_task_lookback_days,
+        roam_task_max_files=settings.journaler_roam_task_max_files,
+        prose_completion_detection=settings.journaler_prose_completion_detection,
         org_link_on_relation=settings.journaler_org_link_on_relation,
         discussion_briefing_enabled=settings.journaler_discussion_briefing_enabled,
         discussion_briefing_time=settings.journaler_discussion_briefing_time,
@@ -2112,6 +2336,7 @@ def cmd_journaler(args: argparse.Namespace) -> int:
             max_history=config.max_conversation_history,
             max_tokens=config.max_tokens,
             pressure_config=pressure_cfg_chat,
+            output_limit=config.get_output_limit(),
             model_context_window=config.model_context_window,
             corpus_service=config.corpus_service,
             load_file_budget=config.get_load_file_budget(),
@@ -2127,6 +2352,8 @@ def cmd_journaler(args: argparse.Namespace) -> int:
             web_search_anthropic_tool_version=config.web_search_anthropic_tool_version,
             web_search_anthropic_max_uses=config.web_search_anthropic_max_uses,
         )
+        # Interactive truncation recovery menu for output_limit.policy == "prompt".
+        engine.set_output_choice_provider(_interactive_output_choice(console))
 
         delegator = build_delegator(
             backend,
@@ -3593,6 +3820,50 @@ def cmd_zettel(args: argparse.Namespace) -> int:
     return 1
 
 
+def cmd_horn(args: argparse.Namespace) -> int:
+    """Run horn iterator parametric sweeps and show configured defaults."""
+    setup_logging(args.verbose)
+    settings = load_settings(args.config)
+    sub = getattr(args, "horn_command", None) or "defaults"
+
+    if sub == "defaults":
+        console.print(Markdown(horn_service.format_defaults_report(
+            horn_service.get_defaults(settings)
+        )))
+        return 0
+
+    if sub == "sweep":
+        overrides: dict[str, float] = {}
+        if getattr(args, "step_l", None) is not None:
+            overrides["step_l_mm"] = args.step_l
+        if getattr(args, "step_wh", None) is not None:
+            overrides["step_wh_mm"] = args.step_wh
+        if getattr(args, "flare_rate", None) is not None:
+            overrides["flare_rate_per_m"] = args.flare_rate
+
+        export_fmt = getattr(args, "export", None)
+        if export_fmt:
+            result = horn_service.run_sweep_and_export(
+                settings=settings, overrides=overrides, fmt=export_fmt
+            )
+        else:
+            result = horn_service.run_sweep(settings=settings, overrides=overrides)
+
+        console.print(Markdown(horn_service.format_sweep_report(result)))
+        export = result.get("export")
+        if export:
+            if export.get("success"):
+                console.print(
+                    f"[green]Exported {export['rows']} rows -> {export['path']}[/green]"
+                )
+            else:
+                console.print(f"[yellow]Export failed: {export.get('error')}[/yellow]")
+        return 0
+
+    console.print("[yellow]Usage:[/yellow] engineering-hub horn {sweep|defaults}")
+    return 1
+
+
 def main() -> int:
     """Main entry point."""
     parser = argparse.ArgumentParser(
@@ -3991,6 +4262,23 @@ def main() -> int:
         help="Extra tag to attach (can be used multiple times)",
     )
 
+    # horn command
+    horn_parser = subparsers.add_parser(
+        "horn",
+        help="Parametric exponential-horn sweeps with LVT constraint validation",
+    )
+    horn_sub = horn_parser.add_subparsers(dest="horn_command")
+    horn_sub.add_parser("defaults", help="Show configured LVT constraints and sweep bounds")
+    horn_sweep_p = horn_sub.add_parser("sweep", help="Run the parametric horn sweep")
+    horn_sweep_p.add_argument("--export", choices=["csv", "org"], default=None,
+                              help="Export all rows to the horn_iterator output dir")
+    horn_sweep_p.add_argument("--step-l", dest="step_l", type=float, default=None,
+                              help="Override exponential-length step (mm)")
+    horn_sweep_p.add_argument("--step-wh", dest="step_wh", type=float, default=None,
+                              help="Override mouth width/height step (mm)")
+    horn_sweep_p.add_argument("--flare-rate", dest="flare_rate", type=float, default=None,
+                              help="Override flare rate m (/m)")
+
     # zettel command
     zettel_parser = subparsers.add_parser(
         "zettel",
@@ -4110,6 +4398,7 @@ def main() -> int:
         "docker": cmd_docker,
         "load": cmd_load,
         "zettel": cmd_zettel,
+        "horn": cmd_horn,
         "memory": cmd_memory,
         "weekly-review": cmd_weekly_review,
     }

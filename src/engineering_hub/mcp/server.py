@@ -35,6 +35,7 @@ import logging
 from pathlib import Path
 
 from fastmcp import Context, FastMCP
+from fastmcp.server import create_proxy
 from fastmcp.server.lifespan import lifespan
 
 from engineering_hub.config.loader import find_config_file
@@ -43,6 +44,11 @@ from engineering_hub.mcp.rental_scout import mcp as rental_scout_mcp
 from engineering_hub.memory import MemoryService
 
 logger = logging.getLogger(__name__)
+
+
+def _load_startup_settings() -> Settings:
+    config_path = find_config_file()
+    return Settings.from_yaml(config_path) if config_path else Settings()
 
 
 @lifespan
@@ -75,13 +81,32 @@ mcp = FastMCP(
         "Engineering Hub memory tools. Use search_brain to find relevant past work, "
         "browse_recent to see latest activity, capture_note to store observations, "
         "and get_stats for a database overview. Rental scout tools are mounted "
-        "under the rental_ namespace (rental_run_scan, rental_get_top_matches, ...)."
+        "under the rental_ namespace (rental_run_scan, rental_get_top_matches, ...). "
+        "When blender.enabled is true in config, Blender MCP tools are proxied under "
+        "the blender_ namespace (requires a running Blender session with MCP addon)."
     ),
     lifespan=memory_lifespan,
 )
 
 # Bay Area Rental Scout tools (rental_get_criteria, rental_run_scan, ...)
 mcp.mount(rental_scout_mcp, namespace="rental")
+
+_startup_settings = _load_startup_settings()
+if _startup_settings.blender_enabled:
+    _blender_url = _startup_settings.blender_mcp_url
+    _token = (_startup_settings.blender_auth_token or "").strip()
+    logger.info("Mounting Blender MCP proxy at %s (namespace=blender)", _blender_url)
+    if _token:
+        from fastmcp import Client
+        from fastmcp.client.transports import StreamableHttpTransport
+
+        _transport = StreamableHttpTransport(
+            _blender_url,
+            headers={"Authorization": f"Bearer {_token}"},
+        )
+        mcp.mount(create_proxy(Client(_transport), name="blender"), namespace="blender")
+    else:
+        mcp.mount(create_proxy(_blender_url), namespace="blender")
 
 
 @mcp.tool

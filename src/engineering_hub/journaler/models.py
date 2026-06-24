@@ -149,6 +149,88 @@ class AgentOutput:
     summary: str
 
 
+TaskStatus = Literal["pending", "completed"]
+CompletionKind = Literal["checkbox", "todo_state", "prose", "queue_status"]
+
+
+@dataclass
+class TrackedTask:
+    """A task with source provenance for briefing and stale detection."""
+
+    text: str
+    status: TaskStatus
+    source_path: str
+    source_date: str
+    source_heading: str
+    line_hint: int
+    task_key: str
+    completion_kind: CompletionKind
+    first_seen: str
+    last_seen: str
+
+    def to_dict(self) -> dict:
+        return {
+            "text": self.text,
+            "status": self.status,
+            "source_path": self.source_path,
+            "source_date": self.source_date,
+            "source_heading": self.source_heading,
+            "line_hint": self.line_hint,
+            "task_key": self.task_key,
+            "completion_kind": self.completion_kind,
+            "first_seen": self.first_seen,
+            "last_seen": self.last_seen,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> TrackedTask:
+        return cls(
+            text=data.get("text", ""),
+            status=data.get("status", "pending"),
+            source_path=data.get("source_path", ""),
+            source_date=data.get("source_date", ""),
+            source_heading=data.get("source_heading", ""),
+            line_hint=int(data.get("line_hint", 0)),
+            task_key=data.get("task_key", ""),
+            completion_kind=data.get("completion_kind", "checkbox"),
+            first_seen=data.get("first_seen", ""),
+            last_seen=data.get("last_seen", ""),
+        )
+
+
+@dataclass
+class TaskStatusChange:
+    """A pending task that became completed since the prior scan."""
+
+    task_key: str
+    text: str
+    source_path: str
+    source_date: str
+    completion_kind: CompletionKind
+    detail: str = ""
+
+    def to_dict(self) -> dict:
+        return {
+            "task_key": self.task_key,
+            "text": self.text,
+            "source_path": self.source_path,
+            "source_date": self.source_date,
+            "completion_kind": self.completion_kind,
+            "detail": self.detail,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> TaskStatusChange:
+        return cls(
+            task_key=data.get("task_key", ""),
+            text=data.get("text", ""),
+            source_path=data.get("source_path", ""),
+            source_date=data.get("source_date", ""),
+            completion_kind=data.get("completion_kind", "checkbox"),
+            detail=data.get("detail", ""),
+        )
+
+
 @dataclass
 class ContextSnapshot:
     """Compressed context snapshot built from scanning."""
@@ -176,8 +258,14 @@ class ContextSnapshot:
     # Pending tasks with no journal mention in the lookback window
     stale_tasks: list[str] = field(default_factory=list)
 
-    # Per-task first-seen dates for stale detection: {task_fragment: date_str}
+    # Per-task first-seen dates for stale detection: {task_key: date_str}
     task_first_seen: dict[str, str] = field(default_factory=dict)
+
+    # Full task registry with source provenance
+    tracked_tasks: list[TrackedTask] = field(default_factory=list)
+
+    # Pending → completed transitions detected on the latest scan
+    task_status_changes: list[TaskStatusChange] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         """Serialize to a JSON-safe dictionary."""
@@ -195,10 +283,14 @@ class ContextSnapshot:
             "active_roam_nodes": self.active_roam_nodes,
             "stale_tasks": self.stale_tasks,
             "task_first_seen": self.task_first_seen,
+            "tracked_tasks": [t.to_dict() for t in self.tracked_tasks],
+            "task_status_changes": [c.to_dict() for c in self.task_status_changes],
         }
 
     @classmethod
     def from_dict(cls, data: dict) -> ContextSnapshot:
+        tracked_raw = data.get("tracked_tasks") or []
+        changes_raw = data.get("task_status_changes") or []
         return cls(
             last_scan=data.get("last_scan", ""),
             today_date=data.get("today_date", ""),
@@ -213,6 +305,8 @@ class ContextSnapshot:
             active_roam_nodes=data.get("active_roam_nodes", []),
             stale_tasks=data.get("stale_tasks", []),
             task_first_seen=data.get("task_first_seen", {}),
+            tracked_tasks=[TrackedTask.from_dict(t) for t in tracked_raw],
+            task_status_changes=[TaskStatusChange.from_dict(c) for c in changes_raw],
         )
 
 

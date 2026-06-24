@@ -168,8 +168,11 @@ class BriefingTaskExtractor:
         self,
         briefing_markdown: str,
         source: str,
+        completed_task_keys: set[str] | None = None,
     ) -> list[BriefingTask]:
         """Run the extraction prompt and parse results into BriefingTask objects."""
+        from engineering_hub.journaler.task_resolution import is_task_already_completed
+
         chat_excerpt = _read_recent_chat_context(
             self._state_dir, lookback_days=self._chat_lookback_days
         )
@@ -187,7 +190,21 @@ class BriefingTaskExtractor:
             logger.warning("Task extraction failed: %s", exc)
             return []
 
-        return self._parse_extraction(raw, source)
+        tasks = self._parse_extraction(raw, source)
+        if not completed_task_keys:
+            return tasks
+        filtered = [
+            t
+            for t in tasks
+            if not is_task_already_completed(t.description, completed_task_keys)
+        ]
+        if len(filtered) < len(tasks):
+            logger.info(
+                "Filtered %d already-completed tasks from %s extraction",
+                len(tasks) - len(filtered),
+                source,
+            )
+        return filtered
 
     def _parse_extraction(self, raw: str, source: str) -> list[BriefingTask]:
         tasks: list[BriefingTask] = []

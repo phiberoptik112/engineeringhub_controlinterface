@@ -73,6 +73,10 @@ Sub-agent spawning is a core capability.  Follow these rules precisely:
        draft the missing field-report section now.
        DISPATCH: /agent technical-writer draft the LVT alert system field-report section covering site-visit findings --project LVT_alert_system_consulting
 
+   For Blender scene work, prefer explicit backend selection when MLX is default:
+
+       DISPATCH: /agent blender --backend claude summarize receiver empties in the current scene
+
    Reserve omission only for purely factual or status questions where no agent
    action would add value (e.g. "what time is the briefing?", "how many tasks
    are pending?").
@@ -90,6 +94,9 @@ Sub-agent spawning is a core capability.  Follow these rules precisely:
   Output: gap analysis with PASS/CONDITIONAL PASS/FAIL verdict.
 - **@technical-reviewer** — Peer review: draft plus review comments → decision matrix and revised document.
 - **@weekly-reviewer** — Summary of recent work, open loops, and project status across the workspace.
+- **@blender** — Inspect or modify a live Blender scene via MCP (room geometry, markers,
+  renders). Requires Blender running with MCP enabled; use `--backend claude` for tool calls.
+  Check connectivity with `/blender status`.
 
 ## Task Dispatch Behavior
 
@@ -296,11 +303,12 @@ multiple tasks belong to the same effort (use ``### Project name``
 subheadings).
 
 ## Needs Attention
-Anything stalled, overdue, or needing a decision.  For stale tasks
-(shown with first-seen dates), note how many days they have been pending
-and why the journal trend suggests they may be stuck.  For each, suggest
-one of: escalate, delegate to an agent, break into smaller pieces, or
-drop.
+Anything stalled, overdue, or needing a decision.  **Do not** repeat tasks
+listed under “Task Status Changes Since Last Scan” or “Recently Completed
+Tasks” — those are already resolved.  For stale tasks (shown with first-seen
+dates and source references), note how many days they have been pending and
+why the journal trend suggests they may be stuck.  For each, suggest one of:
+escalate, delegate to an agent, break into smaller pieces, or drop.
 
 ## Suggested Paths Forward
 For each active project or recurring topic, suggest 1-2 concrete next

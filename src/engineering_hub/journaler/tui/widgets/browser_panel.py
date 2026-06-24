@@ -29,7 +29,7 @@ BrowserMode = Literal["load", "edit", "skills", "capture", "models"]
 
 SUPPORTED_EXTENSIONS = frozenset({
     ".md", ".txt", ".org", ".py", ".yaml", ".yml",
-    ".json", ".tex", ".csv", ".toml", ".rst", ".docx",
+    ".json", ".tex", ".csv", ".toml", ".rst", ".docx", ".pdf",
 })
 
 _EDIT_EXTENSIONS = frozenset({".org"})

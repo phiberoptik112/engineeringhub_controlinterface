@@ -10,12 +10,16 @@ from __future__ import annotations
 
 import json
 import logging
+import queue
+import re
+import threading
 import uuid
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Iterator
+from typing import TYPE_CHECKING, Any, Callable, Iterator
 
+from engineering_hub.journaler.org_writer import append_to_heading, read_section_body
 from engineering_hub.memory.service import MemoryResult, MemoryService
 
 if TYPE_CHECKING:
@@ -34,6 +38,13 @@ from engineering_hub.journaler.context_manager import (
     TopicTracker,
     estimate_tokens,
     execute_clear,
+)
+from engineering_hub.journaler.output_limit import (
+    Action,
+    GenerationOutcome,
+    OrchestratorResult,
+    OutputLimitConfig,
+    OutputLimitOrchestrator,
 )
 from engineering_hub.journaler.session_retrieval import (
     format_past_session_block,
@@ -60,15 +71,73 @@ SUPPORTED_EXTENSIONS: frozenset[str] = frozenset(
         ".toml",
         ".rst",
         ".docx",
+        ".pdf",
     }
 )
 
 logger = logging.getLogger(__name__)
 
+_DATE_TAG = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+_CROSS_REF_HEADING = "Journaler Cross-References"
+
+# Prompts for output-limit continuation fidelity (kept compact on purpose).
+_CONTINUATION_BRIEF_PROMPT = (
+    "You are helping another assistant resume an interrupted response.\n"
+    "The user's original request was:\n{intent}\n\n"
+    "The response so far (it was cut off) is:\n{partial}\n\n"
+    "Write a COMPACT brief (bullet points, no preamble) capturing only what is "
+    "needed to finish the deliverable: the concrete facts, values, decisions, "
+    "and structure already established, plus exactly what still needs to be "
+    "written. Do not restate the full text."
+)
+
+_PARTIAL_SUMMARY_PROMPT = (
+    "Summarize the key established facts, values, and decisions in the text "
+    "below as compact bullet points (no preamble). This will be used to finish "
+    "an interrupted answer, so preserve specifics:\n\n{text}"
+)
+
 
 # ---------------------------------------------------------------------------
 # Daily-summary relation helpers
 # ---------------------------------------------------------------------------
+
+def _relation_excerpt(content: str, *, excerpt_chars: int) -> str:
+    excerpt = content[:excerpt_chars].replace("\n", " ").strip()
+    if len(content) > excerpt_chars:
+        excerpt += "..."
+    return excerpt
+
+
+def _related_date_from_hit(hit: MemoryResult) -> str:
+    if hit.created_at:
+        return hit.created_at[:10]
+    for tag in hit.tags:
+        if _DATE_TAG.match(tag):
+            return tag
+    return ""
+
+
+def _resolve_relation_file_link(
+    related_date: str,
+    journal_dir: Path,
+    state_dir: Path,
+) -> str:
+    if not related_date:
+        return "Related conversation"
+
+    journal_path = (journal_dir / f"{related_date}.org").expanduser().resolve()
+    if journal_path.is_file():
+        return f"[[file:{journal_path}][{related_date} daily journal]]"
+
+    summary_path = (
+        state_dir / "daily_summaries" / f"{related_date}.md"
+    ).expanduser().resolve()
+    if summary_path.is_file():
+        return f"[[file:{summary_path}][Journaler summary {related_date}]]"
+
+    return related_date
+
 
 def _format_relation_block(
     hits: list[MemoryResult],
@@ -89,43 +158,45 @@ def _format_relation_block(
         "",
     ]
     for hit in hits:
-        date_str = (hit.created_at or "unknown")[:10]
-        excerpt = hit.content[:excerpt_chars].replace("\n", " ").strip()
-        if len(hit.content) > excerpt_chars:
-            excerpt += "..."
+        date_str = _related_date_from_hit(hit) or "unknown"
+        excerpt = _relation_excerpt(hit.content, excerpt_chars=excerpt_chars)
         lines.append(f"**{date_str}** _{hit.similarity:.0%} match_")
         lines.append(f"> {excerpt}")
         lines.append("")
     return "\n".join(lines)
 
 
-def _write_relation_link(journal_dir: Path, hit: MemoryResult) -> None:
+def _write_relation_link(
+    journal_dir: Path,
+    state_dir: Path,
+    hit: MemoryResult,
+    *,
+    excerpt_chars: int = 400,
+) -> None:
     """Append a cross-reference link to the current day's journal.
 
     Creates a ``* Journaler Cross-References`` heading if it does not
     exist, then appends a dated link so the org file accumulates a
     lightweight relation graph over time.
     """
-    from datetime import date as _date
-
-    from engineering_hub.journaler.org_writer import append_to_heading
-
-    today_path = journal_dir / f"{_date.today().isoformat()}.org"
+    today_path = journal_dir / f"{date.today().isoformat()}.org"
     if not today_path.exists():
         return
 
-    related_date = (hit.created_at or "")[:10]
-    excerpt = hit.content[:120].replace("\n", " ").strip()
-    if len(hit.content) > 120:
-        excerpt += "..."
-    link_text = (
-        f"- [[journaler:{related_date}]] Related conversation ({hit.similarity:.0%}): {excerpt}"
-    )
+    related_date = _related_date_from_hit(hit)
+    if related_date:
+        existing = read_section_body(today_path, _CROSS_REF_HEADING)
+        if related_date in existing:
+            return
+
+    link_label = _resolve_relation_file_link(related_date, journal_dir, state_dir)
+    excerpt = _relation_excerpt(hit.content, excerpt_chars=excerpt_chars)
+    link_text = f"- {link_label} ({hit.similarity:.0%} match): {excerpt}"
 
     try:
         append_to_heading(
             today_path,
-            "Journaler Cross-References",
+            _CROSS_REF_HEADING,
             link_text,
             create_heading_if_missing=True,
         )
@@ -502,6 +573,7 @@ class ConversationEngine:
         max_history: int = 20,
         max_tokens: int = 4096,
         pressure_config: PressureConfig | None = None,
+        output_limit: OutputLimitConfig | None = None,
         model_context_window: int = 32768,
         corpus_service: CorpusService | None = None,
         load_file_budget: LoadFileBudgetConfig | None = None,
@@ -572,6 +644,11 @@ class ConversationEngine:
             config=cfg,
         )
         self._pressure_config = cfg
+        self._output_limit = output_limit or OutputLimitConfig()
+        # Optional interactive chooser for ``policy == "prompt"`` (set by the CLI).
+        self._output_choice_provider: (
+            Callable[[GenerationOutcome], Action | None] | None
+        ) = None
         self._roam_edit_target: Path | None = None
 
         self.session_id = str(uuid.uuid4())
@@ -737,17 +814,26 @@ class ConversationEngine:
         self._context_block = context_block
         self.budget.context_snapshot_tokens = estimate_tokens(context_block)
 
-    def chat(self, message: str) -> str:
-        """Send a user message and get a response.
+    # ------------------------------------------------------------------
+    # Output-limit policy plumbing
+    # ------------------------------------------------------------------
 
-        Runs pre-call pressure checks (compression / trim if needed), builds
-        the message array, calls the model, runs post-call topic tracking,
-        and flushes archived turns to conversation.jsonl.
-        """
-        self.budget.corpus_injection_tokens = 0
-        self.budget.history_tokens = self.history.total_tokens
-        self._sync_loaded_files_budget()
+    def set_output_choice_provider(
+        self, provider: Callable[[GenerationOutcome], Action | None] | None
+    ) -> None:
+        """Register an interactive chooser used when ``policy == "prompt"``."""
+        self._output_choice_provider = provider
 
+    def get_output_limit(self) -> OutputLimitConfig:
+        """Return the active output-limit configuration."""
+        return self._output_limit
+
+    def set_output_limit(self, config: OutputLimitConfig) -> None:
+        """Replace the active output-limit configuration."""
+        self._output_limit = config
+
+    def _build_extra_suffix(self, message: str) -> str | None:
+        """Assemble corpus RAG / past-session / relation context for a turn."""
         extra_suffix: str | None = None
         cs = self._corpus_service
         if cs is not None and cs.is_available() and message.strip():
@@ -776,7 +862,6 @@ class ConversationEngine:
             except Exception as exc:
                 logger.warning("Journaler past-session retrieval failed: %s", exc)
 
-        # Per-turn relation search: check daily summaries for related past conversations
         if self._memory_service and message.strip():
             try:
                 relation_hits = self._memory_service.search(
@@ -798,146 +883,173 @@ class ConversationEngine:
                         else relation_block
                     )
                     if self._org_link_on_relation and self._journal_dir:
-                        _write_relation_link(self._journal_dir, relation_hits[0])
+                        _write_relation_link(
+                            self._journal_dir,
+                            self._log_dir,
+                            relation_hits[0],
+                            excerpt_chars=self._pressure_config.org_link_excerpt_chars,
+                        )
             except Exception as exc:
                 logger.warning("Journaler relation search failed (non-fatal): %s", exc)
 
-        if extra_suffix:
-            self.budget.corpus_injection_tokens = estimate_tokens(extra_suffix)
-        else:
-            self.budget.corpus_injection_tokens = 0
+        return extra_suffix
 
-        # Pre-call: check pressure, compress/trim if necessary
-        pre_actions = self.pressure_manager.pre_call_check()
+    def _make_orchestrator(
+        self,
+        message: str,
+        extra_suffix: str | None,
+        on_token: Callable[[str], None] | None,
+    ) -> OutputLimitOrchestrator:
+        """Wire an :class:`OutputLimitOrchestrator` to this engine's backend."""
 
-        messages = self._build_messages(extra_system_suffix=extra_suffix)
-        messages.append({"role": "user", "content": message})
+        def _generate(
+            continuation_prompt: str | None, accumulated: str, max_tokens: int
+        ) -> tuple[str, int]:
+            messages = self._build_messages(extra_system_suffix=extra_suffix)
+            messages.append({"role": "user", "content": message})
+            if continuation_prompt is not None:
+                if accumulated.strip():
+                    messages.append({"role": "assistant", "content": accumulated})
+                messages.append({"role": "user", "content": continuation_prompt})
+            if on_token is not None:
+                chunks: list[str] = []
+                for token in self._backend.stream_generate(messages, max_tokens):
+                    chunks.append(token)
+                    on_token(token)
+                text = "".join(chunks)
+            else:
+                text = self._backend.chat(messages, max_tokens)
+            return text, estimate_tokens(text)
 
-        response = self._backend.chat(messages, self._max_tokens)
+        def _prompt_tokens() -> int:
+            messages = self._build_messages(extra_system_suffix=extra_suffix)
+            total = sum(estimate_tokens(m["content"]) for m in messages)
+            return total + estimate_tokens(message)
 
-        # Record in history (post-generation so history doesn't include this turn in the call)
-        now = datetime.now().isoformat(timespec="seconds")
-        resp_time = datetime.now().isoformat(timespec="seconds")
-        self.history.add("user", message)
-        self.history.add("assistant", response)
-        self.budget.history_tokens = self.history.total_tokens
+        def _summarize_history() -> str | None:
+            result = self.compressor.compress(self.history, force=True)
+            if result.compressed:
+                self.budget.history_tokens = self.history.total_tokens
+                return (
+                    f"[Context compressed: freed {result.tokens_freed} tokens "
+                    f"from {result.turns_compressed} earlier exchanges]"
+                )
+            return None
 
-        # Post-call: topic tracking
-        post_actions = self.pressure_manager.post_call_check(message, response)
+        def _summarize_text(text: str) -> str:
+            return self._raw_complete(
+                _PARTIAL_SUMMARY_PROMPT.format(text=text),
+                self._output_limit.continuation_summary_tokens,
+            )
 
-        # Log raw turns to JSONL
-        self._log_turn("user", message, now)
-        self._log_turn("assistant", response, resp_time)
+        def _build_brief(intent: str, partial: str) -> str:
+            return self._raw_complete(
+                _CONTINUATION_BRIEF_PROMPT.format(intent=intent, partial=partial),
+                self._output_limit.continuation_summary_tokens,
+            )
 
-        # Flush evicted/archived turns to JSONL
-        archived = self.history.flush_archive()
-        if archived:
-            self._log_archived_turns(archived)
+        return OutputLimitOrchestrator(
+            self._output_limit,
+            window_size=self.budget.window_size,
+            requested_max_tokens=self._max_tokens,
+            generate=_generate,
+            prompt_tokens=_prompt_tokens,
+            estimate_tokens=estimate_tokens,
+            summarize_history=_summarize_history,
+            summarize_text=_summarize_text,
+            build_brief=_build_brief,
+            choice_provider=self._output_choice_provider,
+        )
 
-        # Prepend action notifications when configured
-        all_actions = pre_actions + post_actions
-        if all_actions and self._pressure_config.notify_user_on_action:
-            action_text = "\n".join(all_actions)
-            response = f"{action_text}\n\n{response}"
-
-        self.budget.corpus_injection_tokens = 0
-        return response
-
-    def stream_chat(self, message: str) -> Iterator[str]:
-        """Streaming counterpart to :meth:`chat` — yields token strings as they arrive.
-
-        Performs all the same pre-call setup (corpus RAG, relation search, pressure
-        management) and post-call bookkeeping (history, logging, topic tracking) as
-        :meth:`chat`.  The full response is assembled from yielded tokens and stored
-        in history only after the generator is fully consumed by the caller.
-        """
+    def _run_output_policy(
+        self, message: str, on_token: Callable[[str], None] | None = None
+    ) -> OrchestratorResult:
+        """Shared generation path for :meth:`chat` and :meth:`stream_chat`."""
         self.budget.corpus_injection_tokens = 0
         self.budget.history_tokens = self.history.total_tokens
         self._sync_loaded_files_budget()
 
-        extra_suffix: str | None = None
-        cs = self._corpus_service
-        if cs is not None and cs.is_available() and message.strip():
-            try:
-                results = cs.search(message)
-                if results:
-                    extra_suffix = cs.format_for_context(results)
-            except Exception as exc:
-                logger.warning("Journaler corpus RAG failed (non-fatal): %s", exc)
-
-        if references_past_session(message):
-            try:
-                session_hits = retrieve_past_sessions(
-                    message,
-                    state_dir=self._log_dir,
-                    max_results=self._pressure_config.past_session_search_k,
-                    excerpt_chars=self._pressure_config.past_session_excerpt_chars,
-                )
-                session_block = format_past_session_block(session_hits)
-                if session_block:
-                    extra_suffix = (
-                        (extra_suffix + "\n\n" + session_block) if extra_suffix else session_block
-                    )
-            except Exception as exc:
-                logger.warning("Journaler past-session retrieval failed: %s", exc)
-
-        if self._memory_service and message.strip():
-            try:
-                relation_hits = self._memory_service.search(
-                    message,
-                    source="journaler",
-                    threshold=self._relation_threshold,
-                    k=self._pressure_config.conversation_relation_k,
-                )
-                if relation_hits:
-                    relation_block = _format_relation_block(
-                        relation_hits,
-                        excerpt_chars=self._pressure_config.conversation_relation_excerpt_chars,
-                    )
-                    extra_suffix = (
-                        (extra_suffix + "\n\n" + relation_block) if extra_suffix else relation_block
-                    )
-                    if self._org_link_on_relation and self._journal_dir:
-                        _write_relation_link(self._journal_dir, relation_hits[0])
-            except Exception as exc:
-                logger.warning("Journaler relation search failed (non-fatal): %s", exc)
-
+        extra_suffix = self._build_extra_suffix(message)
         if extra_suffix:
             self.budget.corpus_injection_tokens = estimate_tokens(extra_suffix)
         else:
             self.budget.corpus_injection_tokens = 0
 
+        # Pre-call: utilization-based compression/trim (separate from headroom gating).
         pre_actions = self.pressure_manager.pre_call_check()
-        messages = self._build_messages(extra_system_suffix=extra_suffix)
-        messages.append({"role": "user", "content": message})
 
-        chunks: list[str] = []
-        for token in self._backend.stream_generate(messages, self._max_tokens):
-            chunks.append(token)
-            yield token
-
-        response = "".join(chunks)
+        orchestrator = self._make_orchestrator(message, extra_suffix, on_token)
+        result = orchestrator.run(message)
+        final = result.text
 
         now = datetime.now().isoformat(timespec="seconds")
         resp_time = datetime.now().isoformat(timespec="seconds")
         self.history.add("user", message)
-        self.history.add("assistant", response)
+        self.history.add("assistant", final)
         self.budget.history_tokens = self.history.total_tokens
 
-        self.pressure_manager.post_call_check(message, response)
+        post_actions = self.pressure_manager.post_call_check(message, final)
 
         self._log_turn("user", message, now)
-        self._log_turn("assistant", response, resp_time)
+        self._log_turn("assistant", final, resp_time)
 
         archived = self.history.flush_archive()
         if archived:
             self._log_archived_turns(archived)
 
-        if pre_actions and self._pressure_config.notify_user_on_action:
-            action_text = "\n".join(pre_actions)
-            logger.info("Context pressure actions (streaming mode): %s", action_text)
-
         self.budget.corpus_injection_tokens = 0
+
+        if self._pressure_config.notify_user_on_action:
+            result.actions = pre_actions + result.actions + post_actions
+        else:
+            result.actions = []
+        return result
+
+    def chat(self, message: str) -> str:
+        """Send a user message and get a (possibly multi-pass) response.
+
+        Runs pre-call pressure checks, applies the output-limit policy
+        (summarize / continue / stop on truncation), records history, and
+        flushes archived turns to conversation.jsonl.
+        """
+        result = self._run_output_policy(message)
+        response = result.text
+        if result.actions:
+            action_text = "\n".join(result.actions)
+            response = f"{action_text}\n\n{response}"
+        return response
+
+    def stream_chat(self, message: str) -> Iterator[str]:
+        """Streaming counterpart to :meth:`chat` — yields token strings live.
+
+        The output-limit policy runs in a worker thread so continuation passes
+        keep streaming; bracketed action notices are flushed at the end.
+        """
+        result_queue: "queue.Queue[tuple[str, Any]]" = queue.Queue()
+
+        def _on_token(token: str) -> None:
+            result_queue.put(("tok", token))
+
+        def _worker() -> None:
+            try:
+                result = self._run_output_policy(message, on_token=_on_token)
+                result_queue.put(("done", result))
+            except Exception as exc:  # surfaced to the consumer below
+                result_queue.put(("err", exc))
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+        while True:
+            kind, payload = result_queue.get()
+            if kind == "tok":
+                yield payload
+            elif kind == "err":
+                raise payload
+            else:  # "done"
+                result = payload
+                if result.actions:
+                    yield "\n\n" + "\n".join(result.actions)
+                return
 
     def inject_turn(self, user: str, assistant: str) -> None:
         """Inject a pre-computed (user, assistant) exchange into history and the log.
@@ -970,10 +1082,17 @@ class ConversationEngine:
         """Return current context management state for display / /status command."""
         self.budget.history_tokens = self.history.total_tokens
         self._sync_loaded_files_budget()
+        gen_headroom = max(
+            0,
+            self.budget.window_size
+            - self.budget.used
+            - self._output_limit.headroom_safety_tokens,
+        )
         return {
             "context_window": self.budget.window_size,
             "utilization": f"{self.budget.utilization:.0%}",
             "pressure": self.budget.pressure,
+            "gen_headroom": gen_headroom,
             "history_turns": len(self.history.turns),
             "history_tokens": self.history.total_tokens,
             "context_snapshot_tokens": self.budget.context_snapshot_tokens,
@@ -1237,6 +1356,15 @@ class ConversationEngine:
             return False, f"Could not read {path.name}: {exc}"
         except Exception as exc:
             return False, f"Could not load {path.name}: {exc}"
+
+        if not content.strip() or content.strip() == "(No text extracted)":
+            if path.suffix.lower() == ".pdf":
+                return False, (
+                    f"No extractable text in '{path.name}'. It may be a scanned/"
+                    "image-only PDF; install the optional Docling OCR extra "
+                    "(pip install '.[docling-ocrmac]') and retry."
+                )
+            return False, f"No readable text content in '{path.name}'."
 
         truncated = False
         if len(content) > max_chars:

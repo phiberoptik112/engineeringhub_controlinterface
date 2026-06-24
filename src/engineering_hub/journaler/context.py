@@ -15,13 +15,26 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal
 
-from engineering_hub.journaler.models import ContextSnapshot, OrgFileInfo, ScanState
+from engineering_hub.journaler.models import (
+    ContextSnapshot,
+    OrgFileInfo,
+    ScanState,
+    TaskStatusChange,
+    TrackedTask,
+)
 from engineering_hub.journaler.org_parser import (
-    extract_completed_tasks,
-    extract_pending_tasks,
+    extract_tasks_with_provenance,
     extract_topic_keywords,
     parse_org_file,
+    parsed_lines_to_tracked_tasks,
     summarize_file,
+)
+from engineering_hub.journaler.task_resolution import (
+    derive_task_lists,
+    detect_prose_completions,
+    merge_tracked_tasks,
+    normalize_task_key,
+    text_mentions_task,
 )
 
 if TYPE_CHECKING:
@@ -59,6 +72,9 @@ class JournalContext:
         pending_tasks_file: Path | None = None,
         conversation_lookback_days: int = 7,
         conversation_summary_excerpt_chars: int = 800,
+        roam_task_lookback_days: int = 14,
+        roam_task_max_files: int = 30,
+        prose_completion_detection: bool = True,
     ) -> None:
         self.org_roam_dir = org_roam_dir
         self.journal_dir = journal_dir
@@ -75,13 +91,18 @@ class JournalContext:
             200,
             conversation_summary_excerpt_chars,
         )
+        self.roam_task_lookback_days = max(0, roam_task_lookback_days)
+        self.roam_task_max_files = max(1, roam_task_max_files)
+        self.prose_completion_detection = prose_completion_detection
 
         self.state_file = state_dir / "state.json"
         self.cache_file = state_dir / "context_cache.json"
+        self.file_text_cache_path = state_dir / "file_text_cache.json"
 
         self._state = self._load_state()
         self._state.normalize_legacy_keys()
         self._snapshot = self._load_cache()
+        self._file_text_cache = self._load_file_text_cache()
 
     def _resolved_journal_dir(self) -> Path:
         return self.journal_dir.expanduser().resolve()
@@ -142,6 +163,244 @@ class JournalContext:
         if self._pending_tasks_file is not None:
             return self._pending_tasks_file.expanduser().resolve()
         return (self.workspace_dir / ".journaler" / "pending-tasks.org").resolve()
+
+    def _rel_source_path(self, path: Path) -> str:
+        resolved = path.expanduser().resolve()
+        for root in (
+            self.org_roam_dir.expanduser().resolve(),
+            self.workspace_dir.expanduser().resolve(),
+        ):
+            try:
+                return str(resolved.relative_to(root))
+            except ValueError:
+                continue
+        return resolved.name
+
+    def _roam_task_files(self, today: date) -> list[Path]:
+        """Recently modified org-roam notes (excluding daily journals)."""
+        if not self.scan_org_roam_tree:
+            return []
+        roam_dir = self.org_roam_dir.expanduser().resolve()
+        journal_dir = self._resolved_journal_dir()
+        cutoff = today - timedelta(days=self.roam_task_lookback_days)
+        cutoff_mtime = datetime.combine(cutoff, datetime.min.time()).timestamp()
+
+        candidates: list[tuple[float, Path]] = []
+        for org_file in roam_dir.rglob("*.org"):
+            try:
+                org_file.relative_to(journal_dir)
+                continue
+            except ValueError:
+                pass
+            try:
+                mtime = org_file.stat().st_mtime
+            except OSError:
+                continue
+            if mtime >= cutoff_mtime:
+                candidates.append((mtime, org_file.resolve()))
+
+        candidates.sort(key=lambda x: x[0], reverse=True)
+        return [path for _, path in candidates[: self.roam_task_max_files]]
+
+    def _rebuild_task_registry(self, today: date) -> list[TrackedTask]:
+        """Full-window task aggregation from journals, queue, and roam notes."""
+        records: list[TrackedTask] = []
+        journal_sel = self._selected_journal_files(today)
+
+        for org_file in journal_sel:
+            if not org_file.exists():
+                continue
+            file_date = self._extract_date_from_filename(org_file)
+            date_str = file_date.isoformat() if file_date else today.isoformat()
+            rel = self._rel_source_path(org_file)
+            lines = extract_tasks_with_provenance(org_file)
+            records.extend(
+                parsed_lines_to_tracked_tasks(
+                    lines, source_path=rel, source_date=date_str
+                )
+            )
+
+        pending_path = self._resolved_pending_tasks_path()
+        if pending_path.is_file():
+            rel = self._rel_source_path(pending_path)
+            lines = extract_tasks_with_provenance(pending_path)
+            records.extend(
+                parsed_lines_to_tracked_tasks(
+                    lines, source_path=rel, source_date=today.isoformat()
+                )
+            )
+
+        for org_file in self._roam_task_files(today):
+            if not org_file.exists():
+                continue
+            rel = self._rel_source_path(org_file)
+            lines = extract_tasks_with_provenance(org_file)
+            file_date = self._extract_date_from_filename(org_file)
+            if file_date:
+                date_str = file_date.isoformat()
+            else:
+                try:
+                    mtime = org_file.stat().st_mtime
+                    date_str = datetime.fromtimestamp(mtime).date().isoformat()
+                except OSError:
+                    date_str = today.isoformat()
+            records.extend(
+                parsed_lines_to_tracked_tasks(
+                    lines, source_path=rel, source_date=date_str
+                )
+            )
+
+        merged = merge_tracked_tasks(records)
+        for task in merged:
+            stored = self._snapshot.task_first_seen.get(task.task_key)
+            if stored and stored < task.first_seen:
+                task.first_seen = stored
+        return merged
+
+    def _apply_prose_completions(
+        self,
+        tracked: list[TrackedTask],
+        content_changed: list[Path],
+        prose_old_texts: dict[str, str] | None = None,
+    ) -> list[TrackedTask]:
+        if not self.prose_completion_detection or not content_changed:
+            return tracked
+
+        old_texts = prose_old_texts or {}
+        by_key = {t.task_key: t for t in tracked}
+        pending = [t for t in tracked if t.status == "pending"]
+        today_str = date.today().isoformat()
+
+        for path in content_changed:
+            key = ScanState.path_key(path)
+            try:
+                new_text = path.read_text(encoding="utf-8")
+            except OSError:
+                continue
+            old_text = old_texts.get(key, self._file_text_cache.get(key, ""))
+            for hit in detect_prose_completions(
+                pending, new_text=new_text, old_text=old_text
+            ):
+                existing = by_key.get(hit.task_key)
+                if existing is None or existing.status != "pending":
+                    continue
+                by_key[hit.task_key] = TrackedTask(
+                    text=existing.text,
+                    status="completed",
+                    source_path=existing.source_path,
+                    source_date=existing.source_date,
+                    source_heading=existing.source_heading,
+                    line_hint=existing.line_hint,
+                    task_key=existing.task_key,
+                    completion_kind="prose",
+                    first_seen=existing.first_seen,
+                    last_seen=today_str,
+                )
+            self._file_text_cache[key] = new_text
+
+        return list(by_key.values())
+
+    def completed_task_keys(self) -> set[str]:
+        """Normalized keys for tasks currently marked completed."""
+        return {
+            t.task_key
+            for t in self._snapshot.tracked_tasks
+            if t.status == "completed"
+        }
+
+    def _compute_task_status_changes(
+        self,
+        old_tasks: list[TrackedTask],
+        new_tasks: list[TrackedTask],
+    ) -> list[TaskStatusChange]:
+        old_by_key = {t.task_key: t for t in old_tasks}
+        changes: list[TaskStatusChange] = []
+        for task in new_tasks:
+            prior = old_by_key.get(task.task_key)
+            if prior is None or prior.status != "pending" or task.status != "completed":
+                continue
+            changes.append(
+                TaskStatusChange(
+                    task_key=task.task_key,
+                    text=task.text,
+                    source_path=task.source_path,
+                    source_date=task.source_date,
+                    completion_kind=task.completion_kind,
+                    detail=f"Resolved via {task.completion_kind}",
+                )
+            )
+        return changes
+
+    def _refresh_file_text_cache(self, today: date) -> None:
+        """Snapshot raw org text for prose diff detection on the next scan."""
+        for org_file in self._selected_journal_files(today):
+            if org_file.exists():
+                self._update_file_text_cache(org_file)
+        pending_path = self._resolved_pending_tasks_path()
+        if pending_path.is_file():
+            self._update_file_text_cache(pending_path)
+        for org_file in self._roam_task_files(today):
+            if org_file.exists():
+                self._update_file_text_cache(org_file)
+
+    def _update_file_text_cache(self, path: Path) -> None:
+        key = ScanState.path_key(path)
+        try:
+            self._file_text_cache[key] = path.read_text(encoding="utf-8")
+        except OSError:
+            pass
+
+    def _load_file_text_cache(self) -> dict[str, str]:
+        if not self.file_text_cache_path.exists():
+            return {}
+        try:
+            data = json.loads(self.file_text_cache_path.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                return {str(k): str(v) for k, v in data.items()}
+        except (json.JSONDecodeError, OSError) as exc:
+            logger.warning("Could not load file text cache (starting fresh): %s", exc)
+        return {}
+
+    def _save_file_text_cache(self) -> None:
+        self.state_dir.mkdir(parents=True, exist_ok=True)
+        self.file_text_cache_path.write_text(
+            json.dumps(self._file_text_cache, indent=2),
+            encoding="utf-8",
+        )
+
+    def rebuild_tasks(self) -> ContextSnapshot:
+        """Force a full task registry rebuild from all journal/roam sources."""
+        today = date.today()
+        old_tracked = list(self._snapshot.tracked_tasks)
+        tracked = self._rebuild_task_registry(today)
+        tracked = self._apply_prose_completions(tracked, [])
+        pending, completed, first_seen = derive_task_lists(tracked)
+        stale = self._flag_stale_tasks_from_tracked(
+            tracked, self._snapshot.journal_window
+        )
+        status_changes = self._compute_task_status_changes(old_tracked, tracked)
+        self._snapshot = ContextSnapshot(
+            last_scan=self._snapshot.last_scan,
+            today_date=self._snapshot.today_date,
+            today_entries=self._snapshot.today_entries,
+            pending_tasks=pending,
+            completed_tasks=completed,
+            recent_project_changes=self._snapshot.recent_project_changes,
+            recent_agent_outputs=self._snapshot.recent_agent_outputs,
+            active_projects=self._snapshot.active_projects,
+            has_significant_changes=self._snapshot.has_significant_changes,
+            change_summary=self._snapshot.change_summary,
+            journal_window=self._snapshot.journal_window,
+            recurring_topics=self._snapshot.recurring_topics,
+            active_roam_nodes=self._snapshot.active_roam_nodes,
+            stale_tasks=stale,
+            task_first_seen=first_seen,
+            tracked_tasks=tracked,
+            task_status_changes=status_changes,
+        )
+        self._save_cache()
+        self._save_file_text_cache()
+        return self._snapshot
 
     def _classify_org_file(
         self, org_file: Path, journal_sel: set[Path]
@@ -393,18 +652,20 @@ class JournalContext:
                 new_outputs.append(output_file)
                 self._state.record(output_file, file_hash=file_hash)
 
-        all_pending: list[str] = []
-        all_completed: list[str] = []
         today_entries: list[dict[str, str]] = []
         journal_project_changes: list[dict[str, str]] = []
         journal_window_delta: dict[str, list[dict[str, str]]] = {}
         journal_diffs: list[tuple[str, list[str]]] = []
         significant_journal_changes = 0
+        task_source_changed: list[Path] = []
+        roam_task_paths = {p.resolve() for p in self._roam_task_files(today)}
 
         for org_file in content_changed:
             file_kind = self._classify_org_file(org_file, journal_sel)
             if file_kind == "roam":
                 roam_content_count += 1
+                if org_file.resolve() in roam_task_paths:
+                    task_source_changed.append(org_file)
                 continue
 
             if file_kind == "journal" and not self._should_parse_org_file(
@@ -413,8 +674,7 @@ class JournalContext:
                 continue
 
             info = parse_org_file(org_file)
-            all_pending.extend(extract_pending_tasks(info.entries))
-            all_completed.extend(extract_completed_tasks(info.entries))
+            task_source_changed.append(org_file)
             significant_journal_changes += 1
 
             file_date = self._extract_date_from_filename(org_file)
@@ -471,12 +731,6 @@ class JournalContext:
             and ScanState.path_key(today_journal) not in content_changed_keys
         ):
             info = parse_org_file(today_journal)
-            for task in extract_pending_tasks(info.entries):
-                if task not in all_pending:
-                    all_pending.append(task)
-            for task in extract_completed_tasks(info.entries):
-                if task not in all_completed:
-                    all_completed.append(task)
             date_key = today.isoformat()
             if date_key not in journal_window_delta:
                 journal_window_delta[date_key] = self._journal_window_entries(info)
@@ -502,17 +756,32 @@ class JournalContext:
             if _parse_date_key(k) is not None and _parse_date_key(k) >= lookback_cutoff  # type: ignore[operator]
         }
 
-        task_first_seen = dict(self._snapshot.task_first_seen)
-        today_str = today.isoformat()
-        new_pending = all_pending or self._snapshot.pending_tasks
-        for task in new_pending:
-            key = task[:80]
-            if key not in task_first_seen:
-                task_first_seen[key] = today_str
+        prose_targets = list(task_source_changed)
+        pending_path = self._resolved_pending_tasks_path()
+        if (
+            pending_path.is_file()
+            and ScanState.path_key(pending_path) in content_changed_keys
+            and pending_path not in prose_targets
+        ):
+            prose_targets.append(pending_path)
+
+        old_tracked = list(self._snapshot.tracked_tasks)
+        prose_old_texts = {
+            ScanState.path_key(path): self._file_text_cache.get(
+                ScanState.path_key(path), ""
+            )
+            for path in prose_targets
+        }
+        tracked = self._rebuild_task_registry(today)
+        tracked = self._apply_prose_completions(
+            tracked, prose_targets, prose_old_texts
+        )
+        pending_tasks, completed_tasks, task_first_seen = derive_task_lists(tracked)
 
         recurring_topics = self._build_recurring_topics(merged_window)
         active_roam_nodes = self._build_active_roam_nodes()
-        stale_tasks = self._flag_stale_tasks(new_pending, merged_window, task_first_seen)
+        stale_tasks = self._flag_stale_tasks_from_tracked(tracked, merged_window)
+        task_status_changes = self._compute_task_status_changes(old_tracked, tracked)
 
         checked_count = (
             len(content_changed) + mtime_only_count + unchanged_count + len(new_outputs)
@@ -537,8 +806,8 @@ class JournalContext:
             last_scan=now.isoformat(timespec="seconds"),
             today_date=today.isoformat(),
             today_entries=today_entries or self._snapshot.today_entries,
-            pending_tasks=new_pending,
-            completed_tasks=all_completed or self._snapshot.completed_tasks,
+            pending_tasks=pending_tasks,
+            completed_tasks=completed_tasks,
             recent_project_changes=merged_project_changes,
             recent_agent_outputs=recent_agent_outputs or self._snapshot.recent_agent_outputs,
             active_projects=self._snapshot.active_projects,
@@ -549,11 +818,15 @@ class JournalContext:
             active_roam_nodes=active_roam_nodes,
             stale_tasks=stale_tasks,
             task_first_seen=task_first_seen,
+            tracked_tasks=tracked,
+            task_status_changes=task_status_changes,
         )
 
         self._state.last_scan = now.isoformat(timespec="seconds")
+        self._refresh_file_text_cache(today)
         self._save_state()
         self._save_cache()
+        self._save_file_text_cache()
 
         if has_significant:
             log_detail = change_summary
@@ -568,7 +841,8 @@ class JournalContext:
         logger.info(
             f"Scan complete: {content_changed_count} content change"
             f"{'' if content_changed_count == 1 else 's'} — {log_detail}; "
-            f"{len(new_pending)} pending tasks, "
+            f"{len(pending_tasks)} pending tasks, "
+            f"{len(completed_tasks)} completed tasks, "
             f"{len(recurring_topics)} recurring topics, "
             f"{len(stale_tasks)} stale tasks"
         )
@@ -594,21 +868,24 @@ class JournalContext:
             info = parse_org_file(org_file)
             date_key = file_date.isoformat()
             journal_window[date_key] = self._journal_window_entries(info)
-            # Record mtime + hash so incremental scan won't re-parse unchanged files
             self._state.record(org_file)
+
+        old_tracked = list(self._snapshot.tracked_tasks)
+        tracked = self._rebuild_task_registry(today)
+        tracked = self._apply_prose_completions(tracked, [])
+        pending_tasks, completed_tasks, task_first_seen = derive_task_lists(tracked)
 
         recurring_topics = self._build_recurring_topics(journal_window)
         active_roam_nodes = self._build_active_roam_nodes()
-        stale_tasks = self._flag_stale_tasks(
-            self._snapshot.pending_tasks, journal_window, self._snapshot.task_first_seen
-        )
+        stale_tasks = self._flag_stale_tasks_from_tracked(tracked, journal_window)
+        task_status_changes = self._compute_task_status_changes(old_tracked, tracked)
 
         self._snapshot = ContextSnapshot(
             last_scan=self._snapshot.last_scan,
             today_date=self._snapshot.today_date,
             today_entries=self._snapshot.today_entries,
-            pending_tasks=self._snapshot.pending_tasks,
-            completed_tasks=self._snapshot.completed_tasks,
+            pending_tasks=pending_tasks,
+            completed_tasks=completed_tasks,
             recent_project_changes=self._snapshot.recent_project_changes,
             recent_agent_outputs=self._snapshot.recent_agent_outputs,
             active_projects=self._snapshot.active_projects,
@@ -618,15 +895,22 @@ class JournalContext:
             recurring_topics=recurring_topics,
             active_roam_nodes=active_roam_nodes,
             stale_tasks=stale_tasks,
-            task_first_seen=self._snapshot.task_first_seen,
+            task_first_seen=task_first_seen,
+            tracked_tasks=tracked,
+            task_status_changes=task_status_changes,
         )
 
         self._save_state()
+        self._refresh_file_text_cache(today)
         self._save_cache()
+        self._save_file_text_cache()
         logger.info(
             f"Deep scan complete: {len(journal_window)} journal days, "
+            f"{len(pending_tasks)} pending tasks, "
+            f"{len(completed_tasks)} completed tasks, "
             f"{len(recurring_topics)} recurring topics, "
-            f"{len(active_roam_nodes)} active roam nodes"
+            f"{len(active_roam_nodes)} active roam nodes, "
+            f"{len(stale_tasks)} stale tasks"
         )
         return self._snapshot
 
@@ -733,11 +1017,19 @@ class JournalContext:
 
         if s.stale_tasks:
             lines.append("### Possibly Stalled")
-            for task in s.stale_tasks[:8]:
-                lines.append(f"- [ ] {task}  _(no recent journal mention)_")
+            for task_text in s.stale_tasks[:8]:
+                tracked = self._tracked_task_by_text(s.tracked_tasks, task_text)
+                provenance = self._format_task_provenance(tracked) if tracked else ""
+                lines.append(f"- [ ] {task_text}{provenance}  _(no recent journal mention)_")
             lines.append("")
 
-        if s.completed_tasks:
+        completed_tracked = [t for t in s.tracked_tasks if t.status == "completed"]
+        if completed_tracked:
+            lines.append("### Recently Completed")
+            for task in completed_tracked[:10]:
+                lines.append(f"- [x] {task.text}{self._format_task_provenance(task)}")
+            lines.append("")
+        elif s.completed_tasks:
             lines.append("### Recently Completed")
             for task in s.completed_tasks[:10]:
                 lines.append(f"- [x] {task}")
@@ -1031,27 +1323,8 @@ class JournalContext:
             except Exception as exc:
                 logger.warning("Continuing threads search failed (non-fatal): %s", exc)
 
-        # Stale tasks (pending with no recent journal mention)
-        if s.stale_tasks:
-            lines.append("### Stalled / Stale Tasks")
-            for task in s.stale_tasks:
-                first_seen = s.task_first_seen.get(task, "unknown")
-                lines.append(f"- [ ] {task}  _(first seen {first_seen})_")
-            lines.append("")
-
-        # All pending tasks
-        if s.pending_tasks:
-            lines.append("### All Pending Tasks")
-            for task in s.pending_tasks:
-                lines.append(f"- [ ] {task}")
-            lines.append("")
-
-        # Completed tasks
-        if s.completed_tasks:
-            lines.append("### Recently Completed Tasks")
-            for task in s.completed_tasks:
-                lines.append(f"- [x] {task}")
-            lines.append("")
+        # Stale / pending / completed tasks with provenance
+        lines.extend(self._format_task_sections_for_briefing(s))
 
         # Active roam nodes (recently modified project notes)
         if s.active_roam_nodes:
@@ -1213,23 +1486,16 @@ class JournalContext:
             })
         return nodes
 
-    def _flag_stale_tasks(
+    def _flag_stale_tasks_from_tracked(
         self,
-        pending_tasks: list[str],
+        tracked: list[TrackedTask],
         window: dict[str, list[dict[str, str]]],
-        task_first_seen: dict[str, str],
         threshold_days: int = 3,
     ) -> list[str]:
-        """Return pending tasks that have no recent journal mention and are old enough.
-
-        A task is considered stale when:
-        - It first appeared >= threshold_days ago, AND
-        - No journal window entry's heading or content contains a 4+-word fragment of it.
-        """
+        """Return pending tasks with no recent journal mention and old enough."""
         today = date.today()
         cutoff = (today - timedelta(days=threshold_days)).isoformat()
 
-        # Build a flat searchable corpus from all window entries
         all_text = " ".join(
             f"{e.get('heading', '')} {e.get('content', '')}".lower()
             for entries in window.values()
@@ -1237,28 +1503,130 @@ class JournalContext:
         )
 
         stale: list[str] = []
-        for task in pending_tasks:
-            key = task[:80]
-            first_seen = task_first_seen.get(key, today.isoformat())
-            if first_seen > cutoff:
-                continue  # too recent to flag
-            # Check if any significant fragment of the task appears in the window
-            words = task.lower().split()
-            if len(words) <= 2:
-                # Short tasks: require exact substring match
-                if task.lower() in all_text:
-                    continue
-            else:
-                # Longer tasks: look for a 3-word contiguous fragment
-                found = any(
-                    " ".join(words[i:i + 3]) in all_text
-                    for i in range(len(words) - 2)
-                )
-                if found:
-                    continue
-            stale.append(task)
+        for task in tracked:
+            if task.status != "pending":
+                continue
+            if task.first_seen > cutoff:
+                continue
+            if text_mentions_task(all_text, task.text):
+                continue
+            stale.append(task.text)
 
         return stale[:10]
+
+    def _flag_stale_tasks(
+        self,
+        pending_tasks: list[str],
+        window: dict[str, list[dict[str, str]]],
+        task_first_seen: dict[str, str],
+        threshold_days: int = 3,
+    ) -> list[str]:
+        """Legacy stale helper for callers that only have plain pending strings."""
+        tracked = [
+            TrackedTask(
+                text=text,
+                status="pending",
+                source_path="",
+                source_date=task_first_seen.get(normalize_task_key(text), ""),
+                source_heading="",
+                line_hint=0,
+                task_key=normalize_task_key(text),
+                completion_kind="checkbox",
+                first_seen=task_first_seen.get(normalize_task_key(text), date.today().isoformat()),
+                last_seen=date.today().isoformat(),
+            )
+            for text in pending_tasks
+        ]
+        return self._flag_stale_tasks_from_tracked(tracked, window, threshold_days)
+
+    def _tracked_task_by_text(
+        self, tracked: list[TrackedTask], text: str
+    ) -> TrackedTask | None:
+        key = normalize_task_key(text)
+        for task in tracked:
+            if task.task_key == key:
+                return task
+        return None
+
+    def _format_task_provenance(self, task: TrackedTask) -> str:
+        parts: list[str] = []
+        if task.source_date:
+            parts.append(task.source_date)
+        if task.source_path:
+            parts.append(task.source_path)
+        if task.source_heading:
+            parts.append(f"› {task.source_heading}")
+        if not parts:
+            return ""
+        return " _({})_".format(" ".join(parts))
+
+    def _format_task_sections_for_briefing(self, snapshot: ContextSnapshot) -> list[str]:
+        lines: list[str] = []
+
+        if snapshot.task_status_changes:
+            lines.append("### Task Status Changes Since Last Scan")
+            for change in snapshot.task_status_changes[:15]:
+                lines.append(
+                    f"- [x] {change.text}{self._format_task_provenance_from_change(change)} "
+                    f"_(resolved via {change.completion_kind})_"
+                )
+                if change.detail:
+                    lines.append(f"  {change.detail[:200]}")
+            lines.append("")
+
+        if snapshot.stale_tasks:
+            lines.append("### Stalled / Stale Tasks")
+            for task_text in snapshot.stale_tasks:
+                tracked = self._tracked_task_by_text(snapshot.tracked_tasks, task_text)
+                first_seen = (
+                    tracked.first_seen
+                    if tracked
+                    else snapshot.task_first_seen.get(normalize_task_key(task_text), "unknown")
+                )
+                provenance = self._format_task_provenance(tracked) if tracked else ""
+                lines.append(f"- [ ] {task_text}{provenance}  _(first seen {first_seen})_")
+            lines.append("")
+
+        pending_tracked = [t for t in snapshot.tracked_tasks if t.status == "pending"]
+        if pending_tracked:
+            lines.append("### All Pending Tasks")
+            for task in pending_tracked:
+                lines.append(f"- [ ] {task.text}{self._format_task_provenance(task)}")
+            lines.append("")
+        elif snapshot.pending_tasks:
+            lines.append("### All Pending Tasks")
+            for task in snapshot.pending_tasks:
+                lines.append(f"- [ ] {task}")
+            lines.append("")
+
+        completed_tracked = [
+            t for t in snapshot.tracked_tasks if t.status == "completed"
+        ]
+        if completed_tracked:
+            lines.append("### Recently Completed Tasks")
+            for task in completed_tracked[:25]:
+                lines.append(
+                    f"- [x] {task.text}{self._format_task_provenance(task)} "
+                    f"_({task.completion_kind})_"
+                )
+            lines.append("")
+        elif snapshot.completed_tasks:
+            lines.append("### Recently Completed Tasks")
+            for task in snapshot.completed_tasks:
+                lines.append(f"- [x] {task}")
+            lines.append("")
+
+        return lines
+
+    def _format_task_provenance_from_change(self, change: TaskStatusChange) -> str:
+        parts: list[str] = []
+        if change.source_date:
+            parts.append(change.source_date)
+        if change.source_path:
+            parts.append(change.source_path)
+        if not parts:
+            return ""
+        return " _({})_".format(" ".join(parts))
 
     # ------------------------------------------------------------------
     # State persistence

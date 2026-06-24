@@ -32,7 +32,7 @@ _BROWSE_COMMANDS: frozenset[str] = frozenset({
 # Supported extensions reused from command_executor (keep in sync).
 _SUPPORTED_EXTENSIONS = frozenset({
     ".md", ".txt", ".org", ".py", ".yaml", ".yml",
-    ".json", ".tex", ".csv", ".toml", ".rst", ".docx",
+    ".json", ".tex", ".csv", ".toml", ".rst", ".docx", ".pdf",
 })
 
 

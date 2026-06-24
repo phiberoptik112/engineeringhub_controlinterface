@@ -10,7 +10,7 @@ if TYPE_CHECKING:
 
 SUPPORTED_EXTENSIONS = frozenset({
     ".md", ".txt", ".org", ".py", ".yaml", ".yml",
-    ".json", ".tex", ".csv", ".toml", ".rst", ".docx",
+    ".json", ".tex", ".csv", ".toml", ".rst", ".docx", ".pdf",
 })
 
 
@@ -80,10 +80,16 @@ class CommandExecutor:
             return self._cmd_clear(parts)
         if cmd == "/load":
             return self._cmd_load(parts)
+        if cmd == "/load_recent":
+            return self._cmd_load_recent(parts)
         if cmd == "/find":
             return self._cmd_find(parts)
         if cmd == "/skills":
             return self._cmd_skills()
+        if cmd == "/blender":
+            return self._cmd_blender(parts)
+        if cmd == "/horn":
+            return self._cmd_horn(raw)
         if cmd == "/integrate":
             return self._cmd_integrate(parts)
         if cmd == "/task":
@@ -199,6 +205,62 @@ class CommandExecutor:
             ok, msg = self.engine.load_file(path, extensions=SUPPORTED_EXTENSIONS)
         return msg
 
+    def _cmd_load_recent(self, parts: list[str]) -> str:
+        from datetime import datetime
+
+        from engineering_hub.journaler.recent_files import (
+            collect_recent_files,
+            default_recent_roots,
+        )
+
+        list_only = "--list" in parts
+        default_limit = int(
+            getattr(self.settings, "journaler_load_recent_max_files", 5) or 5
+        )
+        default_days = getattr(self.settings, "journaler_load_recent_days", 30)
+
+        limit = default_limit
+        days = default_days
+        positional = [p for p in parts[1:] if not p.startswith("-")]
+        if positional:
+            try:
+                limit = int(positional[0])
+            except ValueError:
+                return "Usage: /load_recent [N] [--days D] [--list]"
+        if "--days" in parts:
+            idx = parts.index("--days")
+            try:
+                days = int(parts[idx + 1])
+            except (IndexError, ValueError):
+                return "--days expects an integer"
+
+        roots = default_recent_roots(self.config, self.settings)
+        if not roots:
+            return "/load_recent could not resolve any scan roots."
+
+        files = collect_recent_files(
+            roots, extensions=SUPPORTED_EXTENSIONS, limit=limit, days=days
+        )
+        if not files:
+            window = f" in the last {days} day(s)" if days else ""
+            return f"No recent files found{window}."
+
+        if list_only:
+            lines = [f"Most recently created files (top {len(files)}):"]
+            for i, rf in enumerate(files, 1):
+                created = datetime.fromtimestamp(rf.created_ts).strftime("%Y-%m-%d %H:%M")
+                lines.append(f"  {i}. {created}  [{rf.root_label}]  {rf.path}")
+            lines.append("Run /load_recent without --list to load them.")
+            return "\n".join(lines)
+
+        lines = [f"Loading {len(files)} recent file(s):"]
+        for rf in files:
+            created = datetime.fromtimestamp(rf.created_ts).strftime("%Y-%m-%d %H:%M")
+            ok, msg = self.engine.load_file(rf.path, extensions=SUPPORTED_EXTENSIONS)
+            marker = "ok" if ok else "fail"
+            lines.append(f"  [{marker}] ({rf.root_label}, {created}) {msg}")
+        return "\n".join(lines)
+
     def _cmd_find(self, parts: list[str]) -> str:
         org_roam_dir = self._get_org_roam_dir()
         if org_roam_dir is None:
@@ -227,6 +289,19 @@ class CommandExecutor:
             return _handle_skills_command(self.delegator)
         except Exception as e:
             return f"Error listing skills: {e}"
+
+    def _cmd_blender(self, parts: list[str]) -> str:
+        from engineering_hub.blender import service as blender_service
+
+        sub = parts[1].lower() if len(parts) > 1 else "status"
+        if sub != "status":
+            return "Usage: /blender status"
+        return blender_service.format_status_message()
+
+    def _cmd_horn(self, raw: str) -> str:
+        from engineering_hub.horn_iterator import service as horn_service
+
+        return horn_service.handle_slash_command(raw)
 
     def _get_task_integrator(self) -> object | None:
         if self._task_integrator is not None:
@@ -513,6 +588,7 @@ class CommandExecutor:
             "",
             "File Operations:",
             "  /load <path> [-r]         Load a file or directory into context",
+            "  /load_recent [N] [--days D] [--list]  Load most recently created workspace files",
             "  /find <title>             Search org-roam files by title",
             "",
             "Agent Delegation:",
@@ -522,6 +598,8 @@ class CommandExecutor:
             "  /queue <description>      Propose a task for overnight queue",
             "  /history [--agent] <query> Retrieve prior chat excerpts",
             "  /skills                   List available agent personas",
+            "  /blender status           Check Blender MCP addon connectivity",
+            "  /horn [sweep|defaults]    Run parametric horn sweep / show LVT defaults",
             "  /integrate [status]       Interview inline in today's journal, propose agent tasks",
             "",
             "Org-Roam Writing:",

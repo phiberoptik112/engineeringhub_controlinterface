@@ -143,6 +143,31 @@ DEFAULT_AGENT_CONFIGS = {
         ],
         max_tokens=6000,
     ),
+    AgentType.BLENDER: AgentConfig(
+        agent_type=AgentType.BLENDER,
+        prompt_file="blender.txt",
+        model_class=ModelClass.TOOL_USE,
+        tools=[
+            "blender_health",
+            "blender_list_tools",
+            "blender_call_tool",
+            "search_memory",
+        ],
+        max_tokens=6000,
+    ),
+    AgentType.HORN_ITERATOR: AgentConfig(
+        agent_type=AgentType.HORN_ITERATOR,
+        prompt_file="horn-iterator.txt",
+        model_class=ModelClass.TOOL_USE,
+        tools=[
+            "horn_get_defaults",
+            "horn_evaluate_design",
+            "horn_run_sweep",
+            "horn_export_results",
+            "search_memory",
+        ],
+        max_tokens=6000,
+    ),
     AgentType.CAREER_COACH: AgentConfig(
         agent_type=AgentType.CAREER_COACH,
         prompt_file="career-coach.txt",

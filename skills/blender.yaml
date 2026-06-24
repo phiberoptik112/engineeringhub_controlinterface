@@ -1,0 +1,46 @@
+name: blender
+display_name: Blender MCP
+agent_type: blender
+
+domain: acoustic-engineering
+domain_triggers:
+  - blender
+  - 3d
+  - scene
+  - mesh
+  - spl map
+  - acoustic visualization
+  - receiver points
+  - room model
+  - bpy
+
+description: |
+  Controls a running Blender session through MCP: inspect scene hierarchy,
+  apply acoustic visualization conventions (SPL colormaps, receiver markers),
+  and invoke remote Blender tools safely with inspect-before-mutate discipline.
+
+when_to_use:
+  - User asks to inspect or summarize the current Blender scene
+  - User wants SPL or acoustic simulation results visualized in 3D
+  - User asks to list objects, materials, or collections via Blender MCP
+  - User needs receiver/source markers placed in a room model
+
+invocation_examples:
+  - "/agent blender --backend claude summarize the current scene and list acoustic receiver empties"
+  - "/agent 3d --backend claude apply a viridis SPL colormap to the wall mesh collection"
+  - "/agent blender --backend claude check MCP connectivity and list available tools"
+  - "/agent blender-mcp inspect materials on the room shell before any edits"
+
+parameters:
+  description:
+    description: The Blender/MCP task — inspection, visualization, or safe scene edit
+    required: true
+
+output:
+  format: markdown
+  structure:
+    - Connectivity
+    - Scene summary
+    - Actions
+    - Next steps
+  output_dir: blender

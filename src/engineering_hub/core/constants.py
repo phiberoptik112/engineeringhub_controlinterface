@@ -29,6 +29,8 @@ class AgentType(str, Enum):
     COORDINATION_ANALYST = "coordination-analyst"
     ACOUSTIC_SIM_EXPERT = "acoustic-sim-expert"
     RENTAL_SCOUT = "rental-scout"
+    BLENDER = "blender"
+    HORN_ITERATOR = "horn-iterator"
     CAREER_COACH = "career-coach"
     PRODUCT_MANAGER = "product-manager"
     COMPLIANCE_ADVISOR = "compliance-advisor"
@@ -59,6 +61,8 @@ AGENT_PROMPT_FILES = {
     AgentType.COORDINATION_ANALYST: "coordination-analyst.txt",
     AgentType.ACOUSTIC_SIM_EXPERT: "acoustic-sim-expert.txt",
     AgentType.RENTAL_SCOUT: "rental-scout.txt",
+    AgentType.BLENDER: "blender.txt",
+    AgentType.HORN_ITERATOR: "horn-iterator.txt",
     AgentType.CAREER_COACH: "career-coach.txt",
     AgentType.PRODUCT_MANAGER: "product-manager.txt",
     AgentType.COMPLIANCE_ADVISOR: "compliance-advisor.txt",

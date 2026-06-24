@@ -108,6 +108,71 @@ class Settings(BaseSettings):
         ),
     )
 
+    # Blender MCP (HTTP addon inside a running Blender session)
+    blender_enabled: bool = Field(
+        default=False,
+        description="Enable Blender MCP client integration for agents and MCP proxy",
+    )
+    blender_mcp_url: str = Field(
+        default="http://127.0.0.1:8765/mcp",
+        description="HTTP MCP endpoint exposed by the Blender addon",
+    )
+    blender_auth_token: str | None = Field(
+        default=None,
+        description=(
+            "Optional bearer token for Blender MCP auth. "
+            "Prefer ENGINEERING_HUB_BLENDER_AUTH_TOKEN env var."
+        ),
+    )
+    blender_connect_timeout_s: float = Field(
+        default=10.0,
+        description="Timeout in seconds for Blender MCP client connections",
+    )
+    blender_tools_cache_ttl_s: float = Field(
+        default=60.0,
+        description="Seconds to cache remote Blender tool listings",
+    )
+    blender_tool_allowlist: list[str] | None = Field(
+        default=None,
+        description=(
+            "When set, only these remote tool names may be invoked. "
+            "None means all tools except denylist entries."
+        ),
+    )
+    blender_tool_denylist: list[str] | None = Field(
+        default_factory=lambda: ["run_python_script"],
+        description="Remote Blender tool names blocked from agent invocation",
+    )
+
+    # Horn Iterator (parametric exponential-horn sweep, LVT alert system)
+    horn_iterator_enabled: bool = Field(
+        default=True,
+        description="Enable the horn iterator agent, CLI, and /horn slash command",
+    )
+    horn_iterator_output_dir: Path | None = Field(
+        default=None,
+        description=(
+            "Directory for horn sweep exports (CSV/org). "
+            "Defaults to {workspace_dir}/horn_iterator when unset."
+        ),
+    )
+    horn_iterator_flare_rate_per_m: float | None = Field(
+        default=None,
+        description="Override the exponential flare rate m (/m); blueprint default 17.8",
+    )
+    horn_iterator_throat_area_mm2: float | None = Field(
+        default=None,
+        description="Override the diffraction-slot throat area S_T (mm^2); default 1050",
+    )
+    horn_iterator_slot_area_mm2: float | None = Field(
+        default=None,
+        description="Override the diffraction slot area used in geometry (mm^2); default 1050",
+    )
+    horn_iterator_adapter_length_mm: float | None = Field(
+        default=None,
+        description="Override the fixed pre-flare adapter length (mm); default 52",
+    )
+
     # Org mode: use org-roam daily journals as the task source instead of journal.md
     use_org_mode: bool = Field(
         default=False,
@@ -483,6 +548,20 @@ class Settings(BaseSettings):
         ge=0,
         description="Extra tokens subtracted from headroom when sizing /load (safety margin)",
     )
+    journaler_load_recent_max_files: int = Field(
+        default=5,
+        ge=1,
+        description="Default number of files /load_recent loads when no count is given",
+    )
+    journaler_load_recent_days: int = Field(
+        default=30,
+        ge=0,
+        description="/load_recent only considers files created in the last N days (0 = no cutoff)",
+    )
+    journaler_load_recent_roots: list[Path] = Field(
+        default_factory=list,
+        description="Optional explicit scan roots for /load_recent (overrides the default set)",
+    )
     journaler_agent_backend: str = Field(
         default="mlx",
         description='Journaler /agent delegation: "mlx", "claude", or "auto"',
@@ -532,9 +611,28 @@ class Settings(BaseSettings):
         ge=200,
         description="Characters per past daily conversation summary in Journaler context",
     )
+    journaler_roam_task_lookback_days: int = Field(
+        default=14,
+        ge=0,
+        description="Include org-roam project notes modified within N days for task registry scans",
+    )
+    journaler_roam_task_max_files: int = Field(
+        default=30,
+        ge=1,
+        description="Max roam project notes to parse for pending/completed tasks",
+    )
+    journaler_prose_completion_detection: bool = Field(
+        default=True,
+        description="Detect prose completion mentions in journal edits (e.g. 'finished X')",
+    )
     journaler_context_management: dict[str, Any] = Field(
         default_factory=dict,
         description="Raw journaler.context_management YAML values for PressureConfig",
+    )
+    journaler_output_limit: dict[str, Any] = Field(
+        default_factory=dict,
+        description="Raw journaler.output_limit YAML values for OutputLimitConfig "
+        "(policy, generation budget, summarize/continue/stop behavior)",
     )
     journaler_org_link_on_relation: bool = Field(
         default=True,
@@ -884,6 +982,52 @@ class Settings(BaseSettings):
                     rental_scout["python_path"]
                 ).expanduser()
 
+        if "blender" in config:
+            blender = config["blender"]
+            if blender.get("enabled") is not None:
+                flat_config["blender_enabled"] = bool(blender["enabled"])
+            if blender.get("mcp_url"):
+                flat_config["blender_mcp_url"] = str(blender["mcp_url"])
+            if blender.get("auth_token"):
+                flat_config["blender_auth_token"] = str(blender["auth_token"])
+            if blender.get("connect_timeout_s") is not None:
+                flat_config["blender_connect_timeout_s"] = float(
+                    blender["connect_timeout_s"]
+                )
+            if blender.get("tools_cache_ttl_s") is not None:
+                flat_config["blender_tools_cache_ttl_s"] = float(
+                    blender["tools_cache_ttl_s"]
+                )
+            if blender.get("tool_allowlist") is not None:
+                flat_config["blender_tool_allowlist"] = list(blender["tool_allowlist"])
+            if blender.get("tool_denylist") is not None:
+                flat_config["blender_tool_denylist"] = list(blender["tool_denylist"])
+
+        if "horn_iterator" in config:
+            horn = config["horn_iterator"]
+            if horn.get("enabled") is not None:
+                flat_config["horn_iterator_enabled"] = bool(horn["enabled"])
+            if horn.get("output_dir"):
+                flat_config["horn_iterator_output_dir"] = Path(
+                    horn["output_dir"]
+                ).expanduser()
+            if horn.get("flare_rate_per_m") is not None:
+                flat_config["horn_iterator_flare_rate_per_m"] = float(
+                    horn["flare_rate_per_m"]
+                )
+            if horn.get("throat_area_mm2") is not None:
+                flat_config["horn_iterator_throat_area_mm2"] = float(
+                    horn["throat_area_mm2"]
+                )
+            if horn.get("slot_area_mm2") is not None:
+                flat_config["horn_iterator_slot_area_mm2"] = float(
+                    horn["slot_area_mm2"]
+                )
+            if horn.get("adapter_length_mm") is not None:
+                flat_config["horn_iterator_adapter_length_mm"] = float(
+                    horn["adapter_length_mm"]
+                )
+
         if "ollama" in config:
             ollama = config["ollama"]
             if ollama.get("host"):
@@ -1088,6 +1232,14 @@ class Settings(BaseSettings):
                 flat_config["journaler_load_min_chars"] = j["load_min_chars"]
             if j.get("load_slack_tokens") is not None:
                 flat_config["journaler_load_slack_tokens"] = j["load_slack_tokens"]
+            if j.get("load_recent_max_files") is not None:
+                flat_config["journaler_load_recent_max_files"] = j["load_recent_max_files"]
+            if j.get("load_recent_days") is not None:
+                flat_config["journaler_load_recent_days"] = j["load_recent_days"]
+            if j.get("load_recent_roots") is not None:
+                flat_config["journaler_load_recent_roots"] = [
+                    Path(p).expanduser() for p in (j["load_recent_roots"] or [])
+                ]
             if j.get("agent_backend"):
                 flat_config["journaler_agent_backend"] = j["agent_backend"]
             if j.get("skills_dir"):
@@ -1121,8 +1273,22 @@ class Settings(BaseSettings):
                 flat_config["journaler_conversation_summary_excerpt_chars"] = int(
                     j["conversation_summary_excerpt_chars"]
                 )
+            if j.get("roam_task_lookback_days") is not None:
+                flat_config["journaler_roam_task_lookback_days"] = int(
+                    j["roam_task_lookback_days"]
+                )
+            if j.get("roam_task_max_files") is not None:
+                flat_config["journaler_roam_task_max_files"] = int(
+                    j["roam_task_max_files"]
+                )
+            if j.get("prose_completion_detection") is not None:
+                flat_config["journaler_prose_completion_detection"] = bool(
+                    j["prose_completion_detection"]
+                )
             if isinstance(j.get("context_management"), dict):
                 flat_config["journaler_context_management"] = j["context_management"]
+            if isinstance(j.get("output_limit"), dict):
+                flat_config["journaler_output_limit"] = j["output_limit"]
             if j.get("org_link_on_relation") is not None:
                 flat_config["journaler_org_link_on_relation"] = bool(
                     j["org_link_on_relation"]

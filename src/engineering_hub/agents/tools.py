@@ -12,6 +12,8 @@ from pathlib import Path
 from typing import Any, Callable
 
 from engineering_hub.actions.file_ingest import FileIngestAction
+from engineering_hub.blender import service as blender_service
+from engineering_hub.horn_iterator import service as horn_service
 from engineering_hub.rental_scout import service as rental_service
 
 logger = logging.getLogger(__name__)
@@ -454,6 +456,207 @@ def handle_rental_add_journal_task(args: dict[str, Any], ctx: ToolContext) -> st
 
 
 # ---------------------------------------------------------------------------
+# Blender MCP proxy tools
+# ---------------------------------------------------------------------------
+
+BLENDER_HEALTH_TOOL = {
+    "name": "blender_health",
+    "description": (
+        "Check connectivity to the Blender MCP addon (HTTP endpoint). "
+        "Use before scene work to confirm Blender is running and tools are available."
+    ),
+    "input_schema": {"type": "object", "properties": {}, "required": []},
+}
+
+
+def handle_blender_health(args: dict[str, Any], ctx: ToolContext) -> str:
+    return json.dumps(blender_service.health_check())
+
+
+BLENDER_LIST_TOOLS_TOOL = {
+    "name": "blender_list_tools",
+    "description": (
+        "List remote Blender MCP tools available after allowlist/denylist filters. "
+        "Use to discover the correct tool_name before blender_call_tool."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "refresh": {
+                "type": "boolean",
+                "description": "Bypass cache and fetch fresh tool list (default false)",
+            },
+        },
+        "required": [],
+    },
+}
+
+
+def handle_blender_list_tools(args: dict[str, Any], ctx: ToolContext) -> str:
+    return json.dumps(
+        blender_service.list_tools(use_cache=not args.get("refresh", False))
+    )
+
+
+BLENDER_CALL_TOOL = {
+    "name": "blender_call_tool",
+    "description": (
+        "Invoke a remote Blender MCP tool by name with a JSON arguments object. "
+        "Prefer inspection tools (scene summary, list objects) before mutating the scene. "
+        "Destructive tools may be blocked by config denylist."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "tool_name": {
+                "type": "string",
+                "description": "Remote MCP tool name (see blender_list_tools)",
+            },
+            "arguments": {
+                "type": "object",
+                "description": "Tool arguments object (may be empty)",
+            },
+        },
+        "required": ["tool_name"],
+    },
+}
+
+
+def handle_blender_call_tool(args: dict[str, Any], ctx: ToolContext) -> str:
+    tool_name = str(args.get("tool_name", "")).strip()
+    arguments = args.get("arguments") or {}
+    if not isinstance(arguments, dict):
+        return json.dumps({"success": False, "error": "arguments must be an object"})
+    return json.dumps(blender_service.call_tool(tool_name, arguments))
+
+
+# ---------------------------------------------------------------------------
+# Horn iterator (parametric exponential-horn sweep) tools
+# ---------------------------------------------------------------------------
+
+HORN_GET_DEFAULTS_TOOL = {
+    "name": "horn_get_defaults",
+    "description": (
+        "Return the configured LVT design constraints (frequency band, SPL, FOV, "
+        "mechanical envelope) and the parametric sweep bounds/step sizes. Use "
+        "first to understand the design space before running a sweep."
+    ),
+    "input_schema": {"type": "object", "properties": {}, "required": []},
+}
+
+
+def handle_horn_get_defaults(args: dict[str, Any], ctx: ToolContext) -> str:
+    return json.dumps(horn_service.get_defaults())
+
+
+HORN_EVALUATE_DESIGN_TOOL = {
+    "name": "horn_evaluate_design",
+    "description": (
+        "Evaluate one horn design: given exponential length, mouth width and "
+        "mouth height (mm), return cutoff frequency, mouth area, projected "
+        "aperture, coverage angles, LF rolloff, and any LVT constraint violations."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "l_exp_mm": {"type": "number", "description": "Exponential flare length (mm)"},
+            "mouth_w_mm": {"type": "number", "description": "Mouth width / horizontal aperture (mm)"},
+            "mouth_h_mm": {"type": "number", "description": "Mouth height / vertical aperture (mm)"},
+        },
+        "required": ["l_exp_mm", "mouth_w_mm", "mouth_h_mm"],
+    },
+}
+
+
+def handle_horn_evaluate_design(args: dict[str, Any], ctx: ToolContext) -> str:
+    return json.dumps(
+        horn_service.evaluate_design(
+            float(args["l_exp_mm"]),
+            float(args["mouth_w_mm"]),
+            float(args["mouth_h_mm"]),
+        )
+    )
+
+
+HORN_RUN_SWEEP_TOOL = {
+    "name": "horn_run_sweep",
+    "description": (
+        "Run the parametric horn sweep over length x mouth-width x mouth-height. "
+        "Returns the candidate count, designs passing all LVT constraints, and "
+        "(unless valid_only) a truncated row sample. Optionally override step "
+        "sizes or flare rate."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "step_l_mm": {"type": "number", "description": "Exponential-length step (mm)"},
+            "step_wh_mm": {"type": "number", "description": "Mouth width/height step (mm)"},
+            "flare_rate_per_m": {"type": "number", "description": "Override flare rate m (/m)"},
+            "valid_only": {
+                "type": "boolean",
+                "description": "Return only passing designs (default true to limit size)",
+            },
+        },
+        "required": [],
+    },
+}
+
+
+def handle_horn_run_sweep(args: dict[str, Any], ctx: ToolContext) -> str:
+    overrides: dict[str, Any] = {}
+    for key in ("step_l_mm", "step_wh_mm", "flare_rate_per_m"):
+        if args.get(key) is not None:
+            overrides[key] = float(args[key])
+    valid_only = bool(args.get("valid_only", True))
+    result = horn_service.run_sweep(overrides=overrides, valid_only=valid_only)
+    if not valid_only and len(result.get("rows", [])) > 50:
+        result["rows"] = result["rows"][:50]
+        result["rows_truncated"] = True
+    return json.dumps(result)
+
+
+HORN_EXPORT_RESULTS_TOOL = {
+    "name": "horn_export_results",
+    "description": (
+        "Run a sweep and export all rows to the horn iterator output directory as "
+        "CSV or org-table. Returns the written file path. Use when the user wants "
+        "a saved artifact rather than inline results."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "format": {
+                "type": "string",
+                "enum": ["csv", "org"],
+                "description": "Export format (default csv)",
+            },
+            "step_l_mm": {"type": "number", "description": "Exponential-length step (mm)"},
+            "step_wh_mm": {"type": "number", "description": "Mouth width/height step (mm)"},
+        },
+        "required": [],
+    },
+}
+
+
+def handle_horn_export_results(args: dict[str, Any], ctx: ToolContext) -> str:
+    overrides: dict[str, Any] = {}
+    for key in ("step_l_mm", "step_wh_mm"):
+        if args.get(key) is not None:
+            overrides[key] = float(args[key])
+    fmt = str(args.get("format", "csv"))
+    result = horn_service.run_sweep_and_export(
+        overrides=overrides, fmt=fmt, output_dir=ctx.output_dir
+    )
+    return json.dumps(
+        {
+            "count": result.get("count"),
+            "valid_count": result.get("valid_count"),
+            "export": result.get("export"),
+        }
+    )
+
+
+# ---------------------------------------------------------------------------
 # Tool Registry
 # ---------------------------------------------------------------------------
 
@@ -505,6 +708,34 @@ TOOL_REGISTRY: dict[str, ToolDefinition] = {
     "rental_add_journal_task": ToolDefinition(
         schema=RENTAL_ADD_JOURNAL_TASK_TOOL,
         handler=handle_rental_add_journal_task,
+    ),
+    "blender_health": ToolDefinition(
+        schema=BLENDER_HEALTH_TOOL,
+        handler=handle_blender_health,
+    ),
+    "blender_list_tools": ToolDefinition(
+        schema=BLENDER_LIST_TOOLS_TOOL,
+        handler=handle_blender_list_tools,
+    ),
+    "blender_call_tool": ToolDefinition(
+        schema=BLENDER_CALL_TOOL,
+        handler=handle_blender_call_tool,
+    ),
+    "horn_get_defaults": ToolDefinition(
+        schema=HORN_GET_DEFAULTS_TOOL,
+        handler=handle_horn_get_defaults,
+    ),
+    "horn_evaluate_design": ToolDefinition(
+        schema=HORN_EVALUATE_DESIGN_TOOL,
+        handler=handle_horn_evaluate_design,
+    ),
+    "horn_run_sweep": ToolDefinition(
+        schema=HORN_RUN_SWEEP_TOOL,
+        handler=handle_horn_run_sweep,
+    ),
+    "horn_export_results": ToolDefinition(
+        schema=HORN_EXPORT_RESULTS_TOOL,
+        handler=handle_horn_export_results,
     ),
 }
 

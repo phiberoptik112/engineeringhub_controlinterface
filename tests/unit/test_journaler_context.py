@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import os
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 from engineering_hub.journaler.context import JournalContext
@@ -189,3 +189,98 @@ def test_pending_tasks_file_counts_as_significant(tmp_path: Path) -> None:
 
     second = ctx.scan()
     assert not second.has_significant_changes
+
+
+def test_checkbox_completion_removes_pending(tmp_path: Path) -> None:
+    ctx = _make_ctx(tmp_path, scan_tree=False)
+    day = date.today().isoformat()
+    journal = ctx.journal_dir / f"{day}.org"
+    journal.write_text(
+        "* Work\n- [ ] Finish ASTM E336 protocol draft\n",
+        encoding="utf-8",
+    )
+    first = ctx.scan()
+    assert "Finish ASTM E336 protocol draft" in first.pending_tasks
+
+    journal.write_text(
+        "* Work\n- [X] Finish ASTM E336 protocol draft\n",
+        encoding="utf-8",
+    )
+    second = ctx.scan()
+    assert "Finish ASTM E336 protocol draft" not in second.pending_tasks
+    assert "Finish ASTM E336 protocol draft" in second.completed_tasks
+
+
+def test_cross_day_pending_preserved_when_one_journal_edited(tmp_path: Path) -> None:
+    ctx = _make_ctx(tmp_path, scan_tree=False)
+    today = date.today()
+    yesterday = today - timedelta(days=1)
+    y_journal = ctx.journal_dir / f"{yesterday.isoformat()}.org"
+    t_journal = ctx.journal_dir / f"{today.isoformat()}.org"
+    y_journal.write_text("* Yesterday\n- [ ] Old pending item\n", encoding="utf-8")
+    t_journal.write_text("* Today\n- [ ] Today pending item\n", encoding="utf-8")
+    ctx.scan()
+
+    t_journal.write_text(
+        "* Today\n- [X] Today pending item\n",
+        encoding="utf-8",
+    )
+    snapshot = ctx.scan()
+    assert "Old pending item" in snapshot.pending_tasks
+    assert "Today pending item" not in snapshot.pending_tasks
+
+
+def test_prose_completion_marks_task_done(tmp_path: Path) -> None:
+    ctx = _make_ctx(tmp_path, scan_tree=False)
+    ctx.prose_completion_detection = True
+    day = date.today().isoformat()
+    journal = ctx.journal_dir / f"{day}.org"
+    journal.write_text(
+        "* Work\n- [ ] ASTM E336 protocol draft\n",
+        encoding="utf-8",
+    )
+    ctx.scan()
+
+    journal.write_text(
+        "* Work\n- [ ] ASTM E336 protocol draft\nFinished ASTM E336 protocol draft.\n",
+        encoding="utf-8",
+    )
+    snapshot = ctx.scan()
+    assert "ASTM E336 protocol draft" in snapshot.completed_tasks
+    assert "ASTM E336 protocol draft" not in snapshot.pending_tasks
+
+
+def test_long_section_checkbox_still_detected(tmp_path: Path) -> None:
+    ctx = _make_ctx(tmp_path, scan_tree=False)
+    day = date.today().isoformat()
+    journal = ctx.journal_dir / f"{day}.org"
+    padding = "x" * 700
+    journal.write_text(
+        f"* Work\n{padding}\n- [ ] Deep checkbox task\n",
+        encoding="utf-8",
+    )
+    snapshot = ctx.scan()
+    assert "Deep checkbox task" in snapshot.pending_tasks
+
+
+def test_roam_checkbox_in_task_registry(tmp_path: Path) -> None:
+    ctx = _make_ctx(tmp_path, scan_tree=True)
+    roam_note = ctx.org_roam_dir / "projects" / "client.org"
+    roam_note.parent.mkdir(parents=True)
+    roam_note.write_text("* Project\n- [ ] Roam-side deliverable\n", encoding="utf-8")
+    snapshot = ctx.scan()
+    assert "Roam-side deliverable" in snapshot.pending_tasks
+    assert any("client.org" in t.source_path for t in snapshot.tracked_tasks)
+
+
+def test_briefing_includes_task_provenance(tmp_path: Path) -> None:
+    ctx = _make_ctx(tmp_path, scan_tree=False)
+    day = date.today().isoformat()
+    journal = ctx.journal_dir / f"{day}.org"
+    journal.write_text("* Client Work\n- [ ] Draft ASTM section\n", encoding="utf-8")
+    ctx.scan()
+    briefing = ctx.get_briefing_context()
+    assert "Draft ASTM section" in briefing
+    assert day in briefing
+    assert "Client Work" in briefing or f"{day}.org" in briefing
+

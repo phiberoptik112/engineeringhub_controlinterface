@@ -223,19 +223,32 @@ class ContextCompressor:
     def should_compress(self, budget: TokenBudget) -> bool:
         return budget.utilization >= self.pressure_threshold
 
-    def compress(self, history: ConversationHistory) -> CompressionResult:
+    def compress(
+        self, history: ConversationHistory, *, force: bool = False
+    ) -> CompressionResult:
         """Compress older turns into a summary, keeping the most recent turns warm.
 
         The summary is injected as a preserved system-role message so the
         model treats it as background context rather than a chat message to
         reply to.
+
+        When *force* is True (used under critical pressure), compression still
+        runs even if the turn count is at or below ``keep_recent`` by keeping a
+        smaller emergency floor. This fixes the edge case where a session sits
+        at exactly ``keep_recent`` turns and would otherwise never free space.
         """
-        if len(history.turns) <= self.keep_recent:
-            return CompressionResult(compressed=False)
+        keep = self.keep_recent
+        if len(history.turns) <= keep:
+            if not force or len(history.turns) <= 2:
+                return CompressionResult(compressed=False)
+            # Emergency: keep a smaller floor so the oldest turns can compress.
+            keep = max(2, len(history.turns) // 2)
 
         all_turns = list(history.turns)
-        to_compress = all_turns[: -self.keep_recent]
-        to_keep = all_turns[-self.keep_recent :]
+        to_compress = all_turns[:-keep]
+        to_keep = all_turns[-keep:]
+        if not to_compress:
+            return CompressionResult(compressed=False)
 
         text = "\n".join(
             f"{t.role.upper()}: {t.content}"
@@ -605,6 +618,7 @@ class PressureConfig:
     conversation_relation_threshold: float = 0.55
     conversation_relation_k: int = 5
     conversation_relation_excerpt_chars: int = 1000
+    org_link_excerpt_chars: int = 400
     past_session_search_k: int = 5
     past_session_excerpt_chars: int = 1200
     reserved_for_generation: int = 2000
@@ -652,7 +666,7 @@ class ContextPressureManager:
 
         elif utilization < self.config.emergency_trim_at:
             if self.compressor.should_compress(self.budget):
-                result = self.compressor.compress(self.history)
+                result = self.compressor.compress(self.history, force=True)
                 if result.compressed:
                     actions.append(
                         f"[Context compressed: freed {result.tokens_freed} tokens "
@@ -661,7 +675,7 @@ class ContextPressureManager:
                     self.budget.history_tokens = self.history.total_tokens
 
         else:
-            result = self.compressor.compress(self.history)
+            result = self.compressor.compress(self.history, force=True)
             if result.compressed:
                 actions.append(
                     f"[Emergency compression: freed {result.tokens_freed} tokens]"

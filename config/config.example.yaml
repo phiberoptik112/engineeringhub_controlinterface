@@ -109,6 +109,32 @@ staging:
 #   # when that venv exists, otherwise the engineering-hub interpreter.
 #   # python_path: "~/dev/rental_scout/.venv/bin/python"
 
+# ── Blender MCP (3D scene control via HTTP addon in Blender) ──────
+# Requires a running Blender session with an MCP addon enabled (e.g. dcc-mcp-blender
+# at http://127.0.0.1:8765/mcp). Exposed to journaler via /agent blender and optionally
+# proxied under the blender_ namespace in `engineering-hub mcp-server`.
+# blender:
+#   enabled: false
+#   mcp_url: "http://127.0.0.1:8765/mcp"
+#   # auth_token: set via ENGINEERING_HUB_BLENDER_AUTH_TOKEN instead of YAML
+#   connect_timeout_s: 10
+#   tools_cache_ttl_s: 60
+#   # tool_allowlist: ["get_scene_info", "list_objects"]
+#   tool_denylist: ["run_python_script"]
+
+# ── Horn Iterator (parametric exponential-horn sweep, LVT alert system) ──
+# Local compute (no API). Exposed via the `engineering-hub horn` CLI, the
+# `/horn` slash command in journaler chat, and `/agent horn-iterator`.
+# All keys are optional; defaults follow the N4v3 horn blueprint.
+# horn_iterator:
+#   enabled: true
+#   # Where sweep exports (CSV/org) are written; defaults to {workspace_dir}/horn_iterator
+#   output_dir: "~/dev/horn_sweeps"
+#   # Geometry/physics overrides (blueprint defaults shown):
+#   flare_rate_per_m: 17.8      # exponential m (/m); fc = c*m/(4*pi) ~= 486 Hz
+#   slot_area_mm2: 1050         # diffraction slot throat area S_T (mm^2)
+#   adapter_length_mm: 52       # fixed pre-flare adapter length (mm)
+
 # ── MLX local model (Apple Silicon) ───────────────────────────────
 # Used when llm_provider is "mlx". Install with: pip install 'engineering-hub[mlx]'
 # Gemma 4 is a Vision-Language Model (VLM) — the engine auto-detects this and
@@ -290,6 +316,30 @@ chunking:
 #   # share one cap). Profiles may override with thinking_max_tokens per profile.
 #   # thinking_max_tokens: 16384
 #
+#   # Output-length management (model agnostic). Controls what Journaler does when
+#   # a response is capped/truncated -- including mid-"thinking" cuts where the
+#   # deliverable was never reached. The visible output can be made to run longer
+#   # via multi-pass continuation, and you choose how recovery happens.
+#   output_limit:
+#     # Default behavior on a capped/truncated response:
+#     #   prompt         -> ask: summarize / continue / stop (interactive chat)
+#     #   auto_continue  -> automatically continue in additional passes
+#     #   auto_summarize -> compress context, then retry
+#     #   stop           -> keep the partial output and show a notice
+#     policy: prompt
+#     max_output_tokens: 8192        # per-pass budget (clamped to real headroom)
+#     max_continuation_passes: 3     # cap on same-turn continuation passes
+#     headroom_safety_tokens: 256    # margin subtracted from window - prompt
+#     continue_mode: ask             # ask | same_turn | follow_up
+#     summarize_scope_default: history   # history | history_and_partial
+#     check_before_call: true        # act if projected headroom < min_output_tokens
+#     min_output_tokens: 512         # headroom threshold that triggers recovery
+#     truncation_heuristics: true    # detect open code fences / mid-line cuts
+#     continuation_summary_tokens: 400   # budget for the compact continuation brief
+#     continuation_overlap_chars: 300    # seam de-dup window for natural joins
+#     force_answer_on_thinking_cut: true # thinking-phase cut -> jump to final answer
+#     summarize_before_continue: true    # reclaim headroom before each continue pass
+#
 #   # The model's actual context window in tokens.
 #   # Used by the context pressure manager to calculate utilization.
 #   # Gemma 4 31B: 131072  |  Qwen3-30B-A3B: 32768  |  Qwen2.5-32B: 32768
@@ -361,6 +411,9 @@ chunking:
 #   # watch_dirs: []             # extra org directories to rglob, e.g. ["~/org-roam/projects"]
 #   # journal_lookback_days: 30  # daily journal files within this many days (with cap)
 #   # journal_max_files: 30      # max recent daily journal files to parse for context/tasks
+#   # roam_task_lookback_days: 14   # roam project notes scanned for checkboxes/tasks
+#   # roam_task_max_files: 30
+#   # prose_completion_detection: true  # treat prose "finished X" as task completion
 #
 #   # HTTP chat endpoint
 #   chat_enabled: true
@@ -381,6 +434,11 @@ chunking:
 #   min_p: 0.05
 #   repetition_penalty: 1.1
 #
+#   # Slash /load accepts: .md .txt .org .py .yaml .yml .json .tex .csv .toml
+#   # .rst .docx .pdf — DOCX and PDF are converted to markdown for context
+#   # (Docling when the [docling] extra is installed, else pypdf/python-docx;
+#   # scanned/image-only PDFs need the [docling-ocrmac] OCR extra).
+#   #
 #   # Slash /load: how much of the *remaining* context (after system, snapshot,
 #   # history, reserved output, slack) may go to each file chunk. Uses the same
 #   # len//3 token estimate as the pressure manager.
@@ -388,6 +446,14 @@ chunking:
 #   # load_max_chars_absolute: 200000  # hard cap per file
 #   # load_min_chars: 1024            # aim for at least this many chars when headroom allows
 #   # load_slack_tokens: 128          # extra margin subtracted from headroom
+#
+#   # ── /load_recent: load most recently created workspace files ───
+#   # Scans org-roam, outputs/, .journaler state, inputs, conversation
+#   # exports, and zettelkasten proposals; ranks by creation time
+#   # (birthtime, falling back to mtime) and auto-loads the top N.
+#   # load_recent_max_files: 5        # default count when /load_recent has no N
+#   # load_recent_days: 30            # only files created in the last N days (0 = no cutoff)
+#   # load_recent_roots: []           # override scan roots, e.g. ["~/org-roam", "~/org-roam/engineering-hub/outputs"]
 #
 #   # ── Context management ─────────────────────────────────────────
 #   # Controls how the daemon manages its finite context window over
@@ -420,6 +486,7 @@ chunking:
 #     # conversation_relation_threshold: 0.55
 #     # conversation_relation_k: 5
 #     # conversation_relation_excerpt_chars: 1000
+#     # org_link_excerpt_chars: 400
 #     # past_session_search_k: 5
 #     # past_session_excerpt_chars: 1200
 #   conversation_summary_excerpt_chars: 800

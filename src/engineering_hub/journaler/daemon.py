@@ -18,8 +18,13 @@ from typing import TYPE_CHECKING, Any
 import schedule
 
 from engineering_hub.config.settings import Settings
+from engineering_hub.journaler.briefing_tasks import (
+    BackgroundWorkQueue,
+    BriefingTaskExtractor,
+    _read_recent_chat_context,
+    write_work_status,
+)
 from engineering_hub.journaler.context import JournalContext
-from engineering_hub.journaler.models import ContextSnapshot
 from engineering_hub.journaler.context_manager import PressureConfig
 from engineering_hub.journaler.engine import (
     ConversationalMLXBackend,
@@ -30,6 +35,8 @@ from engineering_hub.journaler.model_profiles import (
     JournalerChatModelContext,
     spec_from_journaler_config,
 )
+from engineering_hub.journaler.models import ContextSnapshot
+from engineering_hub.journaler.output_limit import OutputLimitConfig
 from engineering_hub.journaler.prompts import (
     build_skills_block,
     build_workspace_layout,
@@ -38,12 +45,6 @@ from engineering_hub.journaler.prompts import (
     format_system_prompt,
     load_briefing_prompt,
     load_system_prompt,
-)
-from engineering_hub.journaler.briefing_tasks import (
-    BackgroundWorkQueue,
-    BriefingTaskExtractor,
-    _read_recent_chat_context,
-    write_work_status,
 )
 from engineering_hub.journaler.task_integrator import (
     TaskIntegrator,
@@ -119,6 +120,9 @@ class JournalerConfig:
     # Context management
     model_context_window: int = 32768
     context_management: PressureConfig | None = None
+
+    # Output-length management (summarize / continue / stop on truncation).
+    output_limit: OutputLimitConfig | None = None
 
     # MLX sampling parameters
     temp: float = 0.7
@@ -205,6 +209,11 @@ class JournalerConfig:
     task_integrator_weekdays_only: bool = True
     task_integrator_max_tokens: int = 1024
 
+    # Task registry rebuild settings
+    roam_task_lookback_days: int = 14
+    roam_task_max_files: int = 30
+    prose_completion_detection: bool = True
+
     def get_pressure_config(self) -> PressureConfig:
         """Return the PressureConfig, defaulting from scalar fields if not set."""
         if self.context_management is not None:
@@ -223,6 +232,10 @@ class JournalerConfig:
             slack_tokens=self.load_slack_tokens,
         )
 
+    def get_output_limit(self) -> OutputLimitConfig:
+        """Return the OutputLimitConfig, defaulting if not set."""
+        return self.output_limit or OutputLimitConfig()
+
 
 def pressure_config_from_settings(
     settings: Settings,
@@ -237,6 +250,11 @@ def pressure_config_from_settings(
     raw.setdefault("end_of_day_time", settings.journaler_end_of_day_time)
     allowed = set(PressureConfig.__dataclass_fields__)
     return PressureConfig(**{k: v for k, v in raw.items() if k in allowed})
+
+
+def output_limit_config_from_settings(settings: Settings) -> OutputLimitConfig:
+    """Build the Journaler output-length config from YAML-backed settings."""
+    return OutputLimitConfig.from_raw(dict(settings.journaler_output_limit or {}))
 
 
 def run_daemon(config: JournalerConfig, settings: Settings | None = None) -> None:
@@ -273,6 +291,9 @@ def run_daemon(config: JournalerConfig, settings: Settings | None = None) -> Non
         pending_tasks_file=pending_ctx,
         conversation_lookback_days=config.conversation_lookback_days,
         conversation_summary_excerpt_chars=config.conversation_summary_excerpt_chars,
+        roam_task_lookback_days=config.roam_task_lookback_days,
+        roam_task_max_files=config.roam_task_max_files,
+        prose_completion_detection=config.prose_completion_detection,
     )
 
     # Init MLX backend (model loads here — takes ~10-30s for 32B)
@@ -297,6 +318,7 @@ def run_daemon(config: JournalerConfig, settings: Settings | None = None) -> Non
         max_history=config.max_conversation_history,
         max_tokens=config.max_tokens,
         pressure_config=pressure_cfg,
+        output_limit=config.get_output_limit(),
         model_context_window=config.model_context_window,
         corpus_service=config.corpus_service,
         load_file_budget=config.get_load_file_budget(),
@@ -572,6 +594,9 @@ def generate_briefing_now(
             pending_tasks_file=ptf,
             conversation_lookback_days=config.conversation_lookback_days,
             conversation_summary_excerpt_chars=config.conversation_summary_excerpt_chars,
+            roam_task_lookback_days=config.roam_task_lookback_days,
+            roam_task_max_files=config.roam_task_max_files,
+            prose_completion_detection=config.prose_completion_detection,
         )
         context.scan()
 
@@ -651,6 +676,9 @@ def generate_discussion_now(
             pending_tasks_file=ptf,
             conversation_lookback_days=config.conversation_lookback_days,
             conversation_summary_excerpt_chars=config.conversation_summary_excerpt_chars,
+            roam_task_lookback_days=config.roam_task_lookback_days,
+            roam_task_max_files=config.roam_task_max_files,
+            prose_completion_detection=config.prose_completion_detection,
         )
         context.scan()
 
@@ -926,10 +954,16 @@ def _extract_and_queue_tasks(
     briefing_text: str,
     source: str,
     config: JournalerConfig,
+    *,
+    completed_task_keys: set[str] | None = None,
 ) -> None:
     """Extract tasks from a briefing and add them to today's work queue."""
     try:
-        tasks = extractor.extract(briefing_text, source)
+        tasks = extractor.extract(
+            briefing_text,
+            source,
+            completed_task_keys=completed_task_keys,
+        )
     except Exception as exc:
         logger.warning("Task extraction from %s failed: %s", source, exc)
         return
@@ -979,8 +1013,14 @@ def _morning_briefing(
         slack.post_briefing(briefing)
 
     if task_extractor is not None and work_queue is not None:
+        completed_keys = context.completed_task_keys()
         _extract_and_queue_tasks(
-            task_extractor, work_queue, briefing, "morning_briefing", config
+            task_extractor,
+            work_queue,
+            briefing,
+            "morning_briefing",
+            config,
+            completed_task_keys=completed_keys,
         )
 
 
