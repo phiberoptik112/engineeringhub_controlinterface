@@ -29,6 +29,12 @@ COMMAND_CATALOG: list[CommandEntry] = [
     CommandEntry("/topic", "", "Show the currently detected conversation topic", "Context Management"),
     CommandEntry("/clear", "[--hard|--summarize]", "Clear conversation history", "Context Management"),
     CommandEntry("/files", "[clear]", "List or clear loaded files", "Context Management"),
+    CommandEntry(
+        "/focus",
+        "<path>|status|off|output <path>",
+        "Focus chat on one technical document",
+        "Context Management",
+    ),
     # File Ops
     CommandEntry("/load", "<path> [-r]", "Load a file or directory into context", "File Ops"),
     CommandEntry("/load_browse", "", "Interactive browser for org-roam files", "File Ops"),

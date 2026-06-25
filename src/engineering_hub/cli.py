@@ -28,6 +28,7 @@ from engineering_hub.journaler.engine import (
     ConversationEngine,
     _is_model_cached,
 )
+from engineering_hub.journaler.file_browser import browse_org_roam
 from engineering_hub.journaler.model_profiles import (
     JournalerChatModelContext,
     build_journaler_mlx_backend,
@@ -742,6 +743,7 @@ def _build_status_bar(engine: ConversationEngine, model_label: str) -> Panel:
     topic = status["current_topic"] or "—"
     turns = status["history_turns"]
     files = len(engine.list_loaded_files())
+    focus_doc = engine.get_focus_document()
 
     t = Text(overflow="ellipsis", no_wrap=True)
     t.append(f" Model: {model_label}", style="cyan")
@@ -753,6 +755,9 @@ def _build_status_bar(engine: ConversationEngine, model_label: str) -> Panel:
     t.append(f"Topic: {topic}", style="magenta")
     t.append(" │ ", style="dim")
     t.append(f"Files: {files} ", style="blue")
+    if focus_doc is not None:
+        t.append(" │ ", style="dim")
+        t.append(f"Focus: {focus_doc.label} ", style="yellow")
     return Panel(t, height=3, padding=(0, 0))
 
 
@@ -761,6 +766,25 @@ def _print_chat_markdown(console: Console, text: str) -> None:
     if not text.strip():
         return
     console.print(Markdown(text))
+
+
+def _print_focus_status(chat_console: Console, engine: ConversationEngine) -> None:
+    """Render the current focus writing mode state."""
+    document = engine.get_focus_document()
+    if document is None:
+        chat_console.print("[dim]Focus mode is off.[/dim]")
+        return
+
+    table = Table(title="Focus Technical Writing Mode")
+    table.add_column("Field", style="cyan")
+    table.add_column("Value", style="green")
+    table.add_row("Mode", document.mode)
+    table.add_row("Document", str(document.path))
+    table.add_row("Label", document.label)
+    table.add_row("Characters", f"{len(document.content):,}")
+    table.add_row("Truncated", "yes" if document.truncated else "no")
+    table.add_row("Output", str(document.output_path) if document.output_path else "")
+    chat_console.print(table)
 
 
 def _handle_chat_slash_command(
@@ -782,6 +806,7 @@ def _handle_chat_slash_command(
       /model                     Show or switch HF model (profile or path).
       /load <path> [-r]          Load a file or directory into context.
       /load_browse               Interactive file browser for org-roam files.
+      /focus <path>|status|off   Focus chat on one technical document.
       /agent_browse              Interactive skill picker for agent delegation.
       /edit_browse               Interactive file browser to set /edit target.
       /files                     List all currently loaded files.
@@ -839,6 +864,112 @@ def _handle_chat_slash_command(
     if journal_dir is None and org_roam_dir is not None:
         candidate = org_roam_dir / "journal"
         journal_dir = candidate if candidate.exists() else org_roam_dir
+
+    if cmd == "/focus":
+        try:
+            tokens = shlex.split(raw)
+        except ValueError as exc:
+            chat_console.print(f"[red]{escape(str(exc))}[/red]")
+            return
+
+        action = tokens[1].lower() if len(tokens) > 1 else "status"
+        if action == "status":
+            _print_focus_status(chat_console, engine)
+            return
+
+        if action in ("off", "clear"):
+            if engine.focus_is_active():
+                engine.clear_focus_document()
+                engine.clear(ClearStrategy.SOFT)
+                chat_console.print(
+                    "[green]Focus mode disabled. Focus-mode turn history cleared.[/green]"
+                )
+            else:
+                chat_console.print("[dim]Focus mode is already off.[/dim]")
+            return
+
+        if action == "output":
+            if not engine.focus_is_active():
+                chat_console.print(
+                    "[yellow]No focus document is active. Use /focus <path> first.[/yellow]"
+                )
+                return
+            if len(tokens) < 3:
+                chat_console.print("[yellow]Usage: /focus output <path>[/yellow]")
+                return
+            output_path = Path(tokens[2]).expanduser()
+            engine.set_focus_output_path(output_path)
+            chat_console.print(
+                f"[green]Focus output target set to {escape(str(output_path))}[/green]"
+            )
+            return
+
+        if action == "browse":
+            if org_roam_dir is None:
+                chat_console.print(
+                    "[yellow]/focus browse requires org-roam dir "
+                    "(set journaler.org_journal_dir or start with 'journaler chat').[/yellow]"
+                )
+                return
+
+            chat_console.print("[dim]Opening file browser… (Esc or q to cancel)[/dim]")
+            selected = browse_org_roam(org_roam_dir, SUPPORTED_EXTENSIONS)
+            if not selected:
+                chat_console.print("[dim]No focus document selected.[/dim]")
+                return
+            focus_path = selected[0]
+        else:
+            focus_path = Path(tokens[1]).expanduser() if len(tokens) > 1 else None
+
+        if focus_path is None:
+            chat_console.print(
+                "[yellow]Usage: /focus <path>|status|off|clear|browse|output <path>[/yellow]"
+            )
+            return
+
+        resolved_focus_path = focus_path.expanduser().resolve()
+        if not resolved_focus_path.exists():
+            chat_console.print(f"[red]File not found: {escape(str(resolved_focus_path))}[/red]")
+            return
+        if not resolved_focus_path.is_file():
+            chat_console.print(
+                f"[red]Path is not a file: {escape(str(resolved_focus_path))}[/red]"
+            )
+            return
+        if resolved_focus_path.suffix.lower() not in SUPPORTED_EXTENSIONS:
+            supported = ", ".join(sorted(SUPPORTED_EXTENSIONS))
+            chat_console.print(
+                f"[red]Extension '{resolved_focus_path.suffix}' is not supported. "
+                f"Supported: {supported}[/red]"
+            )
+            return
+
+        engine.clear(ClearStrategy.SOFT)
+        ok, msg = engine.load_focus_document(
+            resolved_focus_path,
+            extensions=SUPPORTED_EXTENSIONS,
+        )
+        color = "green" if ok else "red"
+        chat_console.print(f"[{color}]{escape(msg)}[/{color}]")
+        if ok:
+            chat_console.print(
+                "[dim]Focus mode uses only this document and new focus-mode turns; "
+                "ambient Journaler context and retrieval are disabled.[/dim]"
+            )
+            if (
+                org_roam_dir is not None
+                and resolved_focus_path.suffix.lower() == ".org"
+            ):
+                try:
+                    assert_org_path_under_roam(resolved_focus_path, org_roam_dir)
+                except ValueError:
+                    pass
+                else:
+                    engine.set_roam_edit_target(resolved_focus_path)
+                    chat_console.print(
+                        "[dim]This org file is also set as the /edit target.[/dim]"
+                    )
+        return
 
     if cmd == "/skills":
         from engineering_hub.journaler.chat_server import _handle_skills_command
@@ -1062,6 +1193,9 @@ def _handle_chat_slash_command(
             "  [cyan]/load <path> [-r][/cyan]          Load a file or directory into context\n"
             "                                 (-r / --recursive scans subdirectories)\n"
             "  [cyan]/load_browse[/cyan]               Browse and select org-roam files to load\n"
+            "  [cyan]/focus <path>[/cyan]               Focus chat on one technical document\n"
+            "  [cyan]/focus status|off[/cyan]           Show or leave focus writing mode\n"
+            "  [cyan]/focus output <path>[/cyan]        Set intended edited-output path\n"
             "  [cyan]/model[/cyan]                     Show active MLX model / profile\n"
             "  [cyan]/model <profile>[/cyan]           Switch to a named journaler.models profile\n"
             "  [cyan]/model path <id-or-path>[/cyan]   Load a Hugging Face id or local path\n"
@@ -1190,8 +1324,6 @@ def _handle_chat_slash_command(
                 "(set journaler.org_journal_dir or start with 'journaler chat')[/yellow]"
             )
             return
-
-        from engineering_hub.journaler.file_browser import browse_org_roam
 
         chat_console.print("[dim]Opening file browser… (Esc or q to cancel)[/dim]")
         selected = browse_org_roam(org_roam_dir, SUPPORTED_EXTENSIONS)
@@ -1806,7 +1938,7 @@ def cmd_journaler(args: argparse.Namespace) -> int:
                     )
 
                     mode = (settings.journaler_default_task_mode or "immediate").lower()
-                    if ctx is not None:
+                    if ctx is not None and not engine.focus_is_active():
                         routed_result = route_natural_language_task(
                             user_input,
                             engine=engine,
