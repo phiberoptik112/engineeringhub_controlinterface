@@ -905,14 +905,28 @@ def _interactive_output_choice(
         chat_console.print(
             f"\n[yellow]Output may be incomplete[/yellow] "
             f"(reason: {outcome.reason}{phase_note}).\n"
+            "\n"
             "  [s] Summarize history and retry\n"
+            "      Compress older exchanges to free context, then ask the model again.\n"
+            "      The cut-off reply stays in context but is not summarized.\n"
+            "\n"
             "  [S] Summarize history + partial answer, then retry\n"
+            "      Same as [s], and also summarizes the incomplete reply into a brief.\n"
+            "      Use when both chat history and the partial answer are using space.\n"
+            "\n"
             "  [c] Continue (same turn)\n"
+            "      Resume where generation stopped and append more text to this reply.\n"
+            "      May run several hidden passes; output is stitched into one message.\n"
+            "\n"
             "  [f] Continue (new follow-up turn)\n"
-            "  [Enter] Stop and keep partial"
+            "      Continue via an explicit follow-up request after the partial reply.\n"
+            "      Use when you want a separate continuation pass instead of a seamless seam.\n"
+            "\n"
+            "  [Enter] Stop and keep partial\n"
+            "      Accept the incomplete answer as-is; no further generation."
         )
         try:
-            choice = input("Choice [s/S/c/f/Enter]: ").strip()
+            choice = input("Choice [s/S/c/f, or Enter to stop]: ").strip()
         except (KeyboardInterrupt, EOFError):
             return "stop"
         mapping: dict[str, Action] = {

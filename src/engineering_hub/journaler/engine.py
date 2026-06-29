@@ -1071,12 +1071,17 @@ class ConversationEngine:
     def clear(self, strategy: ClearStrategy) -> str:
         """Execute a manual clear command. Returns a status message."""
         last_scan = ""
-        return execute_clear(
+        self.budget.history_tokens = self.history.total_tokens
+        self._sync_loaded_files_budget()
+        msg = execute_clear(
             strategy=strategy,
             history=self.history,
             compressor=self.compressor,
             last_scan_time=last_scan,
+            budget=self.budget,
         )
+        self.budget.history_tokens = self.history.total_tokens
+        return msg
 
     def get_status(self) -> dict:
         """Return current context management state for display / /status command."""

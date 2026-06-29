@@ -556,24 +556,68 @@ class ClearStrategy(Enum):
     SUMMARIZE = "summarize"
 
 
+def _is_conversation_summary_turn(turn: ConversationTurn) -> bool:
+    return (
+        turn.preserved
+        and turn.role == "system"
+        and turn.content.startswith("[Conversation summary")
+    )
+
+
+def _clear_recent_turns_keep_summary(history: ConversationHistory) -> int:
+    """Archive non-summary turns and keep preserved summary system message(s)."""
+    kept: list[ConversationTurn] = []
+    cleared = 0
+    for turn in list(history.turns):
+        if _is_conversation_summary_turn(turn):
+            kept.append(turn)
+        else:
+            history._archive.append(turn)
+            cleared += 1
+    history.turns.clear()
+    history.turns.extend(kept)
+    return cleared
+
+
 def execute_clear(
     strategy: ClearStrategy,
     history: ConversationHistory,
     compressor: ContextCompressor,
     last_scan_time: str = "",
     reset_state_fn: Callable[[], None] | None = None,
+    budget: TokenBudget | None = None,
 ) -> str:
     """Execute a clear command. Returns a human-readable status message."""
 
     if strategy == ClearStrategy.SUMMARIZE:
-        result = compressor.compress(history)
+        turn_count = len(history.turns)
+        result = compressor.compress(history, force=True)
         if result.compressed:
+            cleared_recent = _clear_recent_turns_keep_summary(history)
             return (
                 f"Compressed {result.turns_compressed} turns "
                 f"({result.tokens_before} → {result.tokens_after} tokens, "
-                f"freed {result.tokens_freed})."
+                f"freed {result.tokens_freed}). "
+                f"Cleared {cleared_recent} recent turn(s); summary retained."
             )
-        return "Nothing to compress (too few turns)."
+
+        high_pressure = budget is not None and budget.utilization >= compressor.pressure_threshold
+        if high_pressure and turn_count > 0:
+            history_tokens_before = sum(t.tokens for t in history.turns)
+            history._archive.extend(list(history.turns))
+            history.turns.clear()
+            hint = ""
+            if budget is not None and budget.loaded_files_tokens > history_tokens_before:
+                hint = " Loaded files still dominate the window; try /files clear."
+            return (
+                f"Could not summarize ({turn_count} turn(s) — need more than 2 to merge). "
+                f"Cleared {turn_count} turn(s) instead.{hint}"
+            )
+
+        return (
+            f"Nothing to summarize ({turn_count} turn(s)). "
+            f"Use /clear for a soft reset or /files clear if a loaded file fills the window."
+        )
 
     elif strategy == ClearStrategy.SOFT:
         turn_count = len(history.turns)
