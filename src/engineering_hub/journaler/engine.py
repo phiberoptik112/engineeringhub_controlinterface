@@ -34,6 +34,7 @@ from engineering_hub.journaler.context_manager import (
     estimate_tokens,
     execute_clear,
 )
+from engineering_hub.journaler.prompts import FOCUS_TECHNICAL_WRITING_PROMPT
 from engineering_hub.journaler.session_retrieval import (
     format_past_session_block,
     references_past_session,
@@ -63,6 +64,19 @@ SUPPORTED_EXTENSIONS: frozenset[str] = frozenset(
 )
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class FocusDocument:
+    """Document pinned as the exclusive context for focused writing."""
+
+    path: Path
+    label: str
+    content: str
+    mode: str = "technical-writing"
+    output_path: Path | None = None
+    truncated: bool = False
+    max_chars: int | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -503,6 +517,7 @@ class ConversationEngine:
         )
         self._pressure_config = cfg
         self._roam_edit_target: Path | None = None
+        self._focus_document: FocusDocument | None = None
 
         self.session_id = str(uuid.uuid4())
         self.session_opened_at = datetime.now(timezone.utc)
@@ -541,7 +556,7 @@ class ConversationEngine:
     def update_context(self, context_block: str) -> None:
         """Replace the rolling context section of the system prompt."""
         self._context_block = context_block
-        self.budget.context_snapshot_tokens = estimate_tokens(context_block)
+        self._sync_context_snapshot_budget()
 
     def chat(self, message: str) -> str:
         """Send a user message and get a response.
@@ -552,11 +567,17 @@ class ConversationEngine:
         """
         self.budget.corpus_injection_tokens = 0
         self.budget.history_tokens = self.history.total_tokens
+        self._sync_context_snapshot_budget()
         self._sync_loaded_files_budget()
 
         extra_suffix: str | None = None
         cs = self._corpus_service
-        if cs is not None and cs.is_available() and message.strip():
+        if (
+            not self.focus_is_active()
+            and cs is not None
+            and cs.is_available()
+            and message.strip()
+        ):
             try:
                 results = cs.search(message)
                 if results:
@@ -564,7 +585,7 @@ class ConversationEngine:
             except Exception as exc:
                 logger.warning("Journaler corpus RAG failed (non-fatal): %s", exc)
 
-        if references_past_session(message):
+        if not self.focus_is_active() and references_past_session(message):
             try:
                 session_hits = retrieve_past_sessions(
                     message,
@@ -583,7 +604,7 @@ class ConversationEngine:
                 logger.warning("Journaler past-session retrieval failed: %s", exc)
 
         # Per-turn relation search: check daily summaries for related past conversations
-        if self._memory_service and message.strip():
+        if not self.focus_is_active() and self._memory_service and message.strip():
             try:
                 relation_hits = self._memory_service.search(
                     message,
@@ -679,7 +700,9 @@ class ConversationEngine:
     def get_status(self) -> dict:
         """Return current context management state for display / /status command."""
         self.budget.history_tokens = self.history.total_tokens
+        self._sync_context_snapshot_budget()
         self._sync_loaded_files_budget()
+        focus_doc = self.get_focus_document()
         return {
             "context_window": self.budget.window_size,
             "utilization": f"{self.budget.utilization:.0%}",
@@ -693,6 +716,13 @@ class ConversationEngine:
             "available_tokens": self.budget.available,
             "compressions_today": self.compressor.compression_count,
             "current_topic": self.topic_tracker.current_topic,
+            "focus_mode": focus_doc.mode if focus_doc else "",
+            "focus_document": str(focus_doc.path) if focus_doc else "",
+            "focus_output": (
+                str(focus_doc.output_path)
+                if focus_doc and focus_doc.output_path
+                else ""
+            ),
         }
 
     def generate_briefing(
@@ -760,6 +790,139 @@ class ConversationEngine:
             blocks.append(f"### {label}\n```\n{content}\n```")
         return "\n".join(blocks)
 
+    def focus_is_active(self) -> bool:
+        """Return True when focused document writing mode is active."""
+        return self._focus_document is not None
+
+    def get_focus_document(self) -> FocusDocument | None:
+        """Return the current focus document, if any."""
+        return self._focus_document
+
+    def set_focus_document(self, document: FocusDocument | None) -> None:
+        """Set or clear the focus document for strict writing context."""
+        if document is None:
+            self._focus_document = None
+        else:
+            document.path = document.path.expanduser().resolve()
+            if document.output_path is not None:
+                document.output_path = document.output_path.expanduser().resolve()
+            self._focus_document = document
+        self._sync_context_snapshot_budget()
+        self._sync_loaded_files_budget()
+
+    def clear_focus_document(self) -> None:
+        """Disable focus writing mode."""
+        self.set_focus_document(None)
+
+    def set_focus_output_path(self, output_path: Path | None) -> None:
+        """Set or clear the intended output path for the focus document."""
+        if self._focus_document is None:
+            return
+        self._focus_document.output_path = (
+            output_path.expanduser().resolve() if output_path is not None else None
+        )
+
+    def _focus_document_section(self) -> str:
+        """Markdown block for the active focus document."""
+        document = self._focus_document
+        if document is None:
+            return ""
+        path = str(document.path)
+        output = str(document.output_path) if document.output_path else "(not set)"
+        truncated = "yes" if document.truncated else "no"
+        return (
+            "\n\n## Focus Document\n\n"
+            f"- Path: `{path}`\n"
+            f"- Label: `{document.label}`\n"
+            f"- Mode: `{document.mode}`\n"
+            f"- Intended output: `{output}`\n"
+            f"- Truncated: `{truncated}`\n\n"
+            "```text\n"
+            f"{document.content}\n"
+            "```"
+        )
+
+    def _dynamic_max_chars_for_focus_document(self) -> int:
+        """Characters allowed for a focus document under strict-context budget."""
+        self.budget.history_tokens = self.history.total_tokens
+        bf = self._load_file_budget
+        tokens_avail = (
+            self.budget.window_size
+            - self.budget.system_prompt_tokens
+            - self.budget.history_tokens
+            - self.budget.reserved_for_generation
+            - bf.slack_tokens
+        )
+        if tokens_avail <= 0:
+            return 0
+        alloc_tokens = max(1, int(tokens_avail * bf.max_context_fraction))
+        char_cap = min(bf.max_chars_absolute, alloc_tokens * 3)
+        if char_cap > 0 and char_cap < bf.min_chars:
+            char_cap = min(bf.min_chars, tokens_avail * 3, bf.max_chars_absolute)
+        return max(0, char_cap)
+
+    def load_focus_document(
+        self,
+        path: Path,
+        *,
+        output_path: Path | None = None,
+        max_chars: int | None = None,
+        extensions: frozenset[str] = SUPPORTED_EXTENSIONS,
+    ) -> tuple[bool, str]:
+        """Read a single file and make it the active focus document."""
+        path = path.expanduser().resolve()
+
+        if not path.exists():
+            return False, f"File not found: {path}"
+
+        if not path.is_file():
+            return False, f"Path is not a file: {path}"
+
+        if extensions and path.suffix.lower() not in extensions:
+            return False, (
+                f"Extension '{path.suffix}' is not supported. "
+                f"Supported: {', '.join(sorted(extensions))}"
+            )
+
+        if max_chars is None:
+            max_chars = self._dynamic_max_chars_for_focus_document()
+            if max_chars <= 0:
+                return (
+                    False,
+                    "No context budget remaining for a focus document "
+                    f"(window {self.budget.window_size:,} tokens). "
+                    "Try /clear or a larger journaler.model_context_window.",
+                )
+
+        try:
+            content = read_path_content_for_load(path)
+        except OSError as exc:
+            return False, f"Could not read {path.name}: {exc}"
+        except Exception as exc:
+            return False, f"Could not load {path.name}: {exc}"
+
+        truncated = False
+        if len(content) > max_chars:
+            content = content[:max_chars]
+            truncated = True
+
+        self.set_focus_document(
+            FocusDocument(
+                path=path,
+                label=path.name,
+                content=content,
+                output_path=output_path,
+                truncated=truncated,
+                max_chars=max_chars,
+            )
+        )
+
+        size_kb = len(content) / 1024
+        msg = f"Focus document loaded: '{path.name}' ({size_kb:.1f} KB)"
+        if truncated:
+            msg += f" [truncated to {max_chars:,} chars (context-aware cap)]"
+        return True, msg
+
     def build_delegate_context(
         self,
         task_description: str,
@@ -788,6 +951,22 @@ class ConversationEngine:
     ) -> DelegateContextResult:
         """Assemble delegated task context and report web retrieval status."""
         parts: list[str] = []
+        focused = self.get_focus_document()
+        if focused is not None:
+            parts.append(
+                "## Focus document from Journaler chat\n\n"
+                "The user is in focus technical-writing mode. Treat this "
+                "document as the primary source and avoid unrelated workspace "
+                "context unless the user explicitly requests it.\n\n"
+            )
+            parts.append(self._focus_document_section().strip())
+            return DelegateContextResult(
+                context="\n".join(parts).strip(),
+                web_search_attempted=False,
+                web_search_succeeded=False,
+                web_search_error=None,
+            )
+
         loaded = self._loaded_files_section().strip()
         if loaded:
             parts.append(
@@ -872,7 +1051,18 @@ class ConversationEngine:
         return self._web_search_anthropic_max_uses
 
     def _sync_loaded_files_budget(self) -> None:
-        self.budget.loaded_files_tokens = estimate_tokens(self._loaded_files_section())
+        if self._focus_document is not None:
+            self.budget.loaded_files_tokens = estimate_tokens(
+                self._focus_document_section()
+            )
+        else:
+            self.budget.loaded_files_tokens = estimate_tokens(self._loaded_files_section())
+
+    def _sync_context_snapshot_budget(self) -> None:
+        if self._focus_document is not None:
+            self.budget.context_snapshot_tokens = 0
+        else:
+            self.budget.context_snapshot_tokens = estimate_tokens(self._context_block)
 
     def _dynamic_max_chars_for_next_load(self) -> int:
         """Characters allowed for the next file chunk from remaining context budget."""
@@ -1049,11 +1239,14 @@ class ConversationEngine:
         self, extra_system_suffix: str | None = None
     ) -> list[dict[str, str]]:
         """Build the system + history message list for the model (without current user turn)."""
-        system_content = self._system_prompt
-        if self._context_block:
-            system_content += f"\n\n{self._context_block}"
-
-        system_content += self._loaded_files_section()
+        if self._focus_document is not None:
+            system_content = FOCUS_TECHNICAL_WRITING_PROMPT
+            system_content += self._focus_document_section()
+        else:
+            system_content = self._system_prompt
+            if self._context_block:
+                system_content += f"\n\n{self._context_block}"
+            system_content += self._loaded_files_section()
 
         if extra_system_suffix:
             system_content += f"\n\n{extra_system_suffix}"

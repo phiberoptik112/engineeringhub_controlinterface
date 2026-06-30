@@ -219,16 +219,19 @@ def _make_handler(
                         else "immediate"
                     ).lower()
 
-                    routed = route_natural_language_task(
-                        message,
-                        engine=engine,
-                        delegator=delegator,
-                        mode=mode,
-                        pending_tasks_file=resolved_pending,
-                        run_agent_command=lambda cmd: _handle_agent_command(
-                            cmd, delegator, context, engine=engine
-                        ),
-                    )
+                    if engine.focus_is_active():
+                        routed = None
+                    else:
+                        routed = route_natural_language_task(
+                            message,
+                            engine=engine,
+                            delegator=delegator,
+                            mode=mode,
+                            pending_tasks_file=resolved_pending,
+                            run_agent_command=lambda cmd: _handle_agent_command(
+                                cmd, delegator, context, engine=engine
+                            ),
+                        )
                     if routed is not None:
                         elapsed = time.monotonic() - t0
                         body = {

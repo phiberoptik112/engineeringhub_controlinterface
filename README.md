@@ -28,7 +28,7 @@ They coexist cleanly: the Orchestrator processes explicit tasks while the Journa
 - **Context Management**: Token-aware conversation history with automatic compression, topic-shift archival, end-of-day reset, and manual `/clear` controls — keeps the local model coherent across a full workday
 - **Org-Roam Write Skill**: Journaler chat can write properly-formatted org-roam files — add TODOs, mark tasks done, append notes to today's journal (`/note`), set a session target on any roam note (`/open`), append under a heading there (`/edit`), search by title (`/find`), and create new nodes — via slash commands
 - **Journaler Export**: CLI `journaler export` reads the persisted chat transcript (`conversation.jsonl`) and writes org-roam-friendly output to **stdout** by default (raw per-turn org, optional MLX **summary + open TODOs**); use `--note`, `--find-title`, `-o`, or `--new-node` for file targets. In **`journaler chat`**, bare **`/export`** writes under **`conversation_exports/`** in the configured org-roam root unless you pass one of those targets.
-- **Context File Loading**: Inject files or directories into the Journaler's live context (`/load`) or the persistent memory store (`engineering-hub load`)
+- **Context File Loading**: Inject files or directories into the Journaler's live context (`/load`), switch into one-document technical-writing focus mode (`/focus`), or persist files into the memory store (`engineering-hub load`)
 - **Vector Memory**: Local semantic memory (`memory.db`) with Ollama embeddings for past-task and ingest retrieval
 - **PDF Reference Corpus**: Optional ingested reference corpus (`corpus.db` from **libraryfiles-corpus**) injected as RAG into **Journaler chat** turns and **Orchestrator** agent tasks (separate from workspace memory)
 - **Context pipeline diagnostic**: Opt-in **`engineering-hub diagnostic context-pipeline`** command (and matching config/env flags) persist full formatted agent context, heuristic checklists, optional corpus audit excerpts, and agent outputs under `outputs/diagnostics/context-pipeline/<run_id>/` — see [diagnostics/RUNBOOK.md](diagnostics/RUNBOOK.md)
@@ -166,6 +166,10 @@ In **`journaler chat`**, **`/export`** uses the same export pipeline as the CLI;
 /load_browse                    Interactive file browser (arrow keys, multi-select)
 /files                          List currently loaded files (with sizes)
 /files clear                    Remove all loaded files from context
+/focus path/to/draft.md         Focus chat on one technical document only
+/focus status                   Show active focus document and output target
+/focus output path/to/out.md    Set the intended edited-output path
+/focus off                      Leave focus mode and clear focus-mode turn history
 /export                         Export transcript to `<org-roam>/conversation_exports/` (see below)
 /export -o ~/path/to/out.org    Same flags as `engineering-hub journaler export`
 /export --help                  Full `/export` flag list
@@ -181,6 +185,8 @@ In **`journaler chat`**, **`/export`** uses the same export pipeline as the CLI;
 ```
 
 Supported extensions: `.md`, `.txt`, `.org`, `.py`, `.yaml`, `.yml`, `.json`, `.tex`, `.csv`, `.toml`, `.rst`, `.docx` (converted to markdown for context). Each `/load` is capped from your `journaler.model_context_window`, current conversation/history usage, and optional `journaler.load_*` keys in config (documented under **Journaler → Configuration** below). Oversized files are truncated with a notice. Directory loads share one remaining budget across files (recomputed after each file). Loaded files appear in the model's system prompt on every turn, count toward `/budget` and context pressure, and are cleared when the session ends.
+
+`/focus <path>` is stricter than `/load`: it clears the in-memory chat history for the session, disables ambient Journaler context, corpus RAG, past-session retrieval, and natural-language auto-delegation, and uses only the focused document plus new focus-mode turns as context. This is intended for technical-writing passes where the goal is an edited document. Explicit `/agent technical-writer ...` still works while focus mode is active; the focused document is passed as the primary agent context. If the focused file is an org-roam `.org` note under the roam root, Journaler also sets it as the `/edit` target.
 
 **From the command line** — persist files into the long-term memory store for semantic search:
 
