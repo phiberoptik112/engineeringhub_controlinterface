@@ -40,10 +40,10 @@ from engineering_hub.journaler.model_profiles import journaler_slash_model_comma
 from engineering_hub.journaler.org_writer import add_todo_to_journal
 
 if TYPE_CHECKING:
+    from engineering_hub.journaler.activity_log import JournalerActivityLog
     from engineering_hub.journaler.context import JournalContext
     from engineering_hub.journaler.delegator import AgentDelegator
     from engineering_hub.journaler.engine import ConversationEngine
-    from engineering_hub.journaler.activity_log import JournalerActivityLog
     from engineering_hub.journaler.model_profiles import JournalerChatModelContext
 
 logger = logging.getLogger(__name__)

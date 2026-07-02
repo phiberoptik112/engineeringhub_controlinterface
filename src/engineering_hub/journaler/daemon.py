@@ -39,11 +39,11 @@ from engineering_hub.journaler.prompts import (
     load_briefing_prompt,
     load_system_prompt,
 )
-from engineering_hub.search import SearchProvider
 from engineering_hub.journaler.status_snapshot import (
     build_status_suggestions,
     write_status_file,
 )
+from engineering_hub.search import SearchProvider
 
 if TYPE_CHECKING:
     from engineering_hub.journaler.chat_server import ChatServer
