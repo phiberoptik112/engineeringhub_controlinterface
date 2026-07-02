@@ -43,6 +43,7 @@ if TYPE_CHECKING:
     from engineering_hub.journaler.context import JournalContext
     from engineering_hub.journaler.delegator import AgentDelegator
     from engineering_hub.journaler.engine import ConversationEngine
+    from engineering_hub.journaler.activity_log import JournalerActivityLog
     from engineering_hub.journaler.model_profiles import JournalerChatModelContext
 
 logger = logging.getLogger(__name__)
@@ -74,6 +75,13 @@ _SECTION_FLAG_RE = re.compile(r'--section\s+"([^"]+)"|--section\s+(\S+)', re.IGN
 _LOOP_LIMIT_FLAG_RE = re.compile(r"--loop-limit\s+(\d+)", re.IGNORECASE)
 
 
+def _summarize_message(message: str, *, limit: int = 160) -> str:
+    text = " ".join(message.split())
+    if len(text) <= limit:
+        return text
+    return text[: limit - 1].rstrip() + "..."
+
+
 class ChatServer:
     """HTTP server for ad-hoc Journaler interaction."""
 
@@ -87,6 +95,7 @@ class ChatServer:
         delegator: AgentDelegator | None = None,
         model_context: JournalerChatModelContext | None = None,
         pending_tasks_file: Path | None = None,
+        activity_log: JournalerActivityLog | None = None,
     ) -> None:
         self.engine = engine
         self.context = context
@@ -102,6 +111,7 @@ class ChatServer:
         )
         self._server: ThreadingHTTPServer | None = None
         self._thread: threading.Thread | None = None
+        self.activity_log = activity_log
 
     def start_background(self) -> None:
         """Start the HTTP server in a daemon thread."""
@@ -112,6 +122,7 @@ class ChatServer:
             self.delegator,
             self.model_context,
             self.pending_tasks_file,
+            self.activity_log,
         )
         self._server = ThreadingHTTPServer((self.host, self.port), handler)
         self._thread = threading.Thread(
@@ -135,6 +146,7 @@ def _make_handler(
     delegator: AgentDelegator | None = None,
     model_context: JournalerChatModelContext | None = None,
     pending_tasks_file: Path | None = None,
+    activity_log: JournalerActivityLog | None = None,
 ) -> type[BaseHTTPRequestHandler]:
     """Create a request handler class with access to the engine and context."""
 
@@ -175,6 +187,12 @@ def _make_handler(
                     return
 
                 t0 = time.monotonic()
+                if activity_log is not None:
+                    activity_log.append_event(
+                        "chat_request",
+                        "Journaler HTTP chat request received",
+                        details={"Message": _summarize_message(message)},
+                    )
 
                 # Route slash commands before they reach the LLM.
                 mlow = message.lower()
@@ -294,11 +312,17 @@ def _make_handler(
             snapshot = context._snapshot
             self._send_json({
                 "model_loaded": engine._backend.is_loaded(),
+                "model_path": model_context.spec.model_path
+                if model_context is not None
+                else "",
                 "last_scan": snapshot.last_scan,
                 "uptime": uptime_str,
                 "pending_tasks": len(snapshot.pending_tasks),
                 "completed_tasks": len(snapshot.completed_tasks),
+                "stale_tasks": len(snapshot.stale_tasks),
+                "tracked_files": len(context._state.file_mtimes),
                 "history": engine.get_history_summary(),
+                "engine": engine.get_status(),
             })
 
         def _handle_briefing(self) -> None:

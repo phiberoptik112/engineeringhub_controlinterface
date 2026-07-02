@@ -288,6 +288,36 @@ class Settings(BaseSettings):
         default=18790,
         description="Chat server port",
     )
+    journaler_monitor_refresh_sec: float = Field(
+        default=2.0,
+        gt=0.0,
+        description="Refresh interval for `journaler monitor` live status display",
+    )
+    journaler_status_heartbeat_stale_sec: int = Field(
+        default=30,
+        ge=1,
+        description="Seconds before daemon_status.json heartbeat is considered stale",
+    )
+    journaler_activity_log_enabled: bool = Field(
+        default=False,
+        description="Append daemon activity events to an org-mode log for Emacs",
+    )
+    journaler_activity_log_mode: str = Field(
+        default="daily_journal",
+        description='Activity log target mode: "daily_journal" or "dedicated_file"',
+    )
+    journaler_activity_log_path: Path | None = Field(
+        default=None,
+        description="Optional explicit activity log .org path for dedicated_file mode",
+    )
+    journaler_activity_log_heading: str = Field(
+        default="Journaler Activity",
+        description="Org heading used for Journaler activity log entries",
+    )
+    journaler_activity_log_include_suggestions: bool = Field(
+        default=True,
+        description="Include status suggestions in activity log entries",
+    )
     journaler_slack_enabled: bool = Field(
         default=False,
         description="Enable Slack webhook posting",
@@ -777,6 +807,36 @@ class Settings(BaseSettings):
                 flat_config["journaler_chat_host"] = j["chat_host"]
             if j.get("chat_port") is not None:
                 flat_config["journaler_chat_port"] = j["chat_port"]
+            if j.get("monitor_refresh_sec") is not None:
+                flat_config["journaler_monitor_refresh_sec"] = float(
+                    j["monitor_refresh_sec"]
+                )
+            if j.get("status_heartbeat_stale_sec") is not None:
+                flat_config["journaler_status_heartbeat_stale_sec"] = int(
+                    j["status_heartbeat_stale_sec"]
+                )
+            if isinstance(j.get("activity_log"), dict):
+                activity_log = j["activity_log"]
+                if activity_log.get("enabled") is not None:
+                    flat_config["journaler_activity_log_enabled"] = bool(
+                        activity_log["enabled"]
+                    )
+                if activity_log.get("mode"):
+                    flat_config["journaler_activity_log_mode"] = str(
+                        activity_log["mode"]
+                    ).strip()
+                if activity_log.get("path"):
+                    flat_config["journaler_activity_log_path"] = Path(
+                        activity_log["path"]
+                    ).expanduser()
+                if activity_log.get("heading"):
+                    flat_config["journaler_activity_log_heading"] = str(
+                        activity_log["heading"]
+                    ).strip()
+                if activity_log.get("include_suggestions") is not None:
+                    flat_config["journaler_activity_log_include_suggestions"] = bool(
+                        activity_log["include_suggestions"]
+                    )
             if j.get("slack_enabled") is not None:
                 flat_config["journaler_slack_enabled"] = j["slack_enabled"]
             if j.get("slack_webhook_url"):

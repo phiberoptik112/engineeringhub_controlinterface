@@ -276,6 +276,22 @@ chunking:
 #   chat_host: "127.0.0.1"
 #   chat_port: 18790
 #
+#   # Live daemon status monitor:
+#   #   engineering-hub journaler monitor
+#   #   engineering-hub journaler monitor --once
+#   monitor_refresh_sec: 2.0
+#   status_heartbeat_stale_sec: 30
+#
+#   # Optional org-mode activity stream for Doom Emacs auto-revert workflows.
+#   # mode: daily_journal appends under today's YYYY-MM-DD.org.
+#   # mode: dedicated_file writes/creates path (or <org-roam>/journaler-activity.org).
+#   activity_log:
+#     enabled: false
+#     mode: "daily_journal"      # daily_journal | dedicated_file
+#     path: null                 # optional explicit .org path for dedicated_file
+#     heading: "Journaler Activity"
+#     include_suggestions: true
+#
 #   # Slack webhook (outbound only — post briefings and alerts)
 #   slack_enabled: false
 #   slack_webhook_url: ""        # or set JOURNALER_SLACK_WEBHOOK env var
