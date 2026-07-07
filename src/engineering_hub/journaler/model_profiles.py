@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, replace
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -31,6 +32,7 @@ class JournalerModelSpec:
     model_path: str
     model_context_window: int = 32768
     max_tokens: int = 4096
+    max_thinking_tokens: int = 8192
     temp: float = 0.7
     top_p: float = 0.9
     min_p: float = 0.05
@@ -47,6 +49,7 @@ def _legacy_base_spec(settings: Settings) -> JournalerModelSpec:
         model_path=path,
         model_context_window=settings.journaler_model_context_window,
         max_tokens=settings.journaler_max_tokens,
+        max_thinking_tokens=settings.journaler_max_thinking_tokens,
         temp=settings.journaler_temp,
         top_p=settings.journaler_top_p,
         min_p=settings.journaler_min_p,
@@ -92,6 +95,9 @@ def _spec_from_profile_dict(
         max_tokens=int(data["max_tokens"])
         if data.get("max_tokens") is not None
         else defaults.max_tokens,
+        max_thinking_tokens=int(data["max_thinking_tokens"])
+        if data.get("max_thinking_tokens") is not None
+        else defaults.max_thinking_tokens,
         temp=float(data["temp"]) if data.get("temp") is not None else defaults.temp,
         top_p=float(data["top_p"]) if data.get("top_p") is not None else defaults.top_p,
         min_p=float(data["min_p"]) if data.get("min_p") is not None else defaults.min_p,
@@ -132,6 +138,7 @@ def resolve_journaler_model_spec(
             model_path=path,
             model_context_window=base.model_context_window,
             max_tokens=base.max_tokens,
+            max_thinking_tokens=base.max_thinking_tokens,
             temp=base.temp,
             top_p=base.top_p,
             min_p=base.min_p,
@@ -182,10 +189,14 @@ def resolve_journaler_model_spec_for_slash(
     models = getattr(settings, "journaler_models", None) or {}
 
     if raw_path and raw_path.strip():
+        from engineering_hub.journaler.model_catalog import normalize_model_path_input
+
+        normalized = normalize_model_path_input(raw_path.strip())
         return JournalerModelSpec(
-            model_path=raw_path.strip(),
+            model_path=normalized,
             model_context_window=base.model_context_window,
             max_tokens=base.max_tokens,
+            max_thinking_tokens=base.max_thinking_tokens,
             temp=base.temp,
             top_p=base.top_p,
             min_p=base.min_p,
@@ -213,6 +224,7 @@ def apply_spec_to_journaler_config_attrs(spec: JournalerModelSpec) -> dict[str, 
         "model_path": spec.model_path,
         "model_context_window": spec.model_context_window,
         "max_tokens": spec.max_tokens,
+        "max_thinking_tokens": spec.max_thinking_tokens,
         "temp": spec.temp,
         "top_p": spec.top_p,
         "min_p": spec.min_p,
@@ -278,6 +290,7 @@ def journaler_slash_model_command(
             f"Active model: {cur.model_path}\n"
             f"Profile: {prof}\n"
             f"Context window: {cur.model_context_window}\n"
+            f"max_tokens: {cur.max_tokens} (+{cur.max_thinking_tokens} thinking)\n"
             f"enable_thinking: {think_s}\n"
             f"mlx_backend: {cur.mlx_backend}"
         )
@@ -320,9 +333,39 @@ def reload_journaler_model_into_engine(
         backend,
         model_context_window=spec.model_context_window,
         max_tokens=spec.max_tokens,
+        max_thinking_tokens=spec.max_thinking_tokens,
     )
     if delegator is not None:
         delegator.set_mlx_backend(backend)
+
+
+def load_model_from_catalog_entry(
+    entry: object,
+    *,
+    settings: Any,
+    model_ctx: JournalerChatModelContext,
+    engine: Any,
+    delegator: Any | None = None,
+) -> str:
+    """Load a :class:`~engineering_hub.journaler.model_catalog.ModelCatalogEntry`."""
+    from engineering_hub.journaler.model_catalog import resolve_catalog_entry_spec
+
+    import time
+
+    t0 = time.monotonic()
+    try:
+        new_spec = resolve_catalog_entry_spec(entry, settings, model_ctx.spec)
+        reload_journaler_model_into_engine(new_spec, engine, delegator)
+    except Exception as exc:
+        logger.exception("Journaler model reload failed")
+        hint = " Try /model path mlx-community/<name>."
+        return f"Model load failed (previous model still active): {exc}.{hint}"
+    model_ctx.spec = new_spec
+    elapsed = time.monotonic() - t0
+    return (
+        f"Model ready: {new_spec.model_path}\n"
+        f"(loaded in {elapsed:.1f}s; conversation history kept.)"
+    )
 
 
 def ensure_spec_model_path(spec: JournalerModelSpec, default_id: str) -> JournalerModelSpec:
@@ -332,12 +375,23 @@ def ensure_spec_model_path(spec: JournalerModelSpec, default_id: str) -> Journal
     return replace(spec, model_path=default_id)
 
 
+def journaler_model_display_label(spec: JournalerModelSpec) -> str:
+    """Short label for status bars (profile name or checkpoint basename)."""
+    if spec.profile_name:
+        return spec.profile_name
+    path = (spec.model_path or "").strip()
+    if not path:
+        return "(no model)"
+    return Path(path).name if "/" in path else path
+
+
 def spec_from_journaler_config(config: Any) -> JournalerModelSpec:
     """Build a spec from :class:`JournalerConfig` (daemon / HTTP runtime)."""
     return JournalerModelSpec(
         model_path=config.model_path,
         model_context_window=config.model_context_window,
         max_tokens=config.max_tokens,
+        max_thinking_tokens=getattr(config, "max_thinking_tokens", 8192),
         temp=config.temp,
         top_p=config.top_p,
         min_p=config.min_p,

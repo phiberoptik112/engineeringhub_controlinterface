@@ -27,6 +27,7 @@ dependencies = [
 mlx = [
     "mlx-lm>=0.31",
     "mlx-vlm>=0.4.3",
+    "torchvision>=0.15",
 ]
 docling = [
     "docling>=2.60",

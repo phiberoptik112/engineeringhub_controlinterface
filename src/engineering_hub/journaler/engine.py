@@ -41,6 +41,11 @@ from engineering_hub.journaler.session_retrieval import (
     retrieve_past_sessions,
 )
 from engineering_hub.journaler.task_planner_models import TaskPlannerSession
+from engineering_hub.journaler.thinking import (
+    ThinkTagTracker,
+    prompt_primes_thinking,
+    strip_think_blocks,
+)
 from engineering_hub.search import (
     SearchProvider,
     format_search_results_for_context,
@@ -201,16 +206,31 @@ def _is_model_cached(model_id: str) -> bool:
 
 
 _VLM_MODEL_TYPES: frozenset[str] = frozenset(
-    {"gemma4", "paligemma", "llava", "idefics", "blip", "flamingo", "internvl", "qwen2_vl"}
+    {
+        "gemma4",
+        "paligemma",
+        "llava",
+        "idefics",
+        "blip",
+        "flamingo",
+        "internvl",
+        "qwen2_vl",
+        "qwen3_vl",
+    }
 )
 
 
 def _detect_vlm(load_path: str) -> bool:
-    """Return True if the model at *load_path* is a Vision-Language Model.
+    """Return True when the checkpoint should load via mlx-vlm (not mlx-lm).
 
     Peeks at config.json without loading model weights — works for both local
     directories and HF Hub cache entries.  Falls back to False on any error so
     a mis-detection never hard-blocks startup.
+
+    Some newer multimodal checkpoints (e.g. Qwen3.5/3.6 MoE) ship a
+    ``vision_config`` but still load for text-only Journaler chat via mlx-lm.
+    Only known mlx-vlm-only ``model_type`` values select the VLM backend here;
+    users can still force ``mlx_backend: mlx-vlm`` in a profile when needed.
     """
     config_path: Path | None = None
 
@@ -234,8 +254,6 @@ def _detect_vlm(load_path: str) -> bool:
 
     try:
         cfg = json.loads(config_path.read_text(encoding="utf-8"))
-        if "vision_config" in cfg:
-            return True
         model_type = cfg.get("model_type", "").lower()
         return model_type in _VLM_MODEL_TYPES
     except Exception:
@@ -338,8 +356,14 @@ class ConversationalMLXBackend:
             self._model, self._processor = mlx_vlm.load(load_path)
             self._tokenizer = self._processor.tokenizer
         except Exception as exc:
+            detail = str(exc)
+            if "torchvision" in detail.lower():
+                detail += (
+                    " Install torchvision for mlx-vlm VL processors: "
+                    "pip install torchvision"
+                )
             raise LLMBackendError(
-                f"Failed to load Journaler VLM from '{load_path}': {exc}",
+                f"Failed to load Journaler VLM from '{load_path}': {detail}",
                 provider="mlx",
             ) from exc
         logger.info(f"Journaler model loaded (mlx-vlm): {model_path}")
@@ -363,12 +387,22 @@ class ConversationalMLXBackend:
     # Public interface
     # ------------------------------------------------------------------
 
-    def chat(self, messages: list[dict[str, str]], max_tokens: int) -> str:
+    def chat(
+        self,
+        messages: list[dict[str, str]],
+        max_tokens: int,
+        max_thinking_tokens: int = 0,
+    ) -> str:
         """Generate a response given a full message history.
 
         Args:
             messages: List of {role, content} dicts (system, user, assistant).
-            max_tokens: Maximum tokens to generate.
+            max_tokens: Maximum tokens for the user-facing answer.
+            max_thinking_tokens: Additional token budget granted to
+                ``<think>...</think>`` reasoning blocks emitted by thinking
+                models (Qwen3-style). Thinking tokens do not count against
+                *max_tokens*, so a long reasoning phase can no longer starve
+                the final answer.
 
         Returns:
             The model's response text.
@@ -377,9 +411,20 @@ class ConversationalMLXBackend:
 
         if self._is_vlm:
             return self._chat_vlm(prompt, max_tokens)
-        return self._chat_lm(prompt, max_tokens)
+        return self._chat_lm(prompt, max_tokens, max_thinking_tokens)
 
-    def _chat_lm(self, prompt: str, max_tokens: int) -> str:
+    def _chat_lm(
+        self, prompt: str, max_tokens: int, max_thinking_tokens: int = 0
+    ) -> str:
+        """Stream tokens with separate thinking/answer budgets and detect truncation.
+
+        Uses ``mlx_lm.stream_generate`` (instead of ``generate``) so the
+        ``finish_reason`` is observable: "stop" means the model concluded
+        naturally, "length" means it was cut off at the token limit. Tokens
+        inside ``<think>`` blocks draw from *max_thinking_tokens*; everything
+        else draws from *max_tokens*. When output is truncated anyway, an
+        explicit notice is appended so truncation is never silent.
+        """
         sampler = self._make_sampler(  # type: ignore[misc]
             temp=self._temp, top_p=self._top_p, min_p=self._min_p
         )
@@ -387,19 +432,87 @@ class ConversationalMLXBackend:
             repetition_penalty=self._repetition_penalty,
             repetition_context_size=self._repetition_context_size,
         )
+        think_budget = max(0, max_thinking_tokens)
+        hard_cap = max_tokens + think_budget
+
+        # Qwen3.5/3.6 templates prime the assistant turn with "<think>\n", so
+        # generation starts inside a think block and only "</think>" appears
+        # in the output stream.
+        tracker = ThinkTagTracker(start_open=prompt_primes_thinking(prompt))
+        chunks: list[str] = []
+        answer_tokens = 0
+        thinking_tokens = 0
+        total_tokens = 0
+        finish_reason: str | None = None
+        cut_reason: str | None = None
+
         try:
-            return self._mlx_lm.generate(  # type: ignore[union-attr]
+            for response in self._mlx_lm.stream_generate(  # type: ignore[union-attr]
                 self._model,
                 self._tokenizer,
                 prompt=prompt,
-                max_tokens=max_tokens,
+                max_tokens=hard_cap,
                 sampler=sampler,
                 logits_processors=logits_processors,
-            )
+            ):
+                segment = response.text
+                if segment:
+                    chunks.append(segment)
+                    tracker.feed(segment)
+                total_tokens += 1
+                if tracker.open:
+                    thinking_tokens += 1
+                else:
+                    answer_tokens += 1
+                finish_reason = response.finish_reason
+                if finish_reason is not None:
+                    break
+                if tracker.open and thinking_tokens >= think_budget + max_tokens:
+                    # Model never closed its think block; it has consumed the
+                    # thinking budget plus the answer budget — stop here.
+                    cut_reason = "thinking"
+                    break
+                if not tracker.open and answer_tokens >= max_tokens:
+                    cut_reason = "answer"
+                    break
         except Exception as exc:
             raise LLMBackendError(
                 f"Journaler MLX generation failed: {exc}", provider="mlx"
             ) from exc
+
+        text = "".join(chunks)
+        truncated = cut_reason is not None or finish_reason == "length"
+        if not truncated:
+            return text
+
+        if cut_reason is None:
+            cut_reason = "thinking" if tracker.open else "answer"
+        logger.warning(
+            "Journaler generation truncated (%s budget exhausted): "
+            "%d total tokens (%d thinking / %d answer; answer budget %d, "
+            "thinking budget %d)",
+            cut_reason,
+            total_tokens,
+            thinking_tokens,
+            answer_tokens,
+            max_tokens,
+            think_budget,
+        )
+        if tracker.open:
+            notice = (
+                "\n\n---\n"
+                f"⚠ Generation stopped mid-thinking after {total_tokens} tokens "
+                "— no final answer was produced. Raise "
+                "`journaler.max_thinking_tokens` (or free context with /clear) "
+                "and try again."
+            )
+        else:
+            notice = (
+                "\n\n---\n"
+                f"⚠ Response truncated at the {max_tokens}-token answer limit. "
+                "Raise `journaler.max_tokens` or ask for a continuation."
+            )
+        return text + notice
 
     def _chat_vlm(self, prompt: str, max_tokens: int) -> str:
         try:
@@ -445,6 +558,7 @@ class ConversationEngine:
         log_dir: Path,
         max_history: int = 20,
         max_tokens: int = 4096,
+        max_thinking_tokens: int = 8192,
         pressure_config: PressureConfig | None = None,
         model_context_window: int = 32768,
         corpus_service: CorpusService | None = None,
@@ -478,6 +592,7 @@ class ConversationEngine:
         self._web_search_anthropic_max_uses = max(1, web_search_anthropic_max_uses)
         self._loaded_files: dict[str, str] = {}
         self._max_tokens = max_tokens
+        self._max_thinking_tokens = max(0, max_thinking_tokens)
         self._log_dir = log_dir
         self._log_file = log_dir / "conversation.jsonl"
         self._load_file_budget = load_file_budget or LoadFileBudgetConfig()
@@ -541,9 +656,12 @@ class ConversationEngine:
         *,
         model_context_window: int | None = None,
         max_tokens: int | None = None,
+        max_thinking_tokens: int | None = None,
     ) -> None:
         """Swap the MLX backend (e.g. after ``/model``) while keeping conversation history."""
         self._backend = backend
+        if max_thinking_tokens is not None:
+            self._max_thinking_tokens = max(0, max_thinking_tokens)
         if max_tokens is not None:
             self._max_tokens = max_tokens
             self.budget.reserved_for_generation = max(
@@ -640,17 +758,26 @@ class ConversationEngine:
         messages = self._build_messages(extra_system_suffix=extra_suffix)
         messages.append({"role": "user", "content": message})
 
-        response = self._backend.chat(messages, self._max_tokens)
+        response = self._backend.chat(
+            messages,
+            self._max_tokens,
+            max_thinking_tokens=self._effective_thinking_budget(),
+        )
 
         # Record in history (post-generation so history doesn't include this turn in the call)
+        # Thinking blocks are stripped from history so reasoning transcripts do
+        # not bloat the rolling context or confuse subsequent turns.
+        history_response = strip_think_blocks(response)
+        if not history_response:
+            history_response = "(thinking-only output; no final answer was produced)"
         now = datetime.now().isoformat(timespec="seconds")
         resp_time = datetime.now().isoformat(timespec="seconds")
         self.history.add("user", message)
-        self.history.add("assistant", response)
+        self.history.add("assistant", history_response)
         self.budget.history_tokens = self.history.total_tokens
 
         # Post-call: topic tracking
-        post_actions = self.pressure_manager.post_call_check(message, response)
+        post_actions = self.pressure_manager.post_call_check(message, history_response)
 
         # Log raw turns to JSONL
         self._log_turn("user", message, now)
@@ -669,6 +796,17 @@ class ConversationEngine:
 
         self.budget.corpus_injection_tokens = 0
         return response
+
+    def _effective_thinking_budget(self) -> int:
+        """Thinking-token budget for the next call, clamped to context headroom.
+
+        ``reserved_for_generation`` already covers the answer budget
+        (``max_tokens``); thinking tokens may additionally use whatever window
+        headroom remains above that reservation, up to the configured
+        ``max_thinking_tokens``.
+        """
+        headroom = max(0, self.budget.available)
+        return min(self._max_thinking_tokens, headroom)
 
     def inject_turn(self, user: str, assistant: str) -> None:
         """Inject a pre-computed (user, assistant) exchange into history and the log.
@@ -744,6 +882,7 @@ class ConversationEngine:
                 ``self._max_tokens`` when *None*.
         """
         gen_tokens = max_tokens if max_tokens is not None else self._max_tokens
+        think_tokens = self._max_thinking_tokens
         messages = [
             {
                 "role": "system",
@@ -767,7 +906,10 @@ class ConversationEngine:
                 "content": briefing_prompt,
             },
         ]
-        return self._backend.chat(messages, gen_tokens)
+        raw = self._backend.chat(
+            messages, gen_tokens, max_thinking_tokens=think_tokens
+        )
+        return strip_think_blocks(raw) or raw
 
     def get_history_summary(self) -> str:
         """Return a brief summary of recent conversation for status display."""
@@ -1233,7 +1375,10 @@ class ConversationEngine:
     def _raw_complete(self, prompt: str, max_tokens: int = 500) -> str:
         """Single-turn model call used by the compressor and briefing generator."""
         messages = [{"role": "user", "content": prompt}]
-        return self._backend.chat(messages, max_tokens)
+        raw = self._backend.chat(
+            messages, max_tokens, max_thinking_tokens=self._max_thinking_tokens
+        )
+        return strip_think_blocks(raw) or raw
 
     def _build_messages(
         self, extra_system_suffix: str | None = None

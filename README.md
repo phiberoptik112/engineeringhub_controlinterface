@@ -295,6 +295,10 @@ journaler:
   slack_webhook_url: ""  # or set JOURNALER_SLACK_WEBHOOK env var
   max_conversation_history: 20
   max_tokens: 4096
+  # Extra token budget for <think> reasoning blocks on thinking models
+  # (Qwen3.x). Thinking tokens don't count against max_tokens; clamped to
+  # remaining context headroom per turn. Set 0 to disable.
+  max_thinking_tokens: 8192
 
   # Agent delegation — applies to BOTH `journaler start` and `journaler chat`
   agent_backend: "mlx"   # "mlx" | "claude" | "auto" (see Agent Delegation below)
@@ -329,6 +333,8 @@ journaler:
 
 You can define **named profiles** under `journaler.models` and select one with `journaler.model_profile`. Each profile sets `model_path`, optional `model_context_window`, sampling (`temp`, `top_p`, …), `mlx_backend` (`auto`, `mlx-lm`, or `mlx-vlm`), and **`enable_thinking`** for Qwen3-style chat templates (`null` = omit the argument for models like Gemma; `true` / `false` toggles reasoning blocks on supported tokenizers).
 
+Thinking models get a **separate reasoning budget** via `max_thinking_tokens` (default 8192, per profile or top-level): tokens inside `<think>...</think>` blocks draw from this budget instead of `max_tokens`, so a long reasoning phase can't consume the answer budget and truncate the reply mid-thought. Templates that prime the assistant turn with `<think>` (Qwen3.5/3.6) are detected automatically. The budget is clamped to the remaining context headroom each turn. If generation still hits a limit, the Journaler appends an explicit truncation notice instead of stopping silently, and reasoning transcripts are stripped from rolling conversation history so they don't bloat the context window. Delegated `/agent` tasks on the local MLX backend run with a larger 8192-token answer budget (long-form deliverables) plus the same thinking budget.
+
 **Resolution order** (same for daemon, interactive chat, and `journaler download`):
 
 1. CLI `--model <hf-id-or-local-path>` (highest priority)
@@ -354,6 +360,7 @@ journaler:
       temp: 0.6
       top_p: 0.95
       enable_thinking: true
+      max_thinking_tokens: 8192
 ```
 
 Switching models at runtime (without restarting):
@@ -519,7 +526,7 @@ While in `engineering-hub journaler chat`, any input starting with `/` is handle
 
 | Command | Description |
 | --- | --- |
-| `/model` | Show active model path, profile name, context window, `enable_thinking`, and `mlx_backend` |
+| `/model` | Show active model path, profile name, context window, token budgets (`max_tokens` + thinking), `enable_thinking`, and `mlx_backend` |
 | `/model <profile>` | Load the named profile from `journaler.models` (keeps chat history) |
 | `/model path <id-or-path>` | Load a Hugging Face id or local MLX snapshot path |
 
@@ -1125,7 +1132,7 @@ See [config/config.example.yaml](config/config.example.yaml) for all available o
 - `journaler.conversation_lookback_days` - Number of past daily conversation summaries included in the proactive context snapshot every tick (default: 7; independent of `journal_lookback_days`)
 - `journaler.org_link_on_relation` - When true, write a cross-reference link into today's journal whenever a related past conversation is detected via semantic search (default: true)
 - `journaler.model_profile` - Name of the active entry in `journaler.models` (when the map is non-empty)
-- `journaler.models` - Optional map of named MLX profiles (`model_path`, `model_context_window`, sampling, `mlx_backend`, `enable_thinking`)
+- `journaler.models` - Optional map of named MLX profiles (`model_path`, `model_context_window`, sampling, `mlx_backend`, `enable_thinking`, `max_thinking_tokens`)
 - `journaler.model_context_window` - Context window for pressure math when not using per-profile values (default: 32768)
 - `journaler.agent_backend` - Backend for `/agent` delegation: `"mlx"` (default), `"claude"`, or `"auto"` (used by **`journaler start`** and **`journaler chat`**)
 - `journaler.anthropic_api_key` - Optional per-journaler Anthropic key (falls back to `anthropic.api_key` / env if unset; same scope as `agent_backend`)

@@ -204,6 +204,36 @@ chunking:
 #   # Ollama URL as seen from inside containers (Docker Compose service name)
 #   ollama_host: "http://ollama:11434"
 
+# ── Pi coding agent (code-engineer) ──────────────────────────────
+# The code-engineer agent delegates software changes to the external Pi
+# coding agent (https://pi.dev) running in an isolated git worktree of a
+# registered local repository. Install Pi with:
+#   npm install -g --ignore-scripts @earendil-works/pi-coding-agent
+#
+# pi:
+#   bin: "pi"                 # path to the pi CLI (or "node /path/to/pi.js")
+#   mode: "json"              # json (structured events) | print
+#   task_timeout: 1800        # seconds before killing a Pi run
+#   max_concurrent: 1         # parallel Pi runs (repos are stateful; keep low)
+#   default_tools: ""         # "" = full toolset; e.g. "read,grep,find,ls" for review-only
+#   provider: "anthropic"     # anthropic | openai | google
+#   model: "claude-sonnet-4-5"
+#   share_hub_api_key: true   # pass hub's anthropic key via --api-key; false = use Pi's own /login creds
+#   offline: true             # set PI_OFFLINE=1 + PI_SKIP_VERSION_CHECK=1 for deterministic runs
+#
+# Local repositories the code-engineer may operate on. The map key is the
+# project id used in tasks:  /agent code-engineer <task> --project myrepo
+# or an org task:  - [ ] @code-engineer: <task> [[project/myrepo]]
+#
+# code_projects:
+#   myrepo:
+#     path: "~/dev/myrepo"
+#     default_branch: "main"
+#     test_cmd: "npm test"      # optional; surfaced to Pi in the briefing
+#     provider: "anthropic"     # optional per-repo override of pi.provider
+#     model: "claude-sonnet-4-5"  # optional per-repo override of pi.model
+#     tools: ""                 # optional per-repo override of pi.default_tools
+
 # ── Journaler daemon (always-on ambient listener) ────────────────
 # The Journaler runs a local ~32B model, continuously monitors your
 # org-roam workspace, delivers morning briefings, and responds to
@@ -251,6 +281,7 @@ chunking:
 #   #     temp: 0.6
 #   #     top_p: 0.95
 #   #     enable_thinking: true
+#   #     max_thinking_tokens: 8192   # extra budget for <think> blocks
 #
 #   # The model's actual context window in tokens.
 #   # Used by the context pressure manager to calculate utilization.
@@ -283,6 +314,11 @@ chunking:
 #   # Conversation settings
 #   max_conversation_history: 40 # turns kept in memory
 #   max_tokens: 4096
+#   # Extra token budget for <think> reasoning blocks emitted by thinking models
+#   # (Qwen3.x with enable_thinking). Thinking tokens do NOT count against
+#   # max_tokens, so long reasoning can no longer truncate the final answer.
+#   # Clamped to remaining context headroom at generation time. Set 0 to disable.
+#   max_thinking_tokens: 8192
 #
 #   # Sampling parameters (defaults shown)
 #   temp: 0.7

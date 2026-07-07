@@ -33,6 +33,7 @@ from engineering_hub.journaler.model_profiles import (
     JournalerChatModelContext,
     build_journaler_mlx_backend,
     ensure_spec_model_path,
+    journaler_model_display_label,
     journaler_slash_model_command,
     resolve_journaler_model_spec,
 )
@@ -804,6 +805,7 @@ def _handle_chat_slash_command(
 
     Recognised commands:
       /model                     Show or switch HF model (profile or path).
+      /model_browse              Interactive picker for mlx-community models.
       /load <path> [-r]          Load a file or directory into context.
       /load_browse               Interactive file browser for org-roam files.
       /focus <path>|status|off   Focus chat on one technical document.
@@ -848,6 +850,43 @@ def _handle_chat_slash_command(
             return
         msg = journaler_slash_model_command(
             raw,
+            settings=journaler_model_ctx.settings,
+            model_ctx=journaler_model_ctx,
+            engine=engine,
+            delegator=delegator,
+        )
+        chat_console.print(f"[green]{escape(msg)}[/green]")
+        return
+
+    if cmd == "/model_browse":
+        if journaler_model_ctx is None:
+            chat_console.print(
+                "[yellow]/model_browse requires internal context; if you see this, file a bug.[/yellow]"
+            )
+            return
+        from engineering_hub.journaler.file_browser import browse_models
+        from engineering_hub.journaler.model_catalog import build_model_catalog
+        from engineering_hub.journaler.model_profiles import load_model_from_catalog_entry
+
+        catalog = build_model_catalog(
+            journaler_model_ctx.settings,
+            journaler_model_ctx.spec,
+        )
+        if not catalog:
+            chat_console.print(
+                "[yellow]No mlx-community models found in HF cache and no journaler.models "
+                "profiles configured. Run [cyan]engineering-hub journaler download[/cyan] first.[/yellow]"
+            )
+            return
+        chat_console.print(
+            f"[dim]Opening model picker ({len(catalog)} entries)… (Esc or q to cancel)[/dim]"
+        )
+        selected = browse_models(catalog)
+        if selected is None:
+            chat_console.print("[dim]No model selected.[/dim]")
+            return
+        msg = load_model_from_catalog_entry(
+            selected,
             settings=journaler_model_ctx.settings,
             model_ctx=journaler_model_ctx,
             engine=engine,
@@ -1199,6 +1238,7 @@ def _handle_chat_slash_command(
             "  [cyan]/model[/cyan]                     Show active MLX model / profile\n"
             "  [cyan]/model <profile>[/cyan]           Switch to a named journaler.models profile\n"
             "  [cyan]/model path <id-or-path>[/cyan]   Load a Hugging Face id or local path\n"
+            "  [cyan]/model_browse[/cyan]              Browse mlx-community models and profiles\n"
             "  [cyan]/files[/cyan]                     List loaded files\n"
             "  [cyan]/files clear[/cyan]               Remove all loaded files from context\n"
             "  [cyan]/clear[/cyan]                     Clear conversation history (keeps context snapshot)\n"
@@ -1721,6 +1761,7 @@ def cmd_journaler(args: argparse.Namespace) -> int:
         slack_webhook_url=settings.journaler_slack_webhook_url,
         max_conversation_history=settings.journaler_max_conversation_history,
         max_tokens=spec.max_tokens,
+        max_thinking_tokens=spec.max_thinking_tokens,
         model_context_window=spec.model_context_window,
         context_management=pressure_config_from_settings(
             settings,
@@ -1792,6 +1833,7 @@ def cmd_journaler(args: argparse.Namespace) -> int:
             prompt_line,
             set_pending_insertion,
         )
+        from engineering_hub.code.pi_executor import build_pi_executor
         from engineering_hub.journaler.delegator import build_delegator
         from engineering_hub.journaler.engine import ConversationEngine
         from engineering_hub.journaler.file_browser import browse_commands
@@ -1837,6 +1879,7 @@ def cmd_journaler(args: argparse.Namespace) -> int:
             log_dir=config.state_dir,
             max_history=config.max_conversation_history,
             max_tokens=config.max_tokens,
+            max_thinking_tokens=config.max_thinking_tokens,
             pressure_config=pressure_cfg_chat,
             model_context_window=config.model_context_window,
             corpus_service=config.corpus_service,
@@ -1860,6 +1903,7 @@ def cmd_journaler(args: argparse.Namespace) -> int:
             skills_dir=config.skills_dir,
             default_backend=config.agent_backend,
             output_dir=config.workspace_dir / "outputs",
+            pi_executor=build_pi_executor(settings),
         )
         if delegator is not None:
             skills_text = build_skills_block(delegator)
@@ -1873,11 +1917,10 @@ def cmd_journaler(args: argparse.Namespace) -> int:
 
         transcript_path = config.state_dir / "conversation.jsonl"
         max_hist = config.max_conversation_history
-        model_label = spec.profile_name or Path(spec.model_path).name
         console.print(
             "[green]Journaler ready. "
             "Type your questions (Ctrl-C, /exit, or exit to leave).[/green]\n"
-            "[dim]Tip: /agent and /skills for agent personas; /model to switch profile; "
+            "[dim]Tip: /agent and /skills for agent personas; /model_browse to switch model; "
             "/load for files; /load_browse to browse; /help for commands.[/dim]\n"
             "[dim]Ctrl+P opens the command palette. Tab completes slash commands.[/dim]\n"
             "[dim]Context: /status, /budget, /topic — "
@@ -1887,7 +1930,7 @@ def cmd_journaler(args: argparse.Namespace) -> int:
             f"Longer model memory: raise journaler.max_conversation_history "
             f"(now {max_hist}).[/dim]\n"
         )
-        console.print(_build_status_bar(engine, model_label))
+        console.print(_build_status_bar(engine, journaler_model_display_label(chat_model_ctx.spec)))
         log = logging.getLogger(__name__)
         try:
             while True:
@@ -1927,7 +1970,7 @@ def cmd_journaler(args: argparse.Namespace) -> int:
                             f"[red]Command failed:[/red] {escape(str(exc))}\n"
                             "[dim]Type /help for commands. You can keep chatting.[/dim]\n"
                         )
-                    console.print(_build_status_bar(engine, model_label))
+                    console.print(_build_status_bar(engine, journaler_model_display_label(chat_model_ctx.spec)))
                     continue
                 try:
                     from engineering_hub.journaler.chat_router import (
@@ -1956,7 +1999,7 @@ def cmd_journaler(args: argparse.Namespace) -> int:
                         console.print("\n[bold]Journaler:[/bold]")
                         _print_chat_markdown(console, routed_result.response)
                         console.print()
-                        console.print(_build_status_bar(engine, model_label))
+                        console.print(_build_status_bar(engine, journaler_model_display_label(chat_model_ctx.spec)))
                         continue
 
                     raw_response = engine.chat(user_input)
@@ -2004,7 +2047,7 @@ def cmd_journaler(args: argparse.Namespace) -> int:
                     else:
                         console.print("[dim]Dispatch cancelled.[/dim]\n")
 
-                console.print(_build_status_bar(engine, model_label))
+                console.print(_build_status_bar(engine, journaler_model_display_label(chat_model_ctx.spec)))
         except (KeyboardInterrupt, EOFError):
             pass
         console.print("\n[dim]Chat ended.[/dim]")

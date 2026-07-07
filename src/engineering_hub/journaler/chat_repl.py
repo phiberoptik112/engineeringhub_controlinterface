@@ -24,6 +24,7 @@ _PALETTE_SENTINEL = "///cmdpalette"
 COMMAND_CATALOG: list[CommandEntry] = [
     # Context Management
     CommandEntry("/model", "[profile|path]", "Show or switch model profile", "Context Management"),
+    CommandEntry("/model_browse", "", "Interactive picker for mlx-community models", "Context Management"),
     CommandEntry("/status", "", "Show context pressure and turn count", "Context Management"),
     CommandEntry("/budget", "", "Token budget breakdown", "Context Management"),
     CommandEntry("/topic", "", "Show the currently detected conversation topic", "Context Management"),

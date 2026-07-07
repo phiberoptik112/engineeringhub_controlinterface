@@ -98,6 +98,15 @@ DEFAULT_AGENT_CONFIGS = {
         tools=[],
         max_tokens=12000,
     ),
+    # code-engineer executes via the external Pi coding agent (PiExecutor), not an
+    # LLMBackend, so model_class/tools are inert here — kept for enable/max_tokens plumbing.
+    AgentType.CODE_ENGINEER: AgentConfig(
+        agent_type=AgentType.CODE_ENGINEER,
+        prompt_file="code-engineer.txt",
+        model_class=ModelClass.TOOL_USE,
+        tools=[],
+        max_tokens=8000,
+    ),
 }
 
 

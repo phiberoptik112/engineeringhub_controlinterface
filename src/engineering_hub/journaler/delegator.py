@@ -43,11 +43,22 @@ from engineering_hub.agents.worker import AgentWorker
 from engineering_hub.core.constants import AgentType
 from engineering_hub.core.models import ParsedTask, TaskStatus
 from engineering_hub.journaler.org_writer import add_todo_to_journal
+from engineering_hub.journaler.thinking import strip_think_blocks
 
 if TYPE_CHECKING:
+    from engineering_hub.code.pi_executor import PiExecutor
     from engineering_hub.journaler.engine import ConversationalMLXBackend
 
 logger = logging.getLogger(__name__)
+
+# Thinking-token budget for single-turn delegated agent tasks (Qwen3-style
+# <think> blocks); the reasoning transcript is stripped from the result.
+_DELEGATE_MAX_THINKING_TOKENS = 8192
+
+# Answer budget for delegated MLX agent tasks. Higher than the interactive chat
+# default because delegated deliverables (reports, protocols, plans) are long
+# documents; 4096 truncates them mid-section.
+_DELEGATE_MAX_OUTPUT_TOKENS = 8192
 
 
 def _anthropic_key_str(anthropic_api_key: SecretStr | str) -> str:
@@ -64,11 +75,15 @@ def build_delegator(
     default_backend: str = "mlx",
     output_dir: Path | None = None,
     prompts_dir: Path | None = None,
+    pi_executor: "PiExecutor | None" = None,
 ) -> AgentDelegator | None:
     """Construct an :class:`AgentDelegator` or return ``None`` if setup fails.
 
     Shared by the Journaler daemon and interactive ``journaler chat`` so both
     inject the same skills/persona metadata into the system prompt.
+
+    ``pi_executor`` (optional) enables the ``code-engineer`` agent; callers build
+    it from settings via :func:`engineering_hub.code.pi_executor.build_pi_executor`.
     """
     if output_dir is None:
         output_dir = Path.cwd() / "outputs"
@@ -92,6 +107,7 @@ def build_delegator(
             default_backend=default_backend,
             prompts_dir=prompts_dir,
             output_dir=output_dir,
+            pi_executor=pi_executor,
         )
         logger.info(
             "AgentDelegator ready (default backend: %s, skills: %s)",
@@ -127,6 +143,12 @@ _AGENT_ALIASES: dict[str, str] = {
     "panning": "panning-for-gold",
     "pan-for-gold": "panning-for-gold",
     "gold": "panning-for-gold",
+    "code-engineer": "code-engineer",
+    "code": "code-engineer",
+    "coder": "code-engineer",
+    "eng": "code-engineer",
+    "engineer": "code-engineer",
+    "pi": "code-engineer",
 }
 
 
@@ -155,7 +177,10 @@ class JournalerMLXBackendAdapter:
             {"role": "system", "content": system},
             {"role": "user", "content": user_message},
         ]
-        return self._backend.chat(messages, max_tokens)
+        raw = self._backend.chat(
+            messages, max_tokens, max_thinking_tokens=_DELEGATE_MAX_THINKING_TOKENS
+        )
+        return strip_think_blocks(raw) or raw
 
     def test_connection(self) -> bool:
         return self._backend.is_loaded()
@@ -230,15 +255,18 @@ class AgentDelegator:
         default_backend: str = "mlx",
         prompts_dir: Path | None = None,
         output_dir: Path | None = None,
+        pi_executor: "PiExecutor | None" = None,
     ) -> None:
         self._default_backend = default_backend.lower()
         self._anthropic_worker = anthropic_worker
+        self._pi_executor = pi_executor
 
         self._mlx_adapter = JournalerMLXBackendAdapter(mlx_backend)
         self._mlx_worker = AgentWorker(
             backend=self._mlx_adapter,
             prompts_dir=prompts_dir,
             output_dir=output_dir,
+            max_tokens=_DELEGATE_MAX_OUTPUT_TOKENS,
         )
 
         resolved_skills = skills_dir or _default_skills_dir()
@@ -288,6 +316,11 @@ class AgentDelegator:
             AgentType(resolved_type)
         except ValueError:
             return f"Agent type '{resolved_type}' is not registered in the system."
+
+        # code-engineer runs via the external Pi coding agent (PiExecutor), not an
+        # LLMBackend worker; route it before worker selection.
+        if resolved_type == AgentType.CODE_ENGINEER.value:
+            return self._delegate_code_task(description, project_id, journaler_context)
 
         worker = self._select_worker(backend)
         if worker is None:
@@ -340,6 +373,58 @@ class AgentDelegator:
                 f"Agent task failed ({backend_label}): "
                 f"{result.error_message or 'unknown error'}"
             )
+
+    def _delegate_code_task(
+        self,
+        description: str,
+        project_id: int | str | None,
+        journaler_context: str,
+    ) -> str:
+        """Route a code-engineer task to the PiExecutor and format the result.
+
+        In Phase 1 the executor is a stub; the briefing is the journaler context.
+        """
+        if self._pi_executor is None:
+            return (
+                "The code-engineer agent is unavailable: no code projects are "
+                "configured. Add repositories under `code_projects:` in config.yaml."
+            )
+
+        task = ParsedTask(
+            agent=AgentType.CODE_ENGINEER.value,
+            status=TaskStatus.PENDING,
+            project_id=project_id,
+            description=description,
+            start_line=0,
+            end_line=0,
+            raw_block=f"@{AgentType.CODE_ENGINEER.value}: {description}",
+        )
+
+        logger.info(
+            "Delegating to code-engineer (project=%s): %s...",
+            project_id,
+            description[:60],
+        )
+
+        try:
+            result = self._pi_executor.execute_task(
+                task,
+                briefing=journaler_context,
+                mode="implement",
+            )
+        except Exception as exc:
+            logger.error("Code-engineer delegation failed: %s", exc)
+            return f"Code-engineer execution failed: {exc}"
+
+        if result.success:
+            header = f"**{self._skill_display_name(AgentType.CODE_ENGINEER.value)} — completed**"
+            if result.output_path:
+                header += f"\nDiff saved to: `{result.output_path}`"
+            body = result.agent_response or "(No response text returned)"
+            return f"{header}\n\n{body}"
+        return (
+            f"Code-engineer task failed: {result.error_message or 'unknown error'}"
+        )
 
     def write_to_journal(
         self,

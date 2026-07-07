@@ -11,6 +11,7 @@ from engineering_hub.actions.file_ingest import FileIngestAction
 from engineering_hub.agents.backends import _resolve_model_for_agent, create_backend
 from engineering_hub.agents.registry import AgentRegistry
 from engineering_hub.agents.worker import AgentWorker
+from engineering_hub.code.pi_executor import PiExecutor, build_pi_executor
 from engineering_hub.config.settings import Settings
 from engineering_hub.container.router import TaskRouter
 from engineering_hub.context.manager import ContextManager
@@ -137,6 +138,9 @@ class Orchestrator:
         )
         self._workers["__global__"] = self.agent_worker
 
+        # Code-engineer executor (external Pi coding agent); None if no repos configured
+        self._pi_executor: PiExecutor | None = build_pi_executor(self.settings)
+
         # Task router (local or Docker container execution)
         self.task_router = TaskRouter(self.settings, self.agent_worker)
 
@@ -198,6 +202,11 @@ class Orchestrator:
         Returns:
             TaskResult with execution outcome
         """
+        # Route code-engineer tasks to the Pi executor (repo + briefing, not an
+        # AgentWorker or the Docker text path).
+        if task.agent_type == AgentType.CODE_ENGINEER:
+            return self._execute_code_task(task)
+
         # Route ingest tasks to FileIngestAction before agent
         if is_ingest_task(task.description):
             return self._execute_ingest(task)
@@ -268,6 +277,32 @@ class Orchestrator:
             self._capture_task_result(task, result)
             self._create_roam_wrapper(task, result)
             self._verify_citations(task, result)
+
+        return result
+
+    def _execute_code_task(self, task: ParsedTask) -> TaskResult:
+        """Execute a code-engineer task via the Pi executor.
+
+        Builds a briefing from the context manager, runs the executor (a stub in
+        Phase 1), and captures the result to memory on success.
+        """
+        if self._pi_executor is None:
+            msg = (
+                "code-engineer task skipped: no code projects configured. "
+                "Add repositories under 'code_projects' in config.yaml."
+            )
+            logger.warning(msg)
+            return TaskResult(task=task, success=False, error_message=msg)
+
+        briefing = self.context_manager.format_for_agent(task)
+        result = self._pi_executor.execute_task(
+            task,
+            briefing=briefing,
+            mode="implement",
+        )
+
+        if result.success:
+            self._capture_task_result(task, result)
 
         return result
 

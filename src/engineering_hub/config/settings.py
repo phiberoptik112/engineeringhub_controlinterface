@@ -219,6 +219,48 @@ class Settings(BaseSettings):
         description="Ollama URL as seen from inside task containers (Docker service name)",
     )
 
+    # ── Pi coding-agent (code-engineer) settings ────────────────────
+    pi_bin: str = Field(
+        default="pi",
+        description="Path to the pi CLI (or 'node /path/to/pi.js')",
+    )
+    pi_mode: str = Field(
+        default="json",
+        description="Pi non-interactive mode: 'json' (structured events) or 'print'",
+    )
+    pi_task_timeout: int = Field(
+        default=1800,
+        description="Seconds before force-killing a Pi run",
+    )
+    pi_max_concurrent: int = Field(
+        default=1,
+        description="Max parallel Pi runs (repos are stateful; keep low)",
+    )
+    pi_default_tools: str = Field(
+        default="",
+        description="Comma-separated Pi tool allowlist; empty = full toolset",
+    )
+    pi_provider: str = Field(
+        default="anthropic",
+        description="Pi provider: 'anthropic', 'openai', or 'google'",
+    )
+    pi_model: str = Field(
+        default="claude-sonnet-4-5",
+        description="Pi model pattern/id (supports 'provider/id' and ':thinking')",
+    )
+    pi_share_hub_api_key: bool = Field(
+        default=True,
+        description="Pass the hub's Anthropic key to Pi via --api-key (else use Pi's own creds)",
+    )
+    pi_offline: bool = Field(
+        default=True,
+        description="Set PI_OFFLINE=1 and PI_SKIP_VERSION_CHECK=1 for deterministic Pi runs",
+    )
+    code_projects: dict[str, dict[str, Any]] = Field(
+        default_factory=dict,
+        description="Registered local repos for code-engineer: name -> {path, default_branch, ...}",
+    )
+
     # Memory settings
     memory_enabled: bool = Field(
         default=True,
@@ -303,6 +345,14 @@ class Settings(BaseSettings):
     journaler_max_tokens: int = Field(
         default=4096,
         description="Max tokens for Journaler model responses",
+    )
+    journaler_max_thinking_tokens: int = Field(
+        default=8192,
+        ge=0,
+        description=(
+            "Extra token budget for <think> reasoning blocks (thinking models); "
+            "does not count against max_tokens"
+        ),
     )
     journaler_temp: float = Field(
         default=0.7,
@@ -719,6 +769,31 @@ class Settings(BaseSettings):
             if docker.get("ollama_host"):
                 flat_config["docker_ollama_host"] = docker["ollama_host"]
 
+        if "pi" in config:
+            pi = config["pi"]
+            if isinstance(pi, dict):
+                if pi.get("bin"):
+                    flat_config["pi_bin"] = pi["bin"]
+                if pi.get("mode"):
+                    flat_config["pi_mode"] = pi["mode"]
+                if pi.get("task_timeout") is not None:
+                    flat_config["pi_task_timeout"] = pi["task_timeout"]
+                if pi.get("max_concurrent") is not None:
+                    flat_config["pi_max_concurrent"] = pi["max_concurrent"]
+                if pi.get("default_tools") is not None:
+                    flat_config["pi_default_tools"] = pi["default_tools"]
+                if pi.get("provider"):
+                    flat_config["pi_provider"] = pi["provider"]
+                if pi.get("model"):
+                    flat_config["pi_model"] = pi["model"]
+                if pi.get("share_hub_api_key") is not None:
+                    flat_config["pi_share_hub_api_key"] = pi["share_hub_api_key"]
+                if pi.get("offline") is not None:
+                    flat_config["pi_offline"] = pi["offline"]
+
+        if isinstance(config.get("code_projects"), dict):
+            flat_config["code_projects"] = config["code_projects"]
+
         if "llm_provider" in config:
             flat_config["llm_provider"] = config["llm_provider"]
 
@@ -785,6 +860,8 @@ class Settings(BaseSettings):
                 flat_config["journaler_max_conversation_history"] = j["max_conversation_history"]
             if j.get("max_tokens") is not None:
                 flat_config["journaler_max_tokens"] = j["max_tokens"]
+            if j.get("max_thinking_tokens") is not None:
+                flat_config["journaler_max_thinking_tokens"] = j["max_thinking_tokens"]
             if j.get("temp") is not None:
                 flat_config["journaler_temp"] = j["temp"]
             if j.get("top_p") is not None:

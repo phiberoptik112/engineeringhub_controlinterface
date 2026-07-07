@@ -11,6 +11,7 @@ from engineering_hub.journaler.model_profiles import (
     JournalerChatModelContext,
     JournalerModelSpec,
     ensure_spec_model_path,
+    journaler_model_display_label,
     parse_model_slash_message,
     resolve_journaler_model_spec,
     resolve_journaler_model_spec_for_slash,
@@ -81,6 +82,24 @@ def test_ensure_spec_model_path() -> None:
     s = JournalerModelSpec(model_path="")
     out = ensure_spec_model_path(s, DEFAULT_JOURNALER_MLX_MODEL_ID)
     assert out.model_path == DEFAULT_JOURNALER_MLX_MODEL_ID
+
+
+def test_journaler_model_display_label() -> None:
+    assert (
+        journaler_model_display_label(
+            JournalerModelSpec(model_path="mlx-community/Qwen3.6-35B-A3B-4bit")
+        )
+        == "Qwen3.6-35B-A3B-4bit"
+    )
+    assert (
+        journaler_model_display_label(
+            JournalerModelSpec(
+                model_path="mlx-community/gemma-4-31b-it-8bit",
+                profile_name="default",
+            )
+        )
+        == "default"
+    )
 
 
 def test_parse_model_slash_message() -> None:

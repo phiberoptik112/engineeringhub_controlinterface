@@ -73,6 +73,9 @@ class JournalerConfig:
     max_briefing_tokens: int = 8000
     max_conversation_history: int = 40
     max_tokens: int = 4096
+    # Extra budget for <think> reasoning blocks (thinking models like Qwen3.x);
+    # clamped to remaining context headroom at generation time.
+    max_thinking_tokens: int = 8192
 
     # Context management
     model_context_window: int = 32768
@@ -229,6 +232,7 @@ def run_daemon(config: JournalerConfig, settings: Settings | None = None) -> Non
         log_dir=config.state_dir,
         max_history=config.max_conversation_history,
         max_tokens=config.max_tokens,
+        max_thinking_tokens=config.max_thinking_tokens,
         pressure_config=pressure_cfg,
         model_context_window=config.model_context_window,
         corpus_service=config.corpus_service,
@@ -261,6 +265,7 @@ def run_daemon(config: JournalerConfig, settings: Settings | None = None) -> Non
     )
 
     # Init agent delegator (bridges Journaler chat → AgentWorker)
+    from engineering_hub.code.pi_executor import build_pi_executor
     from engineering_hub.journaler.delegator import build_delegator
 
     delegation_key = (
@@ -272,6 +277,7 @@ def run_daemon(config: JournalerConfig, settings: Settings | None = None) -> Non
         skills_dir=config.skills_dir,
         default_backend=config.agent_backend,
         output_dir=config.workspace_dir / "outputs",
+        pi_executor=build_pi_executor(settings) if settings is not None else None,
     )
     skills_suffix = ""
     if delegator is not None:
@@ -441,6 +447,7 @@ def generate_briefing_now(
             system_prompt="You are the Journaler.",
             log_dir=config.state_dir,
             max_tokens=config.max_tokens,
+            max_thinking_tokens=config.max_thinking_tokens,
             pressure_config=config.get_pressure_config(),
             model_context_window=config.model_context_window,
             corpus_service=config.corpus_service,
