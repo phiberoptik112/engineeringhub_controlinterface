@@ -1,0 +1,51 @@
+name: rental-scout
+display_name: Rental Scout
+agent_type: rental-scout
+
+domain: personal
+domain_triggers:
+  - rental
+  - apartment
+  - listing
+  - rent
+  - lease
+  - bay area
+  - landlord
+  - in-unit laundry
+  - housing search
+  - Craigslist
+  - Zumper
+
+description: |
+  Manages the Bay Area rental search: reads and updates search criteria, triggers
+  listing scans through the rental-scout pipeline, and reports scored top matches
+  with pros, cons, and red flags. Can format digests as org-mode text for journal
+  entries and queue overnight scan tasks.
+
+when_to_use:
+  - User asks about their rental search criteria or wants to change them
+  - User wants to run a rental scan or asks for fresh listings
+  - User asks for today's top rental matches in a city (e.g. Oakland, SF, Walnut Creek)
+  - User asks how many listings have been seen or which source produces the most
+  - User wants a rental digest appended to their journal or an org-roam note
+
+invocation_examples:
+  - "/agent rental-scout show today's top matches in Oakland"
+  - "/agent rental-scout set max price to 3800 and require in-unit laundry"
+  - "/agent rental-scout run a dry-run scan of craigslist and zumper"
+  - "/agent rental-scout how many listings have we seen, and from which sources?"
+  - "/agent rental-scout format the top 5 matches for my journal"
+
+parameters:
+  description:
+    description: The rental task — criteria change, scan request, or match query
+    required: true
+
+output:
+  format: markdown
+  structure:
+    - Summary
+    - Matches (score, price, beds, location, pros/cons/red flags)
+    - Criteria (when changed)
+    - Next steps
+  output_dir: rental_scout

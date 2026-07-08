@@ -100,6 +100,7 @@ class Orchestrator:
         self.memory_service: Optional[MemoryService] = self._init_memory_service()
 
         corpus_service = build_corpus_service_from_settings(self.settings)
+        self._corpus_service = corpus_service
 
         corpus_audit_log = RetrievalAuditLog(self.settings.corpus_audit_log_path)
 
@@ -134,6 +135,8 @@ class Orchestrator:
             prompts_dir=self.settings.prompts_dir,
             output_dir=self.settings.output_dir,
             max_tokens=self.settings.max_tokens,
+            corpus_service=corpus_service,
+            memory_service=self.memory_service,
             diagnostic_context_audit=self.settings.diagnostic_context_audit_prompt,
         )
         self._workers["__global__"] = self.agent_worker
@@ -184,6 +187,9 @@ class Orchestrator:
                 prompts_dir=self.settings.prompts_dir,
                 output_dir=self.settings.output_dir,
                 max_tokens=self.settings.max_tokens,
+                corpus_service=self._corpus_service,
+                memory_service=self.memory_service,
+                diagnostic_context_audit=self.settings.diagnostic_context_audit_prompt,
             )
             logger.info(
                 "Created worker for model '%s' (agent class: %s)",

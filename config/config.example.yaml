@@ -98,6 +98,43 @@ roam:
 staging:
   manifest_name: "manifest.json"
 
+# ── Rental Scout (Bay Area rental search agent) ───────────────────
+# Workspace holding the rental-scout pipeline (main.py) and its artifacts:
+# criteria.yaml, seen_listings.db, latest_digest.json.
+# Exposed to journaler agents via /agent rental-scout and to external MCP
+# clients via the rental-scout tools mounted in `engineering-hub mcp-server`.
+# rental_scout:
+#   workspace_dir: "~/dev/rental_scout"
+#   # Python for run_scan subprocesses. Defaults to {workspace_dir}/.venv/bin/python
+#   # when that venv exists, otherwise the engineering-hub interpreter.
+#   # python_path: "~/dev/rental_scout/.venv/bin/python"
+
+# ── Blender MCP (3D scene control via HTTP addon in Blender) ──────
+# Requires a running Blender session with an MCP addon enabled (e.g. dcc-mcp-blender
+# at http://127.0.0.1:8765/mcp). Exposed to journaler via /agent blender and optionally
+# proxied under the blender_ namespace in `engineering-hub mcp-server`.
+# blender:
+#   enabled: false
+#   mcp_url: "http://127.0.0.1:8765/mcp"
+#   # auth_token: set via ENGINEERING_HUB_BLENDER_AUTH_TOKEN instead of YAML
+#   connect_timeout_s: 10
+#   tools_cache_ttl_s: 60
+#   # tool_allowlist: ["get_scene_info", "list_objects"]
+#   tool_denylist: ["run_python_script"]
+
+# ── Horn Iterator (parametric exponential-horn sweep, LVT alert system) ──
+# Local compute (no API). Exposed via the `engineering-hub horn` CLI, the
+# `/horn` slash command in journaler chat, and `/agent horn-iterator`.
+# All keys are optional; defaults follow the N4v3 horn blueprint.
+# horn_iterator:
+#   enabled: true
+#   # Where sweep exports (CSV/org) are written; defaults to {workspace_dir}/horn_iterator
+#   output_dir: "~/dev/horn_sweeps"
+#   # Geometry/physics overrides (blueprint defaults shown):
+#   flare_rate_per_m: 17.8      # exponential m (/m); fc = c*m/(4*pi) ~= 486 Hz
+#   slot_area_mm2: 1050         # diffraction slot throat area S_T (mm^2)
+#   adapter_length_mm: 52       # fixed pre-flare adapter length (mm)
+
 # ── MLX local model (Apple Silicon) ───────────────────────────────
 # Used when llm_provider is "mlx". Install with: pip install 'engineering-hub[mlx]'
 # Gemma 4 is a Vision-Language Model (VLM) — the engine auto-detects this and
@@ -143,6 +180,22 @@ memory:
   enabled: true
   search_k: 5         # memories injected per agent task
   threshold: 0.35     # cosine similarity floor (0.0-1.0)
+
+# ── Zettelkasten proposal workflow ────────────────────────────────
+# Mines marked org-roam daily journal spans into reviewable permanent-note
+# proposals. It writes proposal buffers under outputs/zettelkasten first;
+# permanent org-roam files are created only by `engineering-hub zettel apply`.
+zettelkasten:
+  enabled: true
+  # proposal_dir: "~/org-roam/engineering-hub/outputs/zettelkasten"
+  markers:
+    - "#idea"
+    - "#extract"
+    - "TODO extract"
+    - "TODO: extract"
+  journal_lookback_days: 7
+  link_top_k: 5
+  link_similarity_threshold: 0.75
 
 # ── PDF reference corpus (libraryfiles-corpus) ───────────────────
 # Install in the same venv: pip install -e /path/to/libraryfiles_corpus
@@ -266,22 +319,57 @@ chunking:
 #   # selects which entry to use. Override on the CLI:
 #   #   engineering-hub journaler --profile reasoning chat
 #   #   engineering-hub journaler --model mlx-community/other-id start
-#   # In chat (CLI or HTTP): /model , /model reasoning , /model path <hf-id>
+#   # In chat (CLI or HTTP): /model , /model_browse , /model reasoning , /model path <hf-id>
 #   #
-#   # model_profile: "default"
-#   # models:
-#   #   default:
-#   #     model_path: "mlx-community/gemma-4-31b-it-8bit"
-#   #     model_context_window: 131072
-#   #     mlx_backend: auto          # auto | mlx-lm | mlx-vlm
-#   #     enable_thinking: null       # null = omit (Gemma); true/false for Qwen3 templates
-#   #   reasoning:
-#   #     model_path: "mlx-community/Qwen3-30B-A3B-Instruct-2507-4bit"
-#   #     model_context_window: 32768
-#   #     temp: 0.6
-#   #     top_p: 0.95
-#   #     enable_thinking: true
-#   #     max_thinking_tokens: 8192   # extra budget for <think> blocks
+#   # The "reasoning" profile activates Qwen3 thinking mode, which produces
+#   # more exploratory, self-reflective responses at the cost of additional
+#   # tokens. Recommended for reflective/exploratory sessions; switch at
+#   # runtime with: /model reasoning
+#   #
+#   model_profile: "default"
+#   models:
+#     default:
+#       model_path: "mlx-community/gemma-4-31b-it-8bit"
+#       model_context_window: 131072
+#       mlx_backend: auto          # auto | mlx-lm | mlx-vlm
+#       enable_thinking: null       # null = omit (Gemma); true/false for Qwen3 templates
+#     reasoning:
+#       model_path: "mlx-community/Qwen3-30B-A3B-Instruct-2507-4bit"
+#       model_context_window: 32768
+#       temp: 0.6
+#       top_p: 0.95
+#       enable_thinking: true       # activates Qwen3 extended thinking template
+#       max_tokens: 4096            # base budget (non-thinking fallback)
+#       max_thinking_tokens: 8192   # extra <think> budget added on top of max_tokens
+#       thinking_max_tokens: 16384  # optional explicit override when thinking is on
+#
+#   # Minimum generation budget when enable_thinking is true (thinking + answer
+#   # share one cap). Profiles may override with thinking_max_tokens per profile.
+#   # thinking_max_tokens: 16384
+#
+#   # Output-length management (model agnostic). Controls what Journaler does when
+#   # a response is capped/truncated -- including mid-"thinking" cuts where the
+#   # deliverable was never reached. The visible output can be made to run longer
+#   # via multi-pass continuation, and you choose how recovery happens.
+#   output_limit:
+#     # Default behavior on a capped/truncated response:
+#     #   prompt         -> ask: summarize / continue / stop (interactive chat)
+#     #   auto_continue  -> automatically continue in additional passes
+#     #   auto_summarize -> compress context, then retry
+#     #   stop           -> keep the partial output and show a notice
+#     policy: prompt
+#     max_output_tokens: 8192        # per-pass budget (clamped to real headroom)
+#     max_continuation_passes: 3     # cap on same-turn continuation passes
+#     headroom_safety_tokens: 256    # margin subtracted from window - prompt
+#     continue_mode: ask             # ask | same_turn | follow_up
+#     summarize_scope_default: history   # history | history_and_partial
+#     check_before_call: true        # act if projected headroom < min_output_tokens
+#     min_output_tokens: 512         # headroom threshold that triggers recovery
+#     truncation_heuristics: true    # detect open code fences / mid-line cuts
+#     continuation_summary_tokens: 400   # budget for the compact continuation brief
+#     continuation_overlap_chars: 300    # seam de-dup window for natural joins
+#     force_answer_on_thinking_cut: true # thinking-phase cut -> jump to final answer
+#     summarize_before_continue: true    # reclaim headroom before each continue pass
 #
 #   # The model's actual context window in tokens.
 #   # Used by the context pressure manager to calculate utilization.
@@ -295,12 +383,68 @@ chunking:
 #   briefing_enabled: true
 #   briefing_time: "09:00"       # local time (HH:MM); default 9:00
 #
+#   # Topics Discussion Briefing — multi-persona roundtable (disabled by default)
+#   # discussion_briefing_enabled: false
+#   # discussion_briefing_time: "08:45"     # runs before morning briefing; default 08:45
+#   # personas_dir: "~/org-roam/engineering-hub/personas"  # default: personas/ at repo root
+#   # discussion_persona_lookback_days: 7   # days of per-persona history to inject
+#   # discussion_max_tokens_per_persona: 1024
+#
+#   # Coordination Analyst scheduled scan (disabled by default)
+#   # coordination_scan_enabled: false
+#   # coordination_scan_interval_min: 0    # 0 = disabled; e.g. 240 = every 4h
+#
+#   # Proactive topic scout: MLX one-shot when a scan tick detects journal changes
+#   # proactive_topic_scout_enabled: true
+#   # proactive_topic_scout_max_tokens: 512
+#
+#   # Background agent work loop: extracts tasks from briefings, delegates via
+#   # AgentDelegator, tracks progress in a daily work status file, and feeds
+#   # results into the end-of-day summary for tomorrow's briefing.
+#   # background_work_enabled: false         # off by default; opt in to activate
+#   # background_work_interval_min: 60       # how often the work loop checks the queue
+#   # background_work_max_tasks_per_day: 6   # cap to avoid runaway model usage
+#   # background_work_auto_approve: false     # when true, auto-delegates without confirmation
+#   # background_work_agent_backend: "mlx"   # "mlx" | "claude" | "auto"
+#   # background_work_chat_lookback_days: 3  # days of conversation.jsonl for priority signals
+#
+#   # Task-Integrator: inline call-and-response loop over the daily journal.
+#   # Reads the whole day's note (minus the agent-managed sections below),
+#   # interviews you inline under "* Agent Conversation", and after you reply
+#   # inline, proposes ready-to-run @agent: tasks behind a checkbox. Ticking a
+#   # box queues the task to "* Overnight Agent Tasks" for the Orchestrator —
+#   # so you never have to remember the delegation syntax. Run a cycle on demand
+#   # with /integrate (or /integrate status) in journaler chat.
+#   # task_integrator_enabled: false           # off by default; opt in to activate
+#   # task_integrator_interval_min: 15         # how often a cycle runs in the daemon
+#   # task_integrator_conversation_section: "Agent Conversation"  # where Q&A/proposals are written
+#   # task_integrator_output_section: "Overnight Agent Tasks"     # where approved tasks are queued
+#   # task_integrator_excluded_sections:       # daily-note headings treated as agent-managed (not intake)
+#   #   - "Agent Conversation"
+#   #   - "Overnight Agent Tasks"
+#   #   - "Completed Agent Tasks"
+#   #   - "Pending Agent Tasks"
+#   #   - "Timesheet"
+#   #   - "Journaler Cross-References"
+#   # task_integrator_max_questions: 3         # interview questions per topic
+#   # task_integrator_weekdays_only: true      # only queue approved tasks Mon-Fri
+#   # task_integrator_max_tokens: 1024         # model budget per interview/resolution call
+#
+#   # Daily conversation summary (end-of-day archive + /summarize command)
+#   end_of_day_time: "15:30"     # local time (HH:MM); default 15:30
+#                                # use 'journaler summarize' or /summarize to trigger on demand
+#
 #   # Scan scope: when false, only journal.org_journal_dir + watch_dirs are scanned
 #   # for *.org (not the full roam tree). Large journal years: pair with lookback below.
+#   # Incremental diff uses SHA-256 content hashes (state.json file_hashes); mtime-only
+#   # bumps are ignored. "Significant changes" logs are journal + pending-tasks + outputs only.
 #   # scan_org_roam_tree: true
 #   # watch_dirs: []             # extra org directories to rglob, e.g. ["~/org-roam/projects"]
-#   # journal_lookback_days: 5   # daily journal files within this many days (with cap)
-#   # journal_max_files: 5       # max recent daily journal files to parse for context/tasks
+#   # journal_lookback_days: 30  # daily journal files within this many days (with cap)
+#   # journal_max_files: 30      # max recent daily journal files to parse for context/tasks
+#   # roam_task_lookback_days: 14   # roam project notes scanned for checkboxes/tasks
+#   # roam_task_max_files: 30
+#   # prose_completion_detection: true  # treat prose "finished X" as task completion
 #
 #   # HTTP chat endpoint
 #   chat_enabled: true
@@ -326,6 +470,11 @@ chunking:
 #   min_p: 0.05
 #   repetition_penalty: 1.1
 #
+#   # Slash /load accepts: .md .txt .org .py .yaml .yml .json .tex .csv .toml
+#   # .rst .docx .pdf — DOCX and PDF are converted to markdown for context
+#   # (Docling when the [docling] extra is installed, else pypdf/python-docx;
+#   # scanned/image-only PDFs need the [docling-ocrmac] OCR extra).
+#   #
 #   # Slash /load: how much of the *remaining* context (after system, snapshot,
 #   # history, reserved output, slack) may go to each file chunk. Uses the same
 #   # len//3 token estimate as the pressure manager.
@@ -333,6 +482,14 @@ chunking:
 #   # load_max_chars_absolute: 200000  # hard cap per file
 #   # load_min_chars: 1024            # aim for at least this many chars when headroom allows
 #   # load_slack_tokens: 128          # extra margin subtracted from headroom
+#
+#   # ── /load_recent: load most recently created workspace files ───
+#   # Scans org-roam, outputs/, .journaler state, inputs, conversation
+#   # exports, and zettelkasten proposals; ranks by creation time
+#   # (birthtime, falling back to mtime) and auto-loads the top N.
+#   # load_recent_max_files: 5        # default count when /load_recent has no N
+#   # load_recent_days: 30            # only files created in the last N days (0 = no cutoff)
+#   # load_recent_roots: []           # override scan roots, e.g. ["~/org-roam", "~/org-roam/engineering-hub/outputs"]
 #
 #   # ── Context management ─────────────────────────────────────────
 #   # Controls how the daemon manages its finite context window over
@@ -347,7 +504,8 @@ chunking:
 #     # Prepend a bracketed note when the engine takes an automatic action
 #     notify_user_on_action: true
 #     # Time (HH:MM local) to run the end-of-day conversation clear
-#     end_of_day_time: "00:00"
+#     # Prefer top-level journaler.end_of_day_time; this nested key is a fallback override
+#     end_of_day_time: "15:30"
 #     # Auto-clear conversation after N minutes of inactivity
 #     inactivity_clear_minutes: 120
 #     # Write daily conversation summaries to memory.db (requires memory.enabled)
@@ -364,6 +522,7 @@ chunking:
 #     # conversation_relation_threshold: 0.55
 #     # conversation_relation_k: 5
 #     # conversation_relation_excerpt_chars: 1000
+#     # org_link_excerpt_chars: 400
 #     # past_session_search_k: 5
 #     # past_session_excerpt_chars: 1200
 #   conversation_summary_excerpt_chars: 800

@@ -11,10 +11,13 @@ but returns richer ``OrgEntry`` structures suitable for context compression.
 from __future__ import annotations
 
 import re
-from datetime import datetime
+from dataclasses import dataclass
+from datetime import date, datetime
 from pathlib import Path
+from typing import Literal
 
 from engineering_hub.journaler.models import OrgEntry, OrgFileInfo
+from engineering_hub.journaler.task_resolution import normalize_task_key
 
 # ---------------------------------------------------------------------------
 # Regex patterns
@@ -39,6 +42,13 @@ _HEADING = re.compile(
 
 # Checkbox items: - [ ] text or - [X] text
 _CHECKBOX = re.compile(r"^\s*[-*]\s+\[([xX ])\]\s+(.+)$", re.MULTILINE)
+_CHECKBOX_LINE = re.compile(r"^\s*[-*]\s+\[([xX ])\]\s+(.+)$")
+
+# Queue block header: ** 2026-06-10 10:00 :STATUS: PENDING
+_QUEUE_HEADER = re.compile(
+    r"^\*\*\s+(.+?)\s+:STATUS:\s+(PENDING|DONE)\b",
+    re.IGNORECASE,
+)
 
 # Org active timestamp: <2026-04-01 Tue 09:00>
 _ACTIVE_TS = re.compile(r"<(\d{4}-\d{2}-\d{2})\s+\w{2,3}(?:\s+(\d{2}:\d{2}))?>")
@@ -105,6 +115,132 @@ def extract_completed_tasks(entries: list[OrgEntry]) -> list[str]:
                 results.append(m.group(2))
         results.extend(extract_completed_tasks(entry.children))
     return results
+
+
+@dataclass
+class ParsedTaskLine:
+    """A task line extracted from raw org file text with source context."""
+
+    text: str
+    status: Literal["pending", "completed"]
+    source_heading: str
+    line_hint: int
+    completion_kind: Literal["checkbox", "todo_state", "queue_status"]
+
+
+def extract_tasks_with_provenance(path: Path) -> list[ParsedTaskLine]:
+    """Scan full raw org file text for tasks (not truncated entry bodies)."""
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return []
+
+    results: list[ParsedTaskLine] = []
+    heading_stack: list[tuple[int, str]] = []
+    queue_status: str | None = None
+
+    for line_num, line in enumerate(raw.splitlines(), 1):
+        queue_m = _QUEUE_HEADER.match(line)
+        if queue_m:
+            queue_status = queue_m.group(2).upper()
+            continue
+
+        heading_m = _HEADING.match(line)
+        if heading_m:
+            level = len(heading_m.group(1))
+            state = heading_m.group(2)
+            title = heading_m.group(3).strip()
+            while heading_stack and heading_stack[-1][0] >= level:
+                heading_stack.pop()
+            heading_stack.append((level, title))
+            if state == "TODO":
+                results.append(
+                    ParsedTaskLine(
+                        text=title,
+                        status="pending",
+                        source_heading=_current_heading(heading_stack),
+                        line_hint=line_num,
+                        completion_kind="todo_state",
+                    )
+                )
+            elif state == "DONE":
+                results.append(
+                    ParsedTaskLine(
+                        text=title,
+                        status="completed",
+                        source_heading=_current_heading(heading_stack),
+                        line_hint=line_num,
+                        completion_kind="todo_state",
+                    )
+                )
+            continue
+
+        cb_m = _CHECKBOX_LINE.match(line)
+        if cb_m:
+            checked = cb_m.group(1).lower() == "x"
+            text = cb_m.group(2).strip()
+            if not text:
+                continue
+            status: Literal["pending", "completed"]
+            kind: Literal["checkbox", "queue_status"]
+            if queue_status == "DONE":
+                status = "completed"
+                kind = "queue_status"
+            elif queue_status == "PENDING" and not checked:
+                status = "pending"
+                kind = "queue_status"
+            elif queue_status == "PENDING" and checked:
+                status = "completed"
+                kind = "queue_status"
+            else:
+                status = "completed" if checked else "pending"
+                kind = "checkbox"
+            results.append(
+                ParsedTaskLine(
+                    text=text,
+                    status=status,
+                    source_heading=_current_heading(heading_stack),
+                    line_hint=line_num,
+                    completion_kind=kind,
+                )
+            )
+
+    return results
+
+
+def parsed_lines_to_tracked_tasks(
+    lines: list[ParsedTaskLine],
+    *,
+    source_path: str,
+    source_date: str,
+) -> list["TrackedTask"]:
+    """Convert parsed task lines into TrackedTask records."""
+    from engineering_hub.journaler.models import TrackedTask
+
+    seen_date = source_date or date.today().isoformat()
+    tasks: list[TrackedTask] = []
+    for line in lines:
+        tasks.append(
+            TrackedTask(
+                text=line.text,
+                status=line.status,
+                source_path=source_path,
+                source_date=seen_date,
+                source_heading=line.source_heading,
+                line_hint=line.line_hint,
+                task_key=normalize_task_key(line.text),
+                completion_kind=line.completion_kind,
+                first_seen=seen_date,
+                last_seen=seen_date,
+            )
+        )
+    return tasks
+
+
+def _current_heading(heading_stack: list[tuple[int, str]]) -> str:
+    if not heading_stack:
+        return ""
+    return heading_stack[-1][1]
 
 
 def extract_agent_tasks(entries: list[OrgEntry]) -> list[dict]:

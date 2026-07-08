@@ -34,12 +34,14 @@ STRICT RULES:
   tonight", "overnight", "run later", "don't run now", "add to the batch",
   "schedule").
 - Use "immediate_task" when the user wants agent work done now (draft,
-  summarize, research, standards check, review) WITHOUT those queue signals.
+  summarize, research, standards check, review, Blender/3D scene work) WITHOUT those queue signals.
 - Use "conversational" for greetings, thanks, general discussion, or questions
   that do not require delegating a deliverable to an agent.
 - If unsure between conversational and immediate_task, prefer "conversational".
 - Do not require the user to name a slash command or exact agent. Infer the
   most likely agent from the requested work.
+- For Blender, 3D modeling, viewport renders, room geometry meshes, or scene
+  inspection/mutation, prefer agent_type "blender" (requires --backend claude at runtime).
 
 Available agents:
 {agent_catalog}

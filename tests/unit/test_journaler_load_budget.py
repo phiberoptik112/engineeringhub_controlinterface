@@ -9,6 +9,7 @@ import pytest
 from docx import Document
 
 from engineering_hub.config.settings import Settings
+from engineering_hub.journaler import engine as engine_module
 from engineering_hub.journaler.context_manager import TokenBudget, estimate_tokens
 from engineering_hub.journaler.daemon import pressure_config_from_settings
 from engineering_hub.journaler.engine import (
@@ -213,6 +214,77 @@ def test_load_file_docx_converts_to_text(tmp_path: Path) -> None:
     assert "sample.docx" in engine._loaded_files
     assert "Hello from DOCX ingest" in engine._loaded_files["sample.docx"]
     assert "Loaded" in msg
+
+
+def test_pdf_in_supported_extensions() -> None:
+    assert ".pdf" in SUPPORTED_EXTENSIONS
+
+
+def test_supported_extensions_stay_in_sync() -> None:
+    from engineering_hub.journaler.tui import app as tui_app
+    from engineering_hub.journaler.tui import command_executor
+    from engineering_hub.journaler.tui.widgets import browser_panel
+
+    assert command_executor.SUPPORTED_EXTENSIONS == SUPPORTED_EXTENSIONS
+    assert tui_app._SUPPORTED_EXTENSIONS == SUPPORTED_EXTENSIONS
+    assert browser_panel.SUPPORTED_EXTENSIONS == SUPPORTED_EXTENSIONS
+
+
+def test_load_file_pdf_converts_to_text(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    backend = MagicMock()
+    log_dir = tmp_path / "log"
+    log_dir.mkdir()
+    engine = ConversationEngine(
+        backend,
+        "x",
+        log_dir,
+        model_context_window=4096,
+        max_tokens=512,
+    )
+    pdf_path = tmp_path / "sample.pdf"
+    pdf_path.write_bytes(b"%PDF-1.4 fake")
+
+    monkeypatch.setattr(
+        engine_module,
+        "read_path_content_for_load",
+        lambda p: "## Page 1\n\nHello from PDF ingest",
+    )
+
+    ok, msg = engine.load_file(pdf_path, extensions=SUPPORTED_EXTENSIONS)
+    assert ok is True
+    assert "sample.pdf" in engine._loaded_files
+    assert "Hello from PDF ingest" in engine._loaded_files["sample.pdf"]
+    assert "Loaded" in msg
+
+
+def test_load_file_pdf_no_text_warns_about_ocr(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    backend = MagicMock()
+    log_dir = tmp_path / "log"
+    log_dir.mkdir()
+    engine = ConversationEngine(
+        backend,
+        "x",
+        log_dir,
+        model_context_window=4096,
+        max_tokens=512,
+    )
+    pdf_path = tmp_path / "scanned.pdf"
+    pdf_path.write_bytes(b"%PDF-1.4 fake")
+
+    monkeypatch.setattr(
+        engine_module,
+        "read_path_content_for_load",
+        lambda p: "(No text extracted)",
+    )
+
+    ok, msg = engine.load_file(pdf_path, extensions=SUPPORTED_EXTENSIONS)
+    assert ok is False
+    assert "scanned.pdf" not in engine._loaded_files
+    assert "ocr" in msg.lower() or "docling" in msg.lower()
 
 
 def test_explicit_max_chars_bypasses_dynamic(tmp_path: Path) -> None:

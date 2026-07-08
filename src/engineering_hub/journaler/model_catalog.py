@@ -154,6 +154,9 @@ def discover_cached_mlx_models() -> list[ModelCatalogEntry]:
                 continue
             seen.add(repo_id)
 
+            # Prefer HF repo id so mlx-lm resolves the cache and backend detection
+            # uses config.json consistently (snapshot paths are still valid via
+            # normalize_model_path_input when pasted manually).
             load_value = repo_id
             short_name = repo_id.split("/", 1)[-1]
             entries.append(
@@ -274,7 +277,9 @@ def resolve_catalog_entry_spec(
     current_defaults: JournalerModelSpec | None = None,
 ):
     """Resolve a catalog selection to a :class:`JournalerModelSpec`."""
-    from engineering_hub.journaler.model_profiles import resolve_journaler_model_spec_for_slash
+    from engineering_hub.journaler.model_profiles import (
+        resolve_journaler_model_spec_for_slash,
+    )
 
     if entry.source == "profile" and entry.profile_name:
         return resolve_journaler_model_spec_for_slash(
@@ -291,5 +296,7 @@ def resolve_catalog_entry_spec(
         raw_path=normalized,
         current_defaults=current_defaults,
     )
+    # Re-infer backend for the target checkpoint (avoid inheriting mlx-vlm from
+    # a previously loaded Gemma session when switching to a text-only model).
     mlx_backend = "mlx-vlm" if _detect_vlm(spec.model_path) else "mlx-lm"
     return replace(spec, mlx_backend=mlx_backend)

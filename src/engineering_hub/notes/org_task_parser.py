@@ -40,6 +40,9 @@ _OUTPUT_PATH = re.compile(r"\[\[(/outputs/[^\]]+)\]\]")
 # any [[wikilink]]
 _WIKILINK = re.compile(r"\[\[([^\]]+)\]\]")
 
+# [[mcp://service/tool]] — cross-system hints, not file inputs
+_MCP_REF = re.compile(r"\s*\[\[mcp://[^\]]+\]\]")
+
 # status suffixes written back by OrgTaskWriter
 _IN_PROGRESS_RE = re.compile(r"\s*\(in progress\)\s*$")
 _BLOCKED_RE = re.compile(r"\s*\(blocked:[^)]*\)\s*$")
@@ -248,6 +251,9 @@ class OrgTaskParser:
     ) -> ParsedTask:
         text = raw_text
 
+        # Strip non-actionable MCP tool hints from the task description.
+        text = _MCP_REF.sub("", text).strip()
+
         # Extract deliverable (→ [[path]])
         deliverable: str | None = None
         deliverable_match = _DELIVERABLE_ARROW.search(text)
@@ -273,6 +279,7 @@ class OrgTaskParser:
             for p in all_links
             if not p.startswith("django://")
             and not p.startswith("roam:")
+            and not p.startswith("mcp://")
             and p != deliverable
         ]
 

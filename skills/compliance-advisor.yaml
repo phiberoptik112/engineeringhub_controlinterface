@@ -1,0 +1,65 @@
+name: compliance-advisor
+display_name: Compliance Advisor
+agent_type: compliance-advisor
+
+domain: compliance
+domain_triggers:
+  - legal review
+  - contract clause
+  - contract review
+  - OSHA
+  - compliance checklist
+  - regulatory
+  - data privacy
+  - NDA
+  - non-disclosure
+  - liability
+  - indemnification
+  - business license
+  - procurement
+  - vendor agreement
+  - terms of service
+  - privacy policy
+  - employment law
+  - intellectual property
+  - IP ownership
+
+description: |
+  Reviews and drafts language for general regulatory and legal-adjacent documents outside
+  acoustic building-science compliance (which belongs to standards-checker). Covers contract
+  clause analysis, NDA / IP ownership provisions, data privacy considerations, OSHA
+  applicability checklists, vendor agreement review, and business licensing questions.
+  Provides structured risk analysis and plain-language explanations. Does NOT provide legal
+  advice — outputs are for informed internal review only and should be validated by qualified
+  counsel before execution.
+
+when_to_use:
+  - User needs a contract clause or vendor agreement section reviewed for risk
+  - User is evaluating NDA terms or IP ownership provisions
+  - User wants a data privacy checklist (GDPR, CCPA, or general SaaS)
+  - User is checking OSHA applicability for a project or workplace scenario
+  - User needs a business licensing or procurement compliance checklist
+  - User wants plain-language translation of a legal or regulatory requirement
+  - User is drafting terms of service, privacy policy, or similar policies
+
+invocation_examples:
+  - "/agent compliance-advisor review the indemnification clause in this subcontractor agreement"
+  - "/agent compliance check this NDA for one-sided IP ownership terms"
+  - "/agent compliance-advisor build a GDPR data-handling checklist for the journaler daemon"
+  - "/agent legal-review summarize the liability exposure in this vendor MSA"
+  - "/agent compliance is OSHA 1926 Subpart C applicable to our field measurement setup?"
+
+parameters:
+  description:
+    description: The compliance task — what document, clause, or regulation to review
+    required: true
+
+output:
+  format: markdown
+  structure:
+    - Document / clause summary
+    - Risk items (numbered, with severity HIGH / MEDIUM / LOW)
+    - Plain-language explanation
+    - Recommended actions
+    - Disclaimer (not legal advice)
+  output_dir: compliance

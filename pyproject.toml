@@ -20,6 +20,7 @@ dependencies = [
     "schedule>=1.2.0",
     "watchdog>=3.0.0",
     "rich>=13.0.0",
+    "textual>=3.0.0",
     "fastmcp>=2.0.0",
 ]
 

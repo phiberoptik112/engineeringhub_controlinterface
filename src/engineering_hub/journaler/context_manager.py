@@ -223,19 +223,32 @@ class ContextCompressor:
     def should_compress(self, budget: TokenBudget) -> bool:
         return budget.utilization >= self.pressure_threshold
 
-    def compress(self, history: ConversationHistory) -> CompressionResult:
+    def compress(
+        self, history: ConversationHistory, *, force: bool = False
+    ) -> CompressionResult:
         """Compress older turns into a summary, keeping the most recent turns warm.
 
         The summary is injected as a preserved system-role message so the
         model treats it as background context rather than a chat message to
         reply to.
+
+        When *force* is True (used under critical pressure), compression still
+        runs even if the turn count is at or below ``keep_recent`` by keeping a
+        smaller emergency floor. This fixes the edge case where a session sits
+        at exactly ``keep_recent`` turns and would otherwise never free space.
         """
-        if len(history.turns) <= self.keep_recent:
-            return CompressionResult(compressed=False)
+        keep = self.keep_recent
+        if len(history.turns) <= keep:
+            if not force or len(history.turns) <= 2:
+                return CompressionResult(compressed=False)
+            # Emergency: keep a smaller floor so the oldest turns can compress.
+            keep = max(2, len(history.turns) // 2)
 
         all_turns = list(history.turns)
-        to_compress = all_turns[: -self.keep_recent]
-        to_keep = all_turns[-self.keep_recent :]
+        to_compress = all_turns[:-keep]
+        to_keep = all_turns[-keep:]
+        if not to_compress:
+            return CompressionResult(compressed=False)
 
         text = "\n".join(
             f"{t.role.upper()}: {t.content}"
@@ -370,6 +383,170 @@ class TopicTracker:
 
 
 # ---------------------------------------------------------------------------
+# Domain shift detection (Phase 0.5: Dynamic Prompt Routing)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class DomainShift:
+    """Signals that the conversation has moved to a new domain with a matching skill."""
+
+    old_domain: str
+    new_domain: str
+    skill_name: str
+    display_name: str
+    confidence: float
+
+
+class DomainShiftDetector:
+    """Detects when the conversation crosses domain boundaries and maps to a loaded skill.
+
+    Uses ``domain_triggers`` from each :class:`SkillDef` to score incoming user messages.
+    A shift is declared after ``shift_threshold`` consecutive turns scoring above
+    ``confidence_threshold`` for the same domain — lower than :class:`TopicTracker`'s
+    3-turn default because domain pivots are higher-signal than topic oscillations.
+
+    Only raises a shift when the detected domain differs from the *active* persona's
+    domain, so already-correct sessions stay quiet.
+
+    Skills are passed in as a plain dict to avoid a circular import with ``delegator``;
+    the caller resolves the dict from ``AgentDelegator.list_skills()``.
+    """
+
+    def __init__(
+        self,
+        skills: dict[str, object],
+        shift_threshold: int = 2,
+        confidence_threshold: float = 0.15,
+        suppress_turns: int = 5,
+    ) -> None:
+        self._skills = skills
+        self.shift_threshold = shift_threshold
+        self.confidence_threshold = confidence_threshold
+        self.suppress_turns = suppress_turns
+
+        self.active_domain: str = ""
+        self.pending_shift: DomainShift | None = None
+
+        self._consecutive_count: int = 0
+        self._consecutive_candidate: str = ""
+        self._suppressed_domain: str = ""
+        self._suppressed_remaining: int = 0
+
+    def observe(self, message: str) -> DomainShift | None:
+        """Score *message* against all skill triggers and return a :class:`DomainShift` if warranted.
+
+        Returns ``None`` when no shift has been confirmed.  Sets ``pending_shift`` when
+        a shift is ready so the chat loop can display the confirmation prompt without
+        calling this method again.
+        """
+        if self._suppressed_remaining > 0:
+            self._suppressed_remaining -= 1
+
+        best_skill, confidence = self._score(message)
+        if best_skill is None or confidence < self.confidence_threshold:
+            self._consecutive_count = 0
+            self._consecutive_candidate = ""
+            return None
+
+        detected_domain = best_skill.domain or best_skill.name
+
+        # Already in this domain — no shift needed.
+        if detected_domain == self.active_domain:
+            self._consecutive_count = 0
+            self._consecutive_candidate = ""
+            return None
+
+        # Suppressed after a user rejection.
+        if (
+            self._suppressed_remaining > 0
+            and detected_domain == self._suppressed_domain
+        ):
+            return None
+
+        if detected_domain == self._consecutive_candidate:
+            self._consecutive_count += 1
+        else:
+            self._consecutive_candidate = detected_domain
+            self._consecutive_count = 1
+
+        if self._consecutive_count >= self.shift_threshold:
+            shift = DomainShift(
+                old_domain=self.active_domain,
+                new_domain=detected_domain,
+                skill_name=best_skill.name,
+                display_name=best_skill.display_name,
+                confidence=confidence,
+            )
+            self.pending_shift = shift
+            self._consecutive_count = 0
+            self._consecutive_candidate = ""
+            return shift
+
+        return None
+
+    def confirm_shift(self, skill_name: str) -> None:
+        """Call after the user accepts the persona swap."""
+        skill = self._skills.get(skill_name)
+        if skill is not None:
+            self.active_domain = skill.domain or skill.name
+        self.pending_shift = None
+        self._suppressed_remaining = 0
+        self._suppressed_domain = ""
+
+    def reject_shift(self, suppress_turns: int | None = None) -> None:
+        """Call after the user declines the persona swap."""
+        if self.pending_shift:
+            self._suppressed_domain = self.pending_shift.new_domain
+            self._suppressed_remaining = (
+                suppress_turns if suppress_turns is not None else self.suppress_turns
+            )
+        self.pending_shift = None
+
+    def set_active_domain(self, domain: str) -> None:
+        """Explicitly set the active domain (e.g. when the user runs /persona directly)."""
+        self.active_domain = domain
+        self.pending_shift = None
+        self._consecutive_count = 0
+        self._consecutive_candidate = ""
+
+    def _score(self, message: str) -> tuple[object | None, float]:
+        """Return the best-matching skill and a confidence score.
+
+        Scoring: ``hit_count / min(len(triggers), 5)`` so that 1 strong trigger
+        match on a focused list scores ≥ 0.20, which clears the default threshold
+        of 0.15.  Skills without ``domain_triggers`` are skipped.  In case of a tie
+        the skill with the higher raw hit count wins.
+        """
+        msg_lower = message.lower()
+        best_skill = None
+        best_score = 0.0
+        best_hits = 0
+
+        for skill in self._skills.values():
+            triggers = getattr(skill, "domain_triggers", [])
+            if not triggers:
+                continue
+
+            hit_count = sum(
+                1
+                for t in triggers
+                if re.search(r"\b" + re.escape(t.lower()) + r"\b", msg_lower)
+            )
+            if hit_count == 0:
+                continue
+
+            # Normalise against a cap of 5 so long trigger lists don't need many
+            # simultaneous hits to register as a confident match.
+            score = hit_count / min(len(triggers), 5)
+            if score > best_score or (score == best_score and hit_count > best_hits):
+                best_score = score
+                best_hits = hit_count
+                best_skill = skill
+
+        return best_skill, best_score
+
+
+# ---------------------------------------------------------------------------
 # Clear strategies (Strategy 5: Hard Clear)
 # ---------------------------------------------------------------------------
 
@@ -379,24 +556,68 @@ class ClearStrategy(Enum):
     SUMMARIZE = "summarize"
 
 
+def _is_conversation_summary_turn(turn: ConversationTurn) -> bool:
+    return (
+        turn.preserved
+        and turn.role == "system"
+        and turn.content.startswith("[Conversation summary")
+    )
+
+
+def _clear_recent_turns_keep_summary(history: ConversationHistory) -> int:
+    """Archive non-summary turns and keep preserved summary system message(s)."""
+    kept: list[ConversationTurn] = []
+    cleared = 0
+    for turn in list(history.turns):
+        if _is_conversation_summary_turn(turn):
+            kept.append(turn)
+        else:
+            history._archive.append(turn)
+            cleared += 1
+    history.turns.clear()
+    history.turns.extend(kept)
+    return cleared
+
+
 def execute_clear(
     strategy: ClearStrategy,
     history: ConversationHistory,
     compressor: ContextCompressor,
     last_scan_time: str = "",
     reset_state_fn: Callable[[], None] | None = None,
+    budget: TokenBudget | None = None,
 ) -> str:
     """Execute a clear command. Returns a human-readable status message."""
 
     if strategy == ClearStrategy.SUMMARIZE:
-        result = compressor.compress(history)
+        turn_count = len(history.turns)
+        result = compressor.compress(history, force=True)
         if result.compressed:
+            cleared_recent = _clear_recent_turns_keep_summary(history)
             return (
                 f"Compressed {result.turns_compressed} turns "
                 f"({result.tokens_before} → {result.tokens_after} tokens, "
-                f"freed {result.tokens_freed})."
+                f"freed {result.tokens_freed}). "
+                f"Cleared {cleared_recent} recent turn(s); summary retained."
             )
-        return "Nothing to compress (too few turns)."
+
+        high_pressure = budget is not None and budget.utilization >= compressor.pressure_threshold
+        if high_pressure and turn_count > 0:
+            history_tokens_before = sum(t.tokens for t in history.turns)
+            history._archive.extend(list(history.turns))
+            history.turns.clear()
+            hint = ""
+            if budget is not None and budget.loaded_files_tokens > history_tokens_before:
+                hint = " Loaded files still dominate the window; try /files clear."
+            return (
+                f"Could not summarize ({turn_count} turn(s) — need more than 2 to merge). "
+                f"Cleared {turn_count} turn(s) instead.{hint}"
+            )
+
+        return (
+            f"Nothing to summarize ({turn_count} turn(s)). "
+            f"Use /clear for a soft reset or /files clear if a loaded file fills the window."
+        )
 
     elif strategy == ClearStrategy.SOFT:
         turn_count = len(history.turns)
@@ -441,6 +662,7 @@ class PressureConfig:
     conversation_relation_threshold: float = 0.55
     conversation_relation_k: int = 5
     conversation_relation_excerpt_chars: int = 1000
+    org_link_excerpt_chars: int = 400
     past_session_search_k: int = 5
     past_session_excerpt_chars: int = 1200
     reserved_for_generation: int = 2000
@@ -488,7 +710,7 @@ class ContextPressureManager:
 
         elif utilization < self.config.emergency_trim_at:
             if self.compressor.should_compress(self.budget):
-                result = self.compressor.compress(self.history)
+                result = self.compressor.compress(self.history, force=True)
                 if result.compressed:
                     actions.append(
                         f"[Context compressed: freed {result.tokens_freed} tokens "
@@ -497,7 +719,7 @@ class ContextPressureManager:
                     self.budget.history_tokens = self.history.total_tokens
 
         else:
-            result = self.compressor.compress(self.history)
+            result = self.compressor.compress(self.history, force=True)
             if result.compressed:
                 actions.append(
                     f"[Emergency compression: freed {result.tokens_freed} tokens]"

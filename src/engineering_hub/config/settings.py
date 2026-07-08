@@ -94,6 +94,85 @@ class Settings(BaseSettings):
         description="Path to org-roam daily journal directory (YYYY-MM-DD.org files)",
     )
 
+    # Rental scout workspace (criteria.yaml, seen_listings.db, latest_digest.json)
+    rental_scout_workspace_dir: Path = Field(
+        default=Path.home() / "dev" / "rental_scout",
+        description="Workspace directory for the Bay Area Rental Scout pipeline and artifacts",
+    )
+    rental_scout_python_path: Path | None = Field(
+        default=None,
+        description=(
+            "Python interpreter for rental-scout pipeline subprocesses. "
+            "When unset, uses {workspace_dir}/.venv/bin/python if present, "
+            "otherwise the current process interpreter."
+        ),
+    )
+
+    # Blender MCP (HTTP addon inside a running Blender session)
+    blender_enabled: bool = Field(
+        default=False,
+        description="Enable Blender MCP client integration for agents and MCP proxy",
+    )
+    blender_mcp_url: str = Field(
+        default="http://127.0.0.1:8765/mcp",
+        description="HTTP MCP endpoint exposed by the Blender addon",
+    )
+    blender_auth_token: str | None = Field(
+        default=None,
+        description=(
+            "Optional bearer token for Blender MCP auth. "
+            "Prefer ENGINEERING_HUB_BLENDER_AUTH_TOKEN env var."
+        ),
+    )
+    blender_connect_timeout_s: float = Field(
+        default=10.0,
+        description="Timeout in seconds for Blender MCP client connections",
+    )
+    blender_tools_cache_ttl_s: float = Field(
+        default=60.0,
+        description="Seconds to cache remote Blender tool listings",
+    )
+    blender_tool_allowlist: list[str] | None = Field(
+        default=None,
+        description=(
+            "When set, only these remote tool names may be invoked. "
+            "None means all tools except denylist entries."
+        ),
+    )
+    blender_tool_denylist: list[str] | None = Field(
+        default_factory=lambda: ["run_python_script"],
+        description="Remote Blender tool names blocked from agent invocation",
+    )
+
+    # Horn Iterator (parametric exponential-horn sweep, LVT alert system)
+    horn_iterator_enabled: bool = Field(
+        default=True,
+        description="Enable the horn iterator agent, CLI, and /horn slash command",
+    )
+    horn_iterator_output_dir: Path | None = Field(
+        default=None,
+        description=(
+            "Directory for horn sweep exports (CSV/org). "
+            "Defaults to {workspace_dir}/horn_iterator when unset."
+        ),
+    )
+    horn_iterator_flare_rate_per_m: float | None = Field(
+        default=None,
+        description="Override the exponential flare rate m (/m); blueprint default 17.8",
+    )
+    horn_iterator_throat_area_mm2: float | None = Field(
+        default=None,
+        description="Override the diffraction-slot throat area S_T (mm^2); default 1050",
+    )
+    horn_iterator_slot_area_mm2: float | None = Field(
+        default=None,
+        description="Override the diffraction slot area used in geometry (mm^2); default 1050",
+    )
+    horn_iterator_adapter_length_mm: float | None = Field(
+        default=None,
+        description="Override the fixed pre-flare adapter length (mm); default 52",
+    )
+
     # Org mode: use org-roam daily journals as the task source instead of journal.md
     use_org_mode: bool = Field(
         default=False,
@@ -318,6 +397,129 @@ class Settings(BaseSettings):
         default="09:00",
         description="Time for morning briefing (HH:MM, local time)",
     )
+    journaler_end_of_day_time: str = Field(
+        default="15:30",
+        description="Time to generate the daily conversation summary and archive history (HH:MM, local time)",
+    )
+
+    # Discussion briefing settings
+    journaler_discussion_briefing_enabled: bool = Field(
+        default=False,
+        description="Enable scheduled Topics Discussion Briefing (multi-persona roundtable)",
+    )
+    journaler_discussion_briefing_time: str = Field(
+        default="08:45",
+        description="Time for discussion briefing (HH:MM, local time); runs before morning briefing",
+    )
+    journaler_personas_dir: Path | None = Field(
+        default=None,
+        description="Path to personas/*.yaml directory; defaults to repo personas/ directory",
+    )
+    journaler_discussion_persona_lookback_days: int = Field(
+        default=7,
+        description="Days of per-persona history to inject into each discussion call",
+    )
+    journaler_discussion_max_tokens_per_persona: int = Field(
+        default=1024,
+        description="Max tokens generated per persona in the discussion briefing",
+    )
+
+    # Coordination scan settings
+    journaler_coordination_scan_enabled: bool = Field(
+        default=False,
+        description="Enable scheduled coordination analyst scan (scans journal for client coordination signals)",
+    )
+    journaler_coordination_scan_interval_min: int = Field(
+        default=0,
+        description="Interval in minutes between coordination scans (0 = disabled)",
+    )
+    journaler_proactive_topic_scout_enabled: bool = Field(
+        default=True,
+        description="Run a one-shot MLX topic scout when a scan tick detects significant journal changes",
+    )
+    journaler_proactive_topic_scout_max_tokens: int = Field(
+        default=512,
+        ge=64,
+        le=4096,
+        description="Max tokens for proactive topic scout generation on significant scan ticks",
+    )
+
+    # Background agent work loop
+    journaler_background_work_enabled: bool = Field(
+        default=False,
+        description="Enable background agent work loop that extracts tasks from briefings and delegates them",
+    )
+    journaler_background_work_interval_min: int = Field(
+        default=60,
+        ge=10,
+        description="Interval in minutes between background work loop ticks",
+    )
+    journaler_background_work_max_tasks_per_day: int = Field(
+        default=6,
+        ge=1,
+        le=20,
+        description="Maximum number of background tasks to run per day",
+    )
+    journaler_background_work_auto_approve: bool = Field(
+        default=False,
+        description="When True, background work loop auto-delegates extracted tasks without user confirmation",
+    )
+    journaler_background_work_agent_backend: str = Field(
+        default="mlx",
+        description="Agent backend for background work tasks (mlx, claude, auto)",
+    )
+    journaler_background_work_chat_lookback_days: int = Field(
+        default=3,
+        ge=0,
+        le=30,
+        description="Days of conversation.jsonl chat history to include in task extraction and delegation context",
+    )
+
+    # Task-Integrator: inline call-and-response loop over the daily journal
+    journaler_task_integrator_enabled: bool = Field(
+        default=False,
+        description="Enable the Task-Integrator loop that interviews the user inline in the daily journal and proposes agent tasks",
+    )
+    journaler_task_integrator_interval_min: int = Field(
+        default=15,
+        ge=5,
+        description="Interval in minutes between Task-Integrator cycles",
+    )
+    journaler_task_integrator_conversation_section: str = Field(
+        default="Agent Conversation",
+        description="Daily-journal heading where the Task-Integrator writes interview questions and proposals",
+    )
+    journaler_task_integrator_output_section: str = Field(
+        default="Overnight Agent Tasks",
+        description="Daily-journal heading where approved @agent: tasks are queued for the Orchestrator",
+    )
+    journaler_task_integrator_excluded_sections: list[str] = Field(
+        default_factory=lambda: [
+            "Agent Conversation",
+            "Overnight Agent Tasks",
+            "Completed Agent Tasks",
+            "Pending Agent Tasks",
+            "Timesheet",
+            "Journaler Cross-References",
+        ],
+        description="Daily-journal headings the Task-Integrator must not read as intake (agent-managed sections)",
+    )
+    journaler_task_integrator_max_questions: int = Field(
+        default=3,
+        ge=1,
+        le=10,
+        description="Maximum interview questions the Task-Integrator asks per topic",
+    )
+    journaler_task_integrator_weekdays_only: bool = Field(
+        default=True,
+        description="When True, the Task-Integrator only queues approved tasks Mon-Fri",
+    )
+    journaler_task_integrator_max_tokens: int = Field(
+        default=1024,
+        ge=128,
+        description="Max tokens for Task-Integrator interview/resolution model calls",
+    )
+
     journaler_chat_enabled: bool = Field(
         default=True,
         description="Enable HTTP chat endpoint",
@@ -353,6 +555,11 @@ class Settings(BaseSettings):
             "Extra token budget for <think> reasoning blocks (thinking models); "
             "does not count against max_tokens"
         ),
+    )
+    journaler_thinking_max_tokens: int = Field(
+        default=16384,
+        description="Minimum generation budget when enable_thinking is true "
+        "(thinking + answer share one cap)",
     )
     journaler_temp: float = Field(
         default=0.7,
@@ -391,6 +598,20 @@ class Settings(BaseSettings):
         ge=0,
         description="Extra tokens subtracted from headroom when sizing /load (safety margin)",
     )
+    journaler_load_recent_max_files: int = Field(
+        default=5,
+        ge=1,
+        description="Default number of files /load_recent loads when no count is given",
+    )
+    journaler_load_recent_days: int = Field(
+        default=30,
+        ge=0,
+        description="/load_recent only considers files created in the last N days (0 = no cutoff)",
+    )
+    journaler_load_recent_roots: list[Path] = Field(
+        default_factory=list,
+        description="Optional explicit scan roots for /load_recent (overrides the default set)",
+    )
     journaler_agent_backend: str = Field(
         default="mlx",
         description='Journaler /agent delegation: "mlx", "claude", or "auto"',
@@ -413,12 +634,12 @@ class Settings(BaseSettings):
         description="Extra org directories to include in Journaler scans (rglob *.org)",
     )
     journaler_journal_lookback_days: int = Field(
-        default=5,
+        default=30,
         ge=0,
         description="Include daily journal files from the last N calendar days (with journal_max_files cap)",
     )
     journaler_journal_max_files: int = Field(
-        default=5,
+        default=30,
         ge=1,
         description="Max number of recent daily journal files to parse for context/tasks",
     )
@@ -440,13 +661,62 @@ class Settings(BaseSettings):
         ge=200,
         description="Characters per past daily conversation summary in Journaler context",
     )
+    journaler_roam_task_lookback_days: int = Field(
+        default=14,
+        ge=0,
+        description="Include org-roam project notes modified within N days for task registry scans",
+    )
+    journaler_roam_task_max_files: int = Field(
+        default=30,
+        ge=1,
+        description="Max roam project notes to parse for pending/completed tasks",
+    )
+    journaler_prose_completion_detection: bool = Field(
+        default=True,
+        description="Detect prose completion mentions in journal edits (e.g. 'finished X')",
+    )
     journaler_context_management: dict[str, Any] = Field(
         default_factory=dict,
         description="Raw journaler.context_management YAML values for PressureConfig",
     )
+    journaler_output_limit: dict[str, Any] = Field(
+        default_factory=dict,
+        description="Raw journaler.output_limit YAML values for OutputLimitConfig "
+        "(policy, generation budget, summarize/continue/stop behavior)",
+    )
     journaler_org_link_on_relation: bool = Field(
         default=True,
         description="When True, write a cross-reference link into today's journal when a related past conversation is detected",
+    )
+
+    # Zettelkasten proposal workflow
+    zettelkasten_enabled: bool = Field(
+        default=True,
+        description="Enable the org-roam Zettelkasten proposal workflow",
+    )
+    zettelkasten_proposal_dir: Path | None = Field(
+        default=None,
+        description="Directory for generated Zettelkasten proposal JSON/org review files",
+    )
+    zettelkasten_markers: list[str] = Field(
+        default_factory=lambda: ["#idea", "#extract", "TODO extract", "TODO: extract"],
+        description="Journal markers that identify candidate atomic notes",
+    )
+    zettelkasten_journal_lookback_days: int = Field(
+        default=7,
+        ge=1,
+        description="Recent daily journal days scanned by zettel propose",
+    )
+    zettelkasten_link_top_k: int = Field(
+        default=5,
+        ge=0,
+        description="Maximum semantic link suggestions per proposed note",
+    )
+    zettelkasten_link_similarity_threshold: float = Field(
+        default=0.75,
+        ge=0.0,
+        le=1.0,
+        description="Minimum cosine similarity for Zettelkasten link suggestions",
     )
 
     # ── Per-agent model routing ─────────────────────────────────────
@@ -521,6 +791,15 @@ class Settings(BaseSettings):
     corpus_search_threshold: float = Field(
         default=0.40,
         description="Minimum cosine similarity for corpus results (higher than memory threshold)",
+    )
+    corpus_embedder_config: dict = Field(
+        default_factory=dict,
+        description=(
+            "Embedder config passed to libraryfiles_corpus build_embedder(). "
+            "Keys: provider (ollama|auto|mlx|huggingface), mode (local|api), "
+            "model, hf_model, mlx_model, token. "
+            "Empty dict (default) uses Ollama via OllamaEmbedder."
+        ),
     )
 
     # Agent web search settings (local-first, used by Journaler /agent)
@@ -632,6 +911,13 @@ class Settings(BaseSettings):
         return self.workspace_dir / ".journaler"
 
     @property
+    def zettelkasten_resolved_proposal_dir(self) -> Path:
+        """Effective directory for Zettelkasten proposal buffers."""
+        if self.zettelkasten_proposal_dir is not None:
+            return self.zettelkasten_proposal_dir
+        return self.output_dir / "zettelkasten"
+
+    @property
     def journaler_briefing_output_dir(self) -> Path:
         """Path to the Journaler briefing output directory."""
         return self.journaler_state_dir / "briefings"
@@ -734,6 +1020,63 @@ class Settings(BaseSettings):
             staging = config["staging"]
             if staging.get("manifest_name"):
                 flat_config["staging_manifest_name"] = staging["manifest_name"]
+
+        if "rental_scout" in config:
+            rental_scout = config["rental_scout"]
+            if rental_scout.get("workspace_dir"):
+                flat_config["rental_scout_workspace_dir"] = Path(
+                    rental_scout["workspace_dir"]
+                ).expanduser()
+            if rental_scout.get("python_path"):
+                flat_config["rental_scout_python_path"] = Path(
+                    rental_scout["python_path"]
+                ).expanduser()
+
+        if "blender" in config:
+            blender = config["blender"]
+            if blender.get("enabled") is not None:
+                flat_config["blender_enabled"] = bool(blender["enabled"])
+            if blender.get("mcp_url"):
+                flat_config["blender_mcp_url"] = str(blender["mcp_url"])
+            if blender.get("auth_token"):
+                flat_config["blender_auth_token"] = str(blender["auth_token"])
+            if blender.get("connect_timeout_s") is not None:
+                flat_config["blender_connect_timeout_s"] = float(
+                    blender["connect_timeout_s"]
+                )
+            if blender.get("tools_cache_ttl_s") is not None:
+                flat_config["blender_tools_cache_ttl_s"] = float(
+                    blender["tools_cache_ttl_s"]
+                )
+            if blender.get("tool_allowlist") is not None:
+                flat_config["blender_tool_allowlist"] = list(blender["tool_allowlist"])
+            if blender.get("tool_denylist") is not None:
+                flat_config["blender_tool_denylist"] = list(blender["tool_denylist"])
+
+        if "horn_iterator" in config:
+            horn = config["horn_iterator"]
+            if horn.get("enabled") is not None:
+                flat_config["horn_iterator_enabled"] = bool(horn["enabled"])
+            if horn.get("output_dir"):
+                flat_config["horn_iterator_output_dir"] = Path(
+                    horn["output_dir"]
+                ).expanduser()
+            if horn.get("flare_rate_per_m") is not None:
+                flat_config["horn_iterator_flare_rate_per_m"] = float(
+                    horn["flare_rate_per_m"]
+                )
+            if horn.get("throat_area_mm2") is not None:
+                flat_config["horn_iterator_throat_area_mm2"] = float(
+                    horn["throat_area_mm2"]
+                )
+            if horn.get("slot_area_mm2") is not None:
+                flat_config["horn_iterator_slot_area_mm2"] = float(
+                    horn["slot_area_mm2"]
+                )
+            if horn.get("adapter_length_mm") is not None:
+                flat_config["horn_iterator_adapter_length_mm"] = float(
+                    horn["adapter_length_mm"]
+                )
 
         if "ollama" in config:
             ollama = config["ollama"]
@@ -846,6 +1189,92 @@ class Settings(BaseSettings):
                 flat_config["journaler_briefing_enabled"] = j["briefing_enabled"]
             if j.get("briefing_time"):
                 flat_config["journaler_briefing_time"] = j["briefing_time"]
+            if j.get("end_of_day_time"):
+                flat_config["journaler_end_of_day_time"] = j["end_of_day_time"]
+            if j.get("discussion_briefing_enabled") is not None:
+                flat_config["journaler_discussion_briefing_enabled"] = j["discussion_briefing_enabled"]
+            if j.get("discussion_briefing_time"):
+                flat_config["journaler_discussion_briefing_time"] = j["discussion_briefing_time"]
+            if j.get("personas_dir"):
+                flat_config["journaler_personas_dir"] = Path(j["personas_dir"]).expanduser()
+            if j.get("discussion_persona_lookback_days") is not None:
+                flat_config["journaler_discussion_persona_lookback_days"] = int(
+                    j["discussion_persona_lookback_days"]
+                )
+            if j.get("discussion_max_tokens_per_persona") is not None:
+                flat_config["journaler_discussion_max_tokens_per_persona"] = int(
+                    j["discussion_max_tokens_per_persona"]
+                )
+            if j.get("coordination_scan_enabled") is not None:
+                flat_config["journaler_coordination_scan_enabled"] = j["coordination_scan_enabled"]
+            if j.get("coordination_scan_interval_min") is not None:
+                flat_config["journaler_coordination_scan_interval_min"] = int(
+                    j["coordination_scan_interval_min"]
+                )
+            if j.get("proactive_topic_scout_enabled") is not None:
+                flat_config["journaler_proactive_topic_scout_enabled"] = bool(
+                    j["proactive_topic_scout_enabled"]
+                )
+            if j.get("proactive_topic_scout_max_tokens") is not None:
+                flat_config["journaler_proactive_topic_scout_max_tokens"] = int(
+                    j["proactive_topic_scout_max_tokens"]
+                )
+            if j.get("background_work_enabled") is not None:
+                flat_config["journaler_background_work_enabled"] = bool(
+                    j["background_work_enabled"]
+                )
+            if j.get("background_work_interval_min") is not None:
+                flat_config["journaler_background_work_interval_min"] = int(
+                    j["background_work_interval_min"]
+                )
+            if j.get("background_work_max_tasks_per_day") is not None:
+                flat_config["journaler_background_work_max_tasks_per_day"] = int(
+                    j["background_work_max_tasks_per_day"]
+                )
+            if j.get("background_work_auto_approve") is not None:
+                flat_config["journaler_background_work_auto_approve"] = bool(
+                    j["background_work_auto_approve"]
+                )
+            if j.get("background_work_agent_backend"):
+                flat_config["journaler_background_work_agent_backend"] = str(
+                    j["background_work_agent_backend"]
+                )
+            if j.get("background_work_chat_lookback_days") is not None:
+                flat_config["journaler_background_work_chat_lookback_days"] = int(
+                    j["background_work_chat_lookback_days"]
+                )
+            if j.get("task_integrator_enabled") is not None:
+                flat_config["journaler_task_integrator_enabled"] = bool(
+                    j["task_integrator_enabled"]
+                )
+            if j.get("task_integrator_interval_min") is not None:
+                flat_config["journaler_task_integrator_interval_min"] = int(
+                    j["task_integrator_interval_min"]
+                )
+            if j.get("task_integrator_conversation_section"):
+                flat_config["journaler_task_integrator_conversation_section"] = str(
+                    j["task_integrator_conversation_section"]
+                )
+            if j.get("task_integrator_output_section"):
+                flat_config["journaler_task_integrator_output_section"] = str(
+                    j["task_integrator_output_section"]
+                )
+            if isinstance(j.get("task_integrator_excluded_sections"), list):
+                flat_config["journaler_task_integrator_excluded_sections"] = [
+                    str(s) for s in j["task_integrator_excluded_sections"]
+                ]
+            if j.get("task_integrator_max_questions") is not None:
+                flat_config["journaler_task_integrator_max_questions"] = int(
+                    j["task_integrator_max_questions"]
+                )
+            if j.get("task_integrator_weekdays_only") is not None:
+                flat_config["journaler_task_integrator_weekdays_only"] = bool(
+                    j["task_integrator_weekdays_only"]
+                )
+            if j.get("task_integrator_max_tokens") is not None:
+                flat_config["journaler_task_integrator_max_tokens"] = int(
+                    j["task_integrator_max_tokens"]
+                )
             if j.get("chat_enabled") is not None:
                 flat_config["journaler_chat_enabled"] = j["chat_enabled"]
             if j.get("chat_host"):
@@ -862,6 +1291,8 @@ class Settings(BaseSettings):
                 flat_config["journaler_max_tokens"] = j["max_tokens"]
             if j.get("max_thinking_tokens") is not None:
                 flat_config["journaler_max_thinking_tokens"] = j["max_thinking_tokens"]
+            if j.get("thinking_max_tokens") is not None:
+                flat_config["journaler_thinking_max_tokens"] = j["thinking_max_tokens"]
             if j.get("temp") is not None:
                 flat_config["journaler_temp"] = j["temp"]
             if j.get("top_p") is not None:
@@ -878,6 +1309,14 @@ class Settings(BaseSettings):
                 flat_config["journaler_load_min_chars"] = j["load_min_chars"]
             if j.get("load_slack_tokens") is not None:
                 flat_config["journaler_load_slack_tokens"] = j["load_slack_tokens"]
+            if j.get("load_recent_max_files") is not None:
+                flat_config["journaler_load_recent_max_files"] = j["load_recent_max_files"]
+            if j.get("load_recent_days") is not None:
+                flat_config["journaler_load_recent_days"] = j["load_recent_days"]
+            if j.get("load_recent_roots") is not None:
+                flat_config["journaler_load_recent_roots"] = [
+                    Path(p).expanduser() for p in (j["load_recent_roots"] or [])
+                ]
             if j.get("agent_backend"):
                 flat_config["journaler_agent_backend"] = j["agent_backend"]
             if j.get("skills_dir"):
@@ -911,8 +1350,22 @@ class Settings(BaseSettings):
                 flat_config["journaler_conversation_summary_excerpt_chars"] = int(
                     j["conversation_summary_excerpt_chars"]
                 )
+            if j.get("roam_task_lookback_days") is not None:
+                flat_config["journaler_roam_task_lookback_days"] = int(
+                    j["roam_task_lookback_days"]
+                )
+            if j.get("roam_task_max_files") is not None:
+                flat_config["journaler_roam_task_max_files"] = int(
+                    j["roam_task_max_files"]
+                )
+            if j.get("prose_completion_detection") is not None:
+                flat_config["journaler_prose_completion_detection"] = bool(
+                    j["prose_completion_detection"]
+                )
             if isinstance(j.get("context_management"), dict):
                 flat_config["journaler_context_management"] = j["context_management"]
+            if isinstance(j.get("output_limit"), dict):
+                flat_config["journaler_output_limit"] = j["output_limit"]
             if j.get("org_link_on_relation") is not None:
                 flat_config["journaler_org_link_on_relation"] = bool(
                     j["org_link_on_relation"]
@@ -952,6 +1405,8 @@ class Settings(BaseSettings):
                 flat_config["corpus_search_k"] = corpus["search_k"]
             if corpus.get("threshold") is not None:
                 flat_config["corpus_search_threshold"] = corpus["threshold"]
+            if corpus.get("embedder") and isinstance(corpus["embedder"], dict):
+                flat_config["corpus_embedder_config"] = dict(corpus["embedder"])
 
         if "agent_web_search" in config:
             web = config["agent_web_search"]
@@ -998,6 +1453,27 @@ class Settings(BaseSettings):
                         flat_config["diagnostic_debug_context_max_chars"] = cp[
                             "debug_context_max_chars"
                         ]
+
+        if "zettelkasten" in config:
+            zettel = config["zettelkasten"]
+            if zettel.get("enabled") is not None:
+                flat_config["zettelkasten_enabled"] = zettel["enabled"]
+            if zettel.get("proposal_dir"):
+                flat_config["zettelkasten_proposal_dir"] = Path(
+                    zettel["proposal_dir"]
+                ).expanduser()
+            if zettel.get("markers") is not None:
+                flat_config["zettelkasten_markers"] = list(zettel["markers"] or [])
+            if zettel.get("journal_lookback_days") is not None:
+                flat_config["zettelkasten_journal_lookback_days"] = zettel[
+                    "journal_lookback_days"
+                ]
+            if zettel.get("link_top_k") is not None:
+                flat_config["zettelkasten_link_top_k"] = zettel["link_top_k"]
+            if zettel.get("link_similarity_threshold") is not None:
+                flat_config["zettelkasten_link_similarity_threshold"] = zettel[
+                    "link_similarity_threshold"
+                ]
 
         def _is_empty(v: object) -> bool:
             if v is None or v == "":

@@ -98,6 +98,8 @@ def _agent_command(agent: str, description: str, project_id: Any) -> str:
     cmd = f"/agent {agent} {description}"
     if project_id is not None:
         cmd += f" --project {project_id}"
+    if agent == "blender":
+        cmd += " --backend claude"
     return cmd
 
 
@@ -119,6 +121,18 @@ def _resolve_agent(
 
 def _infer_agent_from_description(description: str) -> str:
     text = description.lower()
+    if any(
+        word in text
+        for word in (
+            "blender",
+            "3d model",
+            "viewport render",
+            "room geometry",
+            "mesh object",
+            "blender scene",
+        )
+    ):
+        return "blender"
     if any(word in text for word in ("latex", "tex", "overleaf")):
         return "latex-writer"
     if any(

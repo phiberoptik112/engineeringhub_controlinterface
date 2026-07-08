@@ -10,12 +10,16 @@ from __future__ import annotations
 
 import json
 import logging
+import queue
+import re
+import threading
 import uuid
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Callable, Iterator
 
+from engineering_hub.journaler.org_writer import append_to_heading, read_section_body
 from engineering_hub.memory.service import MemoryResult, MemoryService
 
 if TYPE_CHECKING:
@@ -28,6 +32,7 @@ from engineering_hub.journaler.context_manager import (
     ContextCompressor,
     ContextPressureManager,
     ConversationHistory,
+    DomainShiftDetector,
     PressureConfig,
     TokenBudget,
     TopicTracker,
@@ -35,6 +40,13 @@ from engineering_hub.journaler.context_manager import (
     execute_clear,
 )
 from engineering_hub.journaler.prompts import FOCUS_TECHNICAL_WRITING_PROMPT
+from engineering_hub.journaler.output_limit import (
+    Action,
+    GenerationOutcome,
+    OrchestratorResult,
+    OutputLimitConfig,
+    OutputLimitOrchestrator,
+)
 from engineering_hub.journaler.session_retrieval import (
     format_past_session_block,
     references_past_session,
@@ -65,10 +77,31 @@ SUPPORTED_EXTENSIONS: frozenset[str] = frozenset(
         ".toml",
         ".rst",
         ".docx",
+        ".pdf",
     }
 )
 
 logger = logging.getLogger(__name__)
+
+_DATE_TAG = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+_CROSS_REF_HEADING = "Journaler Cross-References"
+
+# Prompts for output-limit continuation fidelity (kept compact on purpose).
+_CONTINUATION_BRIEF_PROMPT = (
+    "You are helping another assistant resume an interrupted response.\n"
+    "The user's original request was:\n{intent}\n\n"
+    "The response so far (it was cut off) is:\n{partial}\n\n"
+    "Write a COMPACT brief (bullet points, no preamble) capturing only what is "
+    "needed to finish the deliverable: the concrete facts, values, decisions, "
+    "and structure already established, plus exactly what still needs to be "
+    "written. Do not restate the full text."
+)
+
+_PARTIAL_SUMMARY_PROMPT = (
+    "Summarize the key established facts, values, and decisions in the text "
+    "below as compact bullet points (no preamble). This will be used to finish "
+    "an interrupted answer, so preserve specifics:\n\n{text}"
+)
 
 
 @dataclass
@@ -87,6 +120,43 @@ class FocusDocument:
 # ---------------------------------------------------------------------------
 # Daily-summary relation helpers
 # ---------------------------------------------------------------------------
+
+def _relation_excerpt(content: str, *, excerpt_chars: int) -> str:
+    excerpt = content[:excerpt_chars].replace("\n", " ").strip()
+    if len(content) > excerpt_chars:
+        excerpt += "..."
+    return excerpt
+
+
+def _related_date_from_hit(hit: MemoryResult) -> str:
+    if hit.created_at:
+        return hit.created_at[:10]
+    for tag in hit.tags:
+        if _DATE_TAG.match(tag):
+            return tag
+    return ""
+
+
+def _resolve_relation_file_link(
+    related_date: str,
+    journal_dir: Path,
+    state_dir: Path,
+) -> str:
+    if not related_date:
+        return "Related conversation"
+
+    journal_path = (journal_dir / f"{related_date}.org").expanduser().resolve()
+    if journal_path.is_file():
+        return f"[[file:{journal_path}][{related_date} daily journal]]"
+
+    summary_path = (
+        state_dir / "daily_summaries" / f"{related_date}.md"
+    ).expanduser().resolve()
+    if summary_path.is_file():
+        return f"[[file:{summary_path}][Journaler summary {related_date}]]"
+
+    return related_date
+
 
 def _format_relation_block(
     hits: list[MemoryResult],
@@ -107,43 +177,45 @@ def _format_relation_block(
         "",
     ]
     for hit in hits:
-        date_str = (hit.created_at or "unknown")[:10]
-        excerpt = hit.content[:excerpt_chars].replace("\n", " ").strip()
-        if len(hit.content) > excerpt_chars:
-            excerpt += "..."
+        date_str = _related_date_from_hit(hit) or "unknown"
+        excerpt = _relation_excerpt(hit.content, excerpt_chars=excerpt_chars)
         lines.append(f"**{date_str}** _{hit.similarity:.0%} match_")
         lines.append(f"> {excerpt}")
         lines.append("")
     return "\n".join(lines)
 
 
-def _write_relation_link(journal_dir: Path, hit: MemoryResult) -> None:
+def _write_relation_link(
+    journal_dir: Path,
+    state_dir: Path,
+    hit: MemoryResult,
+    *,
+    excerpt_chars: int = 400,
+) -> None:
     """Append a cross-reference link to the current day's journal.
 
     Creates a ``* Journaler Cross-References`` heading if it does not
     exist, then appends a dated link so the org file accumulates a
     lightweight relation graph over time.
     """
-    from datetime import date as _date
-
-    from engineering_hub.journaler.org_writer import append_to_heading
-
-    today_path = journal_dir / f"{_date.today().isoformat()}.org"
+    today_path = journal_dir / f"{date.today().isoformat()}.org"
     if not today_path.exists():
         return
 
-    related_date = (hit.created_at or "")[:10]
-    excerpt = hit.content[:120].replace("\n", " ").strip()
-    if len(hit.content) > 120:
-        excerpt += "..."
-    link_text = (
-        f"- [[journaler:{related_date}]] Related conversation ({hit.similarity:.0%}): {excerpt}"
-    )
+    related_date = _related_date_from_hit(hit)
+    if related_date:
+        existing = read_section_body(today_path, _CROSS_REF_HEADING)
+        if related_date in existing:
+            return
+
+    link_label = _resolve_relation_file_link(related_date, journal_dir, state_dir)
+    excerpt = _relation_excerpt(hit.content, excerpt_chars=excerpt_chars)
+    link_text = f"- {link_label} ({hit.similarity:.0%} match): {excerpt}"
 
     try:
         append_to_heading(
             today_path,
-            "Journaler Cross-References",
+            _CROSS_REF_HEADING,
             link_text,
             create_heading_if_missing=True,
         )
@@ -255,6 +327,9 @@ def _detect_vlm(load_path: str) -> bool:
     try:
         cfg = json.loads(config_path.read_text(encoding="utf-8"))
         model_type = cfg.get("model_type", "").lower()
+        # Route only known VLMs to mlx-vlm.  Do not treat every model with a
+        # vision_config block as a VLM — e.g. Qwen3.6 (qwen3_5_moe) ships
+        # multimodal config but mlx-community text weights load via mlx-lm.
         return model_type in _VLM_MODEL_TYPES
     except Exception:
         return False
@@ -541,6 +616,74 @@ class ConversationalMLXBackend:
     def is_loaded(self) -> bool:
         return self._model is not None
 
+    # ------------------------------------------------------------------
+    # Runtime setters (no model reload required)
+    # ------------------------------------------------------------------
+
+    def set_enable_thinking(self, value: bool | None) -> None:
+        """Update the thinking-mode flag applied to the chat template."""
+        self._enable_thinking = value
+
+    def set_sampling_params(
+        self,
+        *,
+        temp: float | None = None,
+        top_p: float | None = None,
+        min_p: float | None = None,
+        repetition_penalty: float | None = None,
+    ) -> None:
+        """Update one or more sampling parameters in place."""
+        if temp is not None:
+            self._temp = temp
+        if top_p is not None:
+            self._top_p = top_p
+        if min_p is not None:
+            self._min_p = min_p
+        if repetition_penalty is not None:
+            self._repetition_penalty = repetition_penalty
+
+    def stream_generate(
+        self, messages: list[dict[str, str]], max_tokens: int
+    ) -> Iterator[str]:
+        """Yield tokens one-at-a-time via ``mlx_lm.stream_generate``.
+
+        Only available for text-only (non-VLM) models.  VLM models fall back
+        to a single blocking ``chat()`` call whose full response is yielded
+        as one chunk.
+        """
+        prompt = self._apply_chat_template_safe(messages)
+        if self._is_vlm:
+            yield self._chat_vlm(prompt, max_tokens)
+            return
+
+        sampler = self._make_sampler(  # type: ignore[misc]
+            temp=self._temp, top_p=self._top_p, min_p=self._min_p
+        )
+        logits_processors = self._make_logits_processors(  # type: ignore[misc]
+            repetition_penalty=self._repetition_penalty,
+            repetition_context_size=self._repetition_context_size,
+        )
+        try:
+            for result in self._mlx_lm.stream_generate(  # type: ignore[union-attr]
+                self._model,
+                self._tokenizer,
+                prompt=prompt,
+                max_tokens=max_tokens,
+                sampler=sampler,
+                logits_processors=logits_processors,
+            ):
+                # mlx_lm may yield strings or objects with a `.text` attribute.
+                if isinstance(result, str):
+                    yield result
+                else:
+                    text = getattr(result, "text", None)
+                    if text is not None:
+                        yield str(text)
+        except Exception as exc:
+            raise LLMBackendError(
+                f"Journaler MLX stream generation failed: {exc}", provider="mlx"
+            ) from exc
+
 
 class ConversationEngine:
     """Manages a persistent conversation session with a local model.
@@ -560,6 +703,7 @@ class ConversationEngine:
         max_tokens: int = 4096,
         max_thinking_tokens: int = 8192,
         pressure_config: PressureConfig | None = None,
+        output_limit: OutputLimitConfig | None = None,
         model_context_window: int = 32768,
         corpus_service: CorpusService | None = None,
         load_file_budget: LoadFileBudgetConfig | None = None,
@@ -631,6 +775,11 @@ class ConversationEngine:
             config=cfg,
         )
         self._pressure_config = cfg
+        self._output_limit = output_limit or OutputLimitConfig()
+        # Optional interactive chooser for ``policy == "prompt"`` (set by the CLI).
+        self._output_choice_provider: (
+            Callable[[GenerationOutcome], Action | None] | None
+        ) = None
         self._roam_edit_target: Path | None = None
         self._focus_document: FocusDocument | None = None
 
@@ -638,6 +787,11 @@ class ConversationEngine:
         self.session_opened_at = datetime.now(timezone.utc)
         self.task_planner = TaskPlannerSession(self.session_id, self.session_opened_at)
         self.pinned_state: dict[str, Any] = {"task_planner": self.task_planner}
+
+        # Persona state — populated by swap_persona() / /persona command.
+        self.active_persona: str = ""
+        self.base_system_prompt: str = system_prompt
+        self.domain_shift_detector: DomainShiftDetector | None = None
 
     def get_roam_edit_target(self) -> Path | None:
         """Session target for ``/edit`` (set via ``/open`` in journaler chat)."""
@@ -649,6 +803,114 @@ class ConversationEngine:
             self._roam_edit_target = None
         else:
             self._roam_edit_target = path.expanduser().resolve()
+
+    def swap_persona(
+        self,
+        skill_name: str,
+        display_name: str,
+        description: str,
+        *,
+        personas_dir: Path | None = None,
+    ) -> str:
+        """Hot-swap the main Journaler system prompt to a new persona domain.
+
+        Rebuilds ``_system_prompt`` by prepending a persona header derived from the
+        skill's description.  If a file ``prompts/personas/{skill_name}.txt`` exists
+        it is used as the full persona block instead.  A bracketed note is injected
+        into the conversation history so the model is aware of the transition.
+
+        Args:
+            skill_name: Canonical skill/agent name (e.g. ``"career-coach"``).
+            display_name: Human-readable persona label for the history note.
+            description: Skill description used as the persona header when no
+                ``personas/`` file is found.
+            personas_dir: Optional directory to search for a ``{skill_name}.txt``
+                persona file.  Falls back to a ``prompts/personas/`` sibling of the
+                default prompts directory.
+
+        Returns:
+            Status message suitable for display in the chat UI.
+        """
+        persona_block = self._load_persona_block(
+            skill_name, description, personas_dir=personas_dir
+        )
+        self._system_prompt = persona_block + "\n\n" + self.base_system_prompt
+        self.budget.system_prompt_tokens = estimate_tokens(self._system_prompt)
+        self.active_persona = skill_name
+
+        note = (
+            f"[Persona switched to **{display_name}**. "
+            f"Previous conversation context retained.]"
+        )
+        now = datetime.now().isoformat(timespec="seconds")
+        self.history.add("assistant", note)
+        self._log_turn("assistant", note, now)
+
+        if self.domain_shift_detector is not None:
+            skill = self.domain_shift_detector._skills.get(skill_name)
+            domain = (skill.domain if skill is not None else "") or skill_name
+            self.domain_shift_detector.confirm_shift(skill_name)
+            self.domain_shift_detector.set_active_domain(domain)
+
+        logger.info("Persona swapped to '%s'", skill_name)
+        return note
+
+    def reset_persona(self) -> str:
+        """Restore the base system prompt, clearing any active persona."""
+        self._system_prompt = self.base_system_prompt
+        self.budget.system_prompt_tokens = estimate_tokens(self._system_prompt)
+        old = self.active_persona
+        self.active_persona = ""
+        if self.domain_shift_detector is not None:
+            self.domain_shift_detector.set_active_domain("")
+
+        note = "[Persona reset to default Journaler.]"
+        now = datetime.now().isoformat(timespec="seconds")
+        self.history.add("assistant", note)
+        self._log_turn("assistant", note, now)
+
+        logger.info("Persona reset from '%s' to default", old)
+        return note
+
+    def _load_persona_block(
+        self,
+        skill_name: str,
+        description: str,
+        *,
+        personas_dir: Path | None = None,
+    ) -> str:
+        """Return the persona system-prompt block for *skill_name*.
+
+        Checks for a ``prompts/personas/{skill_name}.txt`` file first; falls back
+        to a concise header built from the skill ``description``.
+        """
+        if personas_dir is None:
+            # Try to locate prompts/personas/ relative to known locations.
+            for candidate in [
+                Path(__file__).parent.parent.parent.parent / "prompts" / "personas",
+                Path.cwd() / "prompts" / "personas",
+            ]:
+                if candidate.is_dir():
+                    personas_dir = candidate
+                    break
+
+        if personas_dir is not None:
+            persona_file = personas_dir / f"{skill_name}.txt"
+            if persona_file.is_file():
+                try:
+                    return persona_file.read_text(encoding="utf-8").strip()
+                except OSError as exc:
+                    logger.warning(
+                        "Could not read persona file %s: %s", persona_file, exc
+                    )
+
+        first_line = description.splitlines()[0] if description else skill_name
+        return (
+            f"## Active persona: {skill_name}\n\n"
+            f"{first_line}\n\n"
+            f"You are now operating in **{skill_name}** mode. "
+            f"Apply the expertise and style appropriate to this domain."
+        )
 
     def replace_backend(
         self,
@@ -671,23 +933,42 @@ class ConversationEngine:
             self._pressure_config.model_context_window = model_context_window
             self.budget.window_size = model_context_window
 
+    def update_max_tokens(self, value: int) -> None:
+        """Update the per-turn generation budget without reloading the model."""
+        self._max_tokens = value
+        self.budget.reserved_for_generation = max(
+            self._pressure_config.reserved_for_generation, value
+        )
+
+    def update_sampling_params(self, **kwargs: Any) -> None:
+        """Forward sampling-parameter changes to the active backend."""
+        self._backend.set_sampling_params(**kwargs)
+
     def update_context(self, context_block: str) -> None:
         """Replace the rolling context section of the system prompt."""
         self._context_block = context_block
         self._sync_context_snapshot_budget()
 
-    def chat(self, message: str) -> str:
-        """Send a user message and get a response.
+    # ------------------------------------------------------------------
+    # Output-limit policy plumbing
+    # ------------------------------------------------------------------
 
-        Runs pre-call pressure checks (compression / trim if needed), builds
-        the message array, calls the model, runs post-call topic tracking,
-        and flushes archived turns to conversation.jsonl.
-        """
-        self.budget.corpus_injection_tokens = 0
-        self.budget.history_tokens = self.history.total_tokens
-        self._sync_context_snapshot_budget()
-        self._sync_loaded_files_budget()
+    def set_output_choice_provider(
+        self, provider: Callable[[GenerationOutcome], Action | None] | None
+    ) -> None:
+        """Register an interactive chooser used when ``policy == "prompt"``."""
+        self._output_choice_provider = provider
 
+    def get_output_limit(self) -> OutputLimitConfig:
+        """Return the active output-limit configuration."""
+        return self._output_limit
+
+    def set_output_limit(self, config: OutputLimitConfig) -> None:
+        """Replace the active output-limit configuration."""
+        self._output_limit = config
+
+    def _build_extra_suffix(self, message: str) -> str | None:
+        """Assemble corpus RAG / past-session / relation context for a turn."""
         extra_suffix: str | None = None
         cs = self._corpus_service
         if (
@@ -743,58 +1024,152 @@ class ConversationEngine:
                         else relation_block
                     )
                     if self._org_link_on_relation and self._journal_dir:
-                        _write_relation_link(self._journal_dir, relation_hits[0])
+                        _write_relation_link(
+                            self._journal_dir,
+                            self._log_dir,
+                            relation_hits[0],
+                            excerpt_chars=self._pressure_config.org_link_excerpt_chars,
+                        )
             except Exception as exc:
                 logger.warning("Journaler relation search failed (non-fatal): %s", exc)
 
+        return extra_suffix
+
+    def _make_orchestrator(
+        self,
+        message: str,
+        extra_suffix: str | None,
+        on_token: Callable[[str], None] | None,
+    ) -> OutputLimitOrchestrator:
+        """Wire an :class:`OutputLimitOrchestrator` to this engine's backend."""
+
+        def _generate(
+            continuation_prompt: str | None, accumulated: str, max_tokens: int
+        ) -> tuple[str, int]:
+            messages = self._build_messages(extra_system_suffix=extra_suffix)
+            messages.append({"role": "user", "content": message})
+            if continuation_prompt is not None:
+                if accumulated.strip():
+                    messages.append({"role": "assistant", "content": accumulated})
+                messages.append({"role": "user", "content": continuation_prompt})
+            if on_token is not None:
+                chunks: list[str] = []
+                for token in self._backend.stream_generate(messages, max_tokens):
+                    chunks.append(token)
+                    on_token(token)
+                text = "".join(chunks)
+            else:
+                text = self._backend.chat(
+                    messages,
+                    max_tokens,
+                    max_thinking_tokens=self._effective_thinking_budget(),
+                )
+            # Strip <think> blocks so reasoning transcripts never leak into the
+            # user-facing answer, history, or continuation-pass accumulation.
+            text = strip_think_blocks(text) or text
+            return text, estimate_tokens(text)
+
+        def _prompt_tokens() -> int:
+            messages = self._build_messages(extra_system_suffix=extra_suffix)
+            total = sum(estimate_tokens(m["content"]) for m in messages)
+            return total + estimate_tokens(message)
+
+        def _summarize_history() -> str | None:
+            result = self.compressor.compress(self.history, force=True)
+            if result.compressed:
+                self.budget.history_tokens = self.history.total_tokens
+                return (
+                    f"[Context compressed: freed {result.tokens_freed} tokens "
+                    f"from {result.turns_compressed} earlier exchanges]"
+                )
+            return None
+
+        def _summarize_text(text: str) -> str:
+            return self._raw_complete(
+                _PARTIAL_SUMMARY_PROMPT.format(text=text),
+                self._output_limit.continuation_summary_tokens,
+            )
+
+        def _build_brief(intent: str, partial: str) -> str:
+            return self._raw_complete(
+                _CONTINUATION_BRIEF_PROMPT.format(intent=intent, partial=partial),
+                self._output_limit.continuation_summary_tokens,
+            )
+
+        return OutputLimitOrchestrator(
+            self._output_limit,
+            window_size=self.budget.window_size,
+            requested_max_tokens=self._max_tokens,
+            generate=_generate,
+            prompt_tokens=_prompt_tokens,
+            estimate_tokens=estimate_tokens,
+            summarize_history=_summarize_history,
+            summarize_text=_summarize_text,
+            build_brief=_build_brief,
+            choice_provider=self._output_choice_provider,
+        )
+
+    def _run_output_policy(
+        self, message: str, on_token: Callable[[str], None] | None = None
+    ) -> OrchestratorResult:
+        """Shared generation path for :meth:`chat` and :meth:`stream_chat`."""
+        self.budget.corpus_injection_tokens = 0
+        self.budget.history_tokens = self.history.total_tokens
+        self._sync_loaded_files_budget()
+
+        extra_suffix = self._build_extra_suffix(message)
         if extra_suffix:
             self.budget.corpus_injection_tokens = estimate_tokens(extra_suffix)
         else:
             self.budget.corpus_injection_tokens = 0
 
-        # Pre-call: check pressure, compress/trim if necessary
+        # Pre-call: utilization-based compression/trim (separate from headroom gating).
         pre_actions = self.pressure_manager.pre_call_check()
 
-        messages = self._build_messages(extra_system_suffix=extra_suffix)
-        messages.append({"role": "user", "content": message})
+        orchestrator = self._make_orchestrator(message, extra_suffix, on_token)
+        result = orchestrator.run(message)
+        final = result.text
 
-        response = self._backend.chat(
-            messages,
-            self._max_tokens,
-            max_thinking_tokens=self._effective_thinking_budget(),
-        )
-
-        # Record in history (post-generation so history doesn't include this turn in the call)
-        # Thinking blocks are stripped from history so reasoning transcripts do
-        # not bloat the rolling context or confuse subsequent turns.
-        history_response = strip_think_blocks(response)
-        if not history_response:
-            history_response = "(thinking-only output; no final answer was produced)"
         now = datetime.now().isoformat(timespec="seconds")
         resp_time = datetime.now().isoformat(timespec="seconds")
         self.history.add("user", message)
+        # Thinking blocks are stripped from history so reasoning transcripts do
+        # not bloat the rolling context or confuse subsequent turns.
+        history_response = strip_think_blocks(final)
+        if not history_response:
+            history_response = "(thinking-only output; no final answer was produced)"
         self.history.add("assistant", history_response)
         self.budget.history_tokens = self.history.total_tokens
 
-        # Post-call: topic tracking
         post_actions = self.pressure_manager.post_call_check(message, history_response)
 
-        # Log raw turns to JSONL
         self._log_turn("user", message, now)
-        self._log_turn("assistant", response, resp_time)
+        self._log_turn("assistant", final, resp_time)
 
-        # Flush evicted/archived turns to JSONL
         archived = self.history.flush_archive()
         if archived:
             self._log_archived_turns(archived)
 
-        # Prepend action notifications when configured
-        all_actions = pre_actions + post_actions
-        if all_actions and self._pressure_config.notify_user_on_action:
-            action_text = "\n".join(all_actions)
-            response = f"{action_text}\n\n{response}"
-
         self.budget.corpus_injection_tokens = 0
+
+        if self._pressure_config.notify_user_on_action:
+            result.actions = pre_actions + result.actions + post_actions
+        else:
+            result.actions = []
+        return result
+
+    def chat(self, message: str) -> str:
+        """Send a user message and get a (possibly multi-pass) response.
+
+        Runs pre-call pressure checks, applies the output-limit policy
+        (summarize / continue / stop on truncation), records history, and
+        flushes archived turns to conversation.jsonl.
+        """
+        result = self._run_output_policy(message)
+        response = result.text
+        if result.actions:
+            action_text = "\n".join(result.actions)
+            response = f"{action_text}\n\n{response}"
         return response
 
     def _effective_thinking_budget(self) -> int:
@@ -807,6 +1182,38 @@ class ConversationEngine:
         """
         headroom = max(0, self.budget.available)
         return min(self._max_thinking_tokens, headroom)
+
+    def stream_chat(self, message: str) -> Iterator[str]:
+        """Streaming counterpart to :meth:`chat` — yields token strings live.
+
+        The output-limit policy runs in a worker thread so continuation passes
+        keep streaming; bracketed action notices are flushed at the end.
+        """
+        result_queue: "queue.Queue[tuple[str, Any]]" = queue.Queue()
+
+        def _on_token(token: str) -> None:
+            result_queue.put(("tok", token))
+
+        def _worker() -> None:
+            try:
+                result = self._run_output_policy(message, on_token=_on_token)
+                result_queue.put(("done", result))
+            except Exception as exc:  # surfaced to the consumer below
+                result_queue.put(("err", exc))
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+        while True:
+            kind, payload = result_queue.get()
+            if kind == "tok":
+                yield payload
+            elif kind == "err":
+                raise payload
+            else:  # "done"
+                result = payload
+                if result.actions:
+                    yield "\n\n" + "\n".join(result.actions)
+                return
 
     def inject_turn(self, user: str, assistant: str) -> None:
         """Inject a pre-computed (user, assistant) exchange into history and the log.
@@ -828,12 +1235,17 @@ class ConversationEngine:
     def clear(self, strategy: ClearStrategy) -> str:
         """Execute a manual clear command. Returns a status message."""
         last_scan = ""
-        return execute_clear(
+        self.budget.history_tokens = self.history.total_tokens
+        self._sync_loaded_files_budget()
+        msg = execute_clear(
             strategy=strategy,
             history=self.history,
             compressor=self.compressor,
             last_scan_time=last_scan,
+            budget=self.budget,
         )
+        self.budget.history_tokens = self.history.total_tokens
+        return msg
 
     def get_status(self) -> dict:
         """Return current context management state for display / /status command."""
@@ -841,10 +1253,17 @@ class ConversationEngine:
         self._sync_context_snapshot_budget()
         self._sync_loaded_files_budget()
         focus_doc = self.get_focus_document()
+        gen_headroom = max(
+            0,
+            self.budget.window_size
+            - self.budget.used
+            - self._output_limit.headroom_safety_tokens,
+        )
         return {
             "context_window": self.budget.window_size,
             "utilization": f"{self.budget.utilization:.0%}",
             "pressure": self.budget.pressure,
+            "gen_headroom": gen_headroom,
             "history_turns": len(self.history.turns),
             "history_tokens": self.history.total_tokens,
             "context_snapshot_tokens": self.budget.context_snapshot_tokens,
@@ -898,7 +1317,10 @@ class ConversationEngine:
                     "trajectories* and suggest concrete paths forward. When you "
                     "see recurring topics or stale tasks, diagnose likely causes "
                     "and recommend next actions. Distinguish quick wins from deep "
-                    "work blocks and flag items that can be delegated to agents."
+                    "work blocks and flag items that can be delegated to agents.\n\n"
+                    "Format the briefing as clean markdown: use ## section headings, "
+                    "blank lines between topics, and generous spacing between "
+                    "sections for readability."
                 ),
             },
             {
@@ -1276,6 +1698,15 @@ class ConversationEngine:
             return False, f"Could not read {path.name}: {exc}"
         except Exception as exc:
             return False, f"Could not load {path.name}: {exc}"
+
+        if not content.strip() or content.strip() == "(No text extracted)":
+            if path.suffix.lower() == ".pdf":
+                return False, (
+                    f"No extractable text in '{path.name}'. It may be a scanned/"
+                    "image-only PDF; install the optional Docling OCR extra "
+                    "(pip install '.[docling-ocrmac]') and retry."
+                )
+            return False, f"No readable text content in '{path.name}'."
 
         truncated = False
         if len(content) > max_chars:

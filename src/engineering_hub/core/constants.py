@@ -25,6 +25,16 @@ class AgentType(str, Enum):
     LATEX_WRITER = "latex-writer"
     PANNING_FOR_GOLD = "panning-for-gold"
     CODE_ENGINEER = "code-engineer"
+    ZETTELKASTEN_CURATOR = "zettelkasten-curator"
+    LVT_TASK_EXTRACTOR = "lvt-task-extractor"
+    COORDINATION_ANALYST = "coordination-analyst"
+    ACOUSTIC_SIM_EXPERT = "acoustic-sim-expert"
+    RENTAL_SCOUT = "rental-scout"
+    BLENDER = "blender"
+    HORN_ITERATOR = "horn-iterator"
+    CAREER_COACH = "career-coach"
+    PRODUCT_MANAGER = "product-manager"
+    COMPLIANCE_ADVISOR = "compliance-advisor"
 
 
 def is_ingest_task(description: str) -> bool:
@@ -48,4 +58,14 @@ AGENT_PROMPT_FILES = {
     AgentType.LATEX_WRITER: "latex-writer.txt",
     AgentType.PANNING_FOR_GOLD: "panning-for-gold.txt",
     AgentType.CODE_ENGINEER: "code-engineer.txt",
+    AgentType.ZETTELKASTEN_CURATOR: "zettelkasten-curator.txt",
+    AgentType.LVT_TASK_EXTRACTOR: "lvt-task-extractor.txt",
+    AgentType.COORDINATION_ANALYST: "coordination-analyst.txt",
+    AgentType.ACOUSTIC_SIM_EXPERT: "acoustic-sim-expert.txt",
+    AgentType.RENTAL_SCOUT: "rental-scout.txt",
+    AgentType.BLENDER: "blender.txt",
+    AgentType.HORN_ITERATOR: "horn-iterator.txt",
+    AgentType.CAREER_COACH: "career-coach.txt",
+    AgentType.PRODUCT_MANAGER: "product-manager.txt",
+    AgentType.COMPLIANCE_ADVISOR: "compliance-advisor.txt",
 }

@@ -8,6 +8,7 @@ directory (e.g. .journaler/system_prompt.txt).
 from __future__ import annotations
 
 import logging
+import re
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -30,7 +31,8 @@ Your role:
   conversations as primary user context.  When the user says "last time",
   "that session", "previous chat", or refers to a prior discussion, first
   use the conversation history/retrieval blocks before falling back to
-  workspace notes.
+  workspace notes. For explicit lookup or agent review, suggest
+  `/history <query>` or `/history --agent <type> <query>`.
 - Flag items that seem stalled, overdue, or need follow-up.
 - When the user wants draft reports, test protocols, executive summaries,
   or other client-ready technical documents, suggest concrete ways to task
@@ -62,10 +64,22 @@ Sub-agent spawning is a core capability.  Follow these rules precisely:
    on its own line with no trailing text.  Do not wrap it in backticks,
    markdown code fences, or quotes.
 
-4. **Omit the `DISPATCH:` line** when you are merely explaining options,
-   answering a question, or suggesting a command the user should copy-paste
-   manually.  Only emit it when the user has clearly agreed to run the task
-   (e.g. "yes, go ahead", "please dispatch", "run it").
+4. **Propose a dispatch proactively** whenever the current topic surfaces a task
+   that a named agent could clearly act on — even mid-exploratory answer.
+   Answer the question briefly first, then add a one-sentence rationale and emit
+   the `DISPATCH:` line.  Example:
+
+       The LVT alert report hasn't been updated since the site visit.  I can
+       draft the missing field-report section now.
+       DISPATCH: /agent technical-writer draft the LVT alert system field-report section covering site-visit findings --project LVT_alert_system_consulting
+
+   For Blender scene work, prefer explicit backend selection when MLX is default:
+
+       DISPATCH: /agent blender --backend claude summarize receiver empties in the current scene
+
+   Reserve omission only for purely factual or status questions where no agent
+   action would add value (e.g. "what time is the briefing?", "how many tasks
+   are pending?").
 
 5. **String project identifiers are valid**: `--project LVT_alert_system_consulting`
    is accepted; you do not need to look up a numeric Django ID.
@@ -80,6 +94,9 @@ Sub-agent spawning is a core capability.  Follow these rules precisely:
   Output: gap analysis with PASS/CONDITIONAL PASS/FAIL verdict.
 - **@technical-reviewer** — Peer review: draft plus review comments → decision matrix and revised document.
 - **@weekly-reviewer** — Summary of recent work, open loops, and project status across the workspace.
+- **@blender** — Inspect or modify a live Blender scene via MCP (room geometry, markers,
+  renders). Requires Blender running with MCP enabled; use `--backend claude` for tool calls.
+  Check connectivity with `/blender status`.
 
 ## Task Dispatch Behavior
 
@@ -116,6 +133,21 @@ is available:
 - **Recent Conversation Summaries** — compressed summaries of the last N
   Journaler chat sessions (newest first).  Use these to track continuity across
   days: notice recurring questions, ongoing threads, and decisions already made.
+
+## Recurring Topic Reflection
+
+When your context snapshot contains a **Recurring Topics** block, do NOT simply
+list the topics.  For each recurring topic, add one sentence of analysis:
+
+- Why it likely keeps appearing (e.g. blocked dependency, ongoing project phase,
+  unresolved decision, waiting on external input).
+- What the single most useful next action would be: delegate to an agent,
+  schedule a decision, break the task down, or explicitly drop it.
+
+Weave this commentary inline with your response rather than as a standalone
+section, unless the user asked specifically about task status.  The goal is to
+surface patterns that make the recurring item actionable, not to repeat the
+list back to the user.
 
 ## Conversation Relation Callout
 
@@ -243,6 +275,12 @@ You can tell the user about these commands; the user types them directly:
                                Default backend is journaler.agent_backend in config
                                ("mlx" is default; use "auto" for Claude when a key is present).
 
+  /history [--agent <type>] [--backend mlx|claude] <query>
+                               Retrieve excerpts from prior Journaler chat logs
+                               (conversation.jsonl and daily summaries). With
+                               --agent, dispatch the retrieved excerpts to a
+                               named persona for review.
+
   /skills                      List all available agent delegation skills with
                                descriptions and example invocations.
 
@@ -254,60 +292,183 @@ You can tell the user about these commands; the user types them directly:
 """
 
 BRIEFING_PROMPT = """\
-Generate a comprehensive morning briefing for today ({date}).
+Generate a concise morning briefing for today ({date}).
 
 You have the following context about recent activity, spanning the full
 journal lookback window:
 
 {briefing_context}
 
-Structure your briefing with the following sections.  Be thorough — this
-briefing is the primary daily planning document and should give a
-complete picture of where things stand and what to do next.
+Structure your briefing with the following sections.  Prioritize content
+trends found across many daily journals over single-day recaps.  Each
+bullet should be 2-3 sentences: first state the item, then explain the
+pattern, significance, or suggested next move.  Prefer synthesis over
+inventory.
 
-1. **Yesterday's Highlights** — What got done, what agents completed,
-   any notable findings or outputs worth reviewing.  For each item,
-   briefly note its significance to the broader project it belongs to
-   (e.g. "this unblocks X" or "completes the Y deliverable").
+Use these exact section headings (markdown ``##``), in order:
 
-2. **Week-at-a-Glance** — Synthesize the multi-day journal thread and
-   recurring topics into a narrative arc.  What themes dominated the
-   week?  What gained momentum, what lost it?  Call out recurring topics
-   that appear on 3+ days — these are ongoing threads worth explicit
-   attention.
+## Cross-Journal Trends
+Start here.  Identify recurring topics, repeated concerns, project
+momentum, and themes appearing across the journal window.  Call out
+which trends seem to be strengthening, fading, or fragmenting.
 
-3. **Today's Agenda** — Pending tasks ordered by suggested priority.
-   For each, briefly explain *why* it should be tackled in that order
-   (deadline pressure, dependency, quick win, etc.).  Group by project
-   when multiple tasks belong to the same effort.
+## Yesterday in Context
+Summarize what changed yesterday only insofar as it confirms, interrupts,
+or advances the longer-running trends.  Include notable agent outputs or
+findings when they shift a project direction.
 
-4. **Needs Attention** — Anything stalled, overdue, or needing a
-   decision.  For stale tasks (shown with first-seen dates), note how
-   many days they have been pending and why they may be stuck.  For
-   each, suggest one of: escalate, delegate to an agent, break into
-   smaller pieces, or drop.
+## Today's Agenda
+Pending tasks ordered by suggested priority.  Explain why each item
+belongs in that position using evidence from the trend history,
+deadlines, dependencies, or quick-win potential.  Group by project when
+multiple tasks belong to the same effort (use ``### Project name``
+subheadings).
 
-5. **Suggested Paths Forward** — The most important section.  For each
-   active project or recurring topic, suggest 1–2 concrete next actions.
-   Categorize each suggestion as:
-   - **Quick win** (< 30 min): something that can be knocked out
-     immediately to maintain momentum.
-   - **Deep-work block** (1–2 hours): focused work that moves the
-     needle on a major deliverable.
-   - **Agent task**: work that can be delegated to a research,
-     technical-writer, or standards-checker agent.
-   - **Decision needed**: flag items that require human judgment before
-     any agent or task can proceed.
-   Reference specific org-roam notes or agent outputs where relevant so
-   the suggestions are actionable, not generic.
+## Needs Attention
+Anything stalled, overdue, or needing a decision.  **Do not** repeat tasks
+listed under “Task Status Changes Since Last Scan” or “Recently Completed
+Tasks” — those are already resolved.  For stale tasks (shown with first-seen
+dates and source references), note how many days they have been pending and
+why the journal trend suggests they may be stuck.  For each, suggest one of:
+escalate, delegate to an agent, break into smaller pieces, or drop.
 
-6. **Quick Stats** — Number of pending vs completed tasks this week,
-   active projects, stale task count, recent memory entries.
+## Suggested Paths Forward
+For each active project or recurring topic, suggest 1-2 concrete next
+actions.  Categorize each suggestion as **Quick win**, **Deep-work
+block**, **Agent task**, or **Decision needed**, and reference specific
+org-roam notes or agent outputs where relevant.
 
-Aim for 800–1200 words.  Use bullet points and bold key phrases for
-scannability, but do not sacrifice depth for brevity — the goal is a
-thorough planning document, not a summary.\
+## Quick Stats
+Number of pending vs completed tasks in the journal window, active
+projects, stale task count, recent memory entries.
+
+If the context includes **Continuing Threads**, add a section:
+
+## Continuing Threads
+Surface past conversations that overlap with today's recurring themes and
+note why each thread is worth revisiting.
+
+Formatting rules (strict — readability depends on whitespace):
+
+- Use ``##`` for each major section above.  Do not number section titles.
+- Leave one blank line after every ``##`` or ``###`` heading.
+- Leave two blank lines before each new ``##`` section (except before the
+  first section).
+- Use ``-`` bullets for topics.  Put one blank line between every bullet.
+- Use ``###`` for project or theme subgroups inside a section; leave one
+  blank line before and after each subgroup heading.
+- Within a bullet, bold only the lead phrase (e.g. ``- **ASTM E336** —
+  …``).
+
+Aim for 500-800 words.  Do not list every journal entry; surface the
+patterns that make today easier to plan.\
 """
+
+
+DISCUSSION_PERSONA_PROMPT = """\
+You are participating in the Topics Discussion Briefing for an acoustic engineering consulting
+practice.  Today is {date}.  You are {persona_name} — {role_summary}
+
+Your communication style: {communication_style}
+
+Your areas of focus: {areas_of_focus}
+
+{past_context_block}
+You have been given the shared workspace context below and the discussion transcript so far
+(from personas who spoke before you).  Read both carefully before contributing.
+
+Your role-specific instructions:
+{system_prompt_suffix}
+"""
+
+DISCUSSION_SYNTHESIS_PROMPT = """\
+You have just read a full Topics Discussion Briefing in which {num_personas} personas each
+contributed their perspective on the current project context.  Your task is to write a concise
+"Key Themes" section that synthesises the discussion.
+
+Identify 2-4 cross-cutting themes — topics where multiple personas converged, where there are
+notable tensions or disagreements, or where a shared concern points toward a single highest-priority
+action.  For each theme, name which personas raised it and propose one concrete next step.
+
+Format:
+## Key Themes
+
+- **[Theme name]** — Raised by: [persona list].  [1-2 sentence synthesis + concrete next step]
+- …
+
+Keep it under 200 words.  Do not repeat content already said — synthesise and redirect.
+"""
+
+
+def format_discussion_persona_prompt(
+    *,
+    date_str: str,
+    persona_name: str,
+    role_summary: str,
+    communication_style: str,
+    areas_of_focus: list[str],
+    system_prompt_suffix: str,
+    past_context_block: str = "",
+) -> str:
+    """Build the system prompt for a single persona in the discussion briefing.
+
+    Args:
+        date_str: ISO date string for today, e.g. ``"2026-05-26"``.
+        persona_name: Human-readable name, e.g. ``"Alex (Project Manager)"``.
+        role_summary: One-sentence description of the persona's role.
+        communication_style: Description of how this persona communicates.
+        areas_of_focus: List of focus areas for bullet formatting.
+        system_prompt_suffix: Persona-specific instruction block from the YAML.
+        past_context_block: Pre-formatted history block from ``PersonaHistoryStore``.
+
+    Returns:
+        Fully-formatted system prompt string for this persona's LLM call.
+    """
+    focus_bullets = "\n".join(f"  - {item}" for item in areas_of_focus)
+    past_section = (
+        f"\n{past_context_block}\n" if past_context_block.strip() else ""
+    )
+    return DISCUSSION_PERSONA_PROMPT.format(
+        date=date_str,
+        persona_name=persona_name,
+        role_summary=role_summary,
+        communication_style=communication_style,
+        areas_of_focus=focus_bullets,
+        past_context_block=past_section,
+        system_prompt_suffix=system_prompt_suffix.strip(),
+    )
+
+
+def format_discussion_user_message(
+    *,
+    shared_context: str,
+    running_transcript: str,
+    is_first: bool = False,
+) -> str:
+    """Build the user-turn message for a persona's LLM call.
+
+    Args:
+        shared_context: The briefing context from ``JournalContext.get_briefing_context()``.
+        running_transcript: Discussion so far (empty string for the first persona).
+        is_first: When True, omits the transcript section from the message.
+
+    Returns:
+        Formatted user message string.
+    """
+    parts: list[str] = [
+        "## Shared Workspace Context\n",
+        shared_context.strip(),
+    ]
+    if not is_first and running_transcript.strip():
+        parts += [
+            "\n\n## Discussion So Far\n",
+            running_transcript.strip(),
+        ]
+    parts.append(
+        "\n\n---\nNow give your perspective based on your role and focus areas. "
+        "Be specific and grounded in the context above."
+    )
+    return "".join(parts)
 
 
 def load_system_prompt(state_dir: Path | None = None) -> str:
@@ -390,6 +551,80 @@ def format_briefing_prompt(
     return template.replace("{date}", date_str).replace(
         "{briefing_context}", briefing_context
     )
+
+
+_BRIEFING_FENCE_RE = re.compile(
+    r"^\s*```(?:\w*)?\s*\n(.*?)\n\s*```\s*$",
+    re.DOTALL | re.IGNORECASE,
+)
+_BRIEFING_NUMBERED_SECTION_RE = re.compile(
+    r"^\d+\.\s+\*\*(.+?)\*\*(?:\s*[—–-].*)?$"
+)
+_BRIEFING_STANDALONE_BOLD_HEADING_RE = re.compile(r"^\*\*(.+?)\*\*\s*$")
+_BRIEFING_LIST_ITEM_RE = re.compile(r"^(\s*[-*+]|\s*\d+\.)\s+")
+
+
+def format_briefing_markdown(text: str) -> str:
+    """Normalize briefing markdown for readable section and topic spacing."""
+    s = text.strip()
+    fence = _BRIEFING_FENCE_RE.match(s)
+    if fence:
+        s = fence.group(1).strip()
+
+    normalized: list[str] = []
+    for line in s.splitlines():
+        stripped = line.strip()
+        numbered = _BRIEFING_NUMBERED_SECTION_RE.match(stripped)
+        if numbered:
+            normalized.append(f"## {numbered.group(1)}")
+            continue
+        standalone = _BRIEFING_STANDALONE_BOLD_HEADING_RE.match(stripped)
+        if standalone and not line.startswith((" ", "\t")):
+            normalized.append(f"## {standalone.group(1)}")
+            continue
+        normalized.append(line.rstrip())
+
+    result: list[str] = []
+    prev_kind: str | None = None
+    seen_h2 = False
+
+    for line in normalized:
+        stripped = line.strip()
+        if not stripped:
+            if result and result[-1] != "":
+                result.append("")
+            prev_kind = "blank"
+            continue
+
+        if stripped.startswith("## ") and not stripped.startswith("###"):
+            kind = "h2"
+            if seen_h2 and result:
+                while result and result[-1] == "":
+                    result.pop()
+                if result:
+                    result.extend(["", ""])
+            seen_h2 = True
+        elif stripped.startswith("###"):
+            kind = "h3"
+            if result and result[-1] != "":
+                result.append("")
+        elif _BRIEFING_LIST_ITEM_RE.match(line):
+            kind = "list"
+            if prev_kind in {"h2", "h3"} and result and result[-1] != "":
+                result.append("")
+            elif prev_kind == "list" and result and result[-1] != "":
+                result.append("")
+        else:
+            kind = "text"
+            if prev_kind in {"h2", "h3"} and result and result[-1] != "":
+                result.append("")
+
+        result.append(line)
+        prev_kind = kind
+
+    out = "\n".join(result)
+    out = re.sub(r"\n{4,}", "\n\n\n", out)
+    return out.rstrip() + "\n"
 
 
 def build_skills_block(delegator: AgentDelegator | None) -> str:
