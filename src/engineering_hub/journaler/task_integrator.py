@@ -47,6 +47,8 @@ DEFAULT_EXCLUDED_SECTIONS = (
     "Pending Agent Tasks",
     "Timesheet",
     "Journaler Cross-References",
+    "Morning Briefing",
+    "Discussion Briefing",
 )
 
 _REPLY_MARKER = "Reply (type your answer below this line):"

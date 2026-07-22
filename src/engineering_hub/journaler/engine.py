@@ -24,6 +24,8 @@ from engineering_hub.memory.service import MemoryResult, MemoryService
 
 if TYPE_CHECKING:
     from corpus.service import CorpusService
+    from engineering_hub.journaler.conversation_store import Conversation, ConversationStore
+    from engineering_hub.journaler.daemon import ConversationsConfig
 
 from engineering_hub.actions.file_ingest import read_path_content_for_load
 from engineering_hub.core.exceptions import LLMBackendError
@@ -32,6 +34,7 @@ from engineering_hub.journaler.context_manager import (
     ContextCompressor,
     ContextPressureManager,
     ConversationHistory,
+    ConversationTurn,
     DomainShiftDetector,
     PressureConfig,
     TokenBudget,
@@ -735,6 +738,7 @@ class ConversationEngine:
         self._web_search_anthropic_tool_version = web_search_anthropic_tool_version
         self._web_search_anthropic_max_uses = max(1, web_search_anthropic_max_uses)
         self._loaded_files: dict[str, str] = {}
+        self._loaded_file_paths: dict[str, str] = {}
         self._max_tokens = max_tokens
         self._max_thinking_tokens = max(0, max_thinking_tokens)
         self._log_dir = log_dir
@@ -792,6 +796,143 @@ class ConversationEngine:
         self.active_persona: str = ""
         self.base_system_prompt: str = system_prompt
         self.domain_shift_detector: DomainShiftDetector | None = None
+
+        self.active_conversation: Conversation | None = None
+        self._conversation_store: ConversationStore | None = None
+        self._conversations_config: ConversationsConfig | None = None
+
+    def attach_conversation_store(
+        self,
+        store: ConversationStore,
+        config: ConversationsConfig,
+    ) -> None:
+        """Enable multi-conversation mode with a ConversationStore."""
+        self._conversation_store = store
+        self._conversations_config = config
+        self.pressure_manager.suggest_split_on_topic_shift = (
+            config.suggest_split_on_topic_shift
+        )
+
+    @property
+    def conversation_store(self) -> ConversationStore | None:
+        return self._conversation_store
+
+    def save_session(self) -> None:
+        """Persist outgoing conversation metadata and file manifest."""
+        store = self._conversation_store
+        conv = self.active_conversation
+        if store is None or conv is None:
+            return
+
+        file_manifest = list(self._loaded_file_paths.values())
+        topic = conv.topic
+        if topic is None and self.topic_tracker.current_topic:
+            topic = self.topic_tracker.current_topic
+
+        turn_count = store.count_jsonl_turns(conv.id)
+        if turn_count == 0:
+            turn_count = len(self.history.turns)
+
+        store.update_meta(
+            conv.id,
+            topic=topic,
+            turn_count=turn_count,
+            file_manifest=file_manifest,
+        )
+        if topic and conv.topic != topic:
+            conv.topic = topic
+        conv.file_manifest = file_manifest
+        conv.turn_count = turn_count
+
+    def switch_session(
+        self,
+        conv: Conversation,
+        *,
+        restore_files: bool = False,
+    ) -> str:
+        """Swap to another conversation; returns a user-facing status line."""
+        store = self._conversation_store
+        if store is None:
+            return "Conversations are not enabled."
+
+        self.save_session()
+
+        self.history.clear()
+        max_turns = 20
+        if self._conversations_config is not None:
+            max_turns = self._conversations_config.max_restore_history_turns
+        jsonl_turns = store.read_turns(conv.id, limit=max_turns)
+        self.history.rehydrate_from_jsonl_turns(jsonl_turns)
+
+        self.clear_loaded_files()
+
+        self._log_file = store.jsonl_path(conv.id)
+        self._log_file.parent.mkdir(parents=True, exist_ok=True)
+        if not self._log_file.exists():
+            self._log_file.touch()
+
+        self.session_id = conv.id
+        try:
+            opened = datetime.fromisoformat(conv.created_at.replace("Z", "+00:00"))
+        except ValueError:
+            opened = datetime.now(timezone.utc)
+        self.session_opened_at = opened
+        self.task_planner = TaskPlannerSession(self.session_id, self.session_opened_at)
+
+        self.topic_tracker = TopicTracker()
+        if conv.topic:
+            self.topic_tracker.current_topic = conv.topic
+
+        self.budget.history_tokens = self.history.total_tokens
+        self._sync_loaded_files_budget()
+
+        store.set_active(conv.id)
+        refreshed = store.get(conv.id)
+        self.active_conversation = refreshed if refreshed is not None else conv
+        self.pressure_manager.named_conversation_active = True
+
+        manifest_count = len(self.active_conversation.file_manifest)
+        do_restore = restore_files or (
+            self._conversations_config is not None
+            and self._conversations_config.restore_files_on_switch
+        )
+        restore_msg = ""
+        if do_restore and manifest_count:
+            ok_count, restore_msg = self.restore_session_files()
+
+        parts = [
+            f"Switched to conversation '{self.active_conversation.title}' "
+            f"({self.active_conversation.id})",
+            f"{len(self.history.turns)} turns restored",
+        ]
+        if manifest_count and not do_restore:
+            parts.append(
+                f"{manifest_count} file(s) remembered — /convo restore-files to load"
+            )
+        elif restore_msg:
+            parts.append(restore_msg)
+        return ". ".join(parts) + "."
+
+    def restore_session_files(self) -> tuple[int, str]:
+        """Re-load the active conversation's remembered file paths."""
+        conv = self.active_conversation
+        if conv is None or not conv.file_manifest:
+            return 0, "No remembered files for this conversation."
+
+        loaded = 0
+        skipped: list[str] = []
+        for path_str in conv.file_manifest:
+            path = Path(path_str).expanduser()
+            ok, msg = self.load_file(path)
+            if ok:
+                loaded += 1
+            else:
+                skipped.append(f"{path.name}: {msg}")
+
+        parts = [f"Restored {loaded}/{len(conv.file_manifest)} remembered file(s)"]
+        if skipped:
+            parts.append("Skipped: " + "; ".join(skipped))
+        return loaded, ". ".join(parts)
 
     def get_roam_edit_target(self) -> Path | None:
         """Session target for ``/edit`` (set via ``/open`` in journaler chat)."""
@@ -991,6 +1132,7 @@ class ConversationEngine:
                     state_dir=self._log_dir,
                     max_results=self._pressure_config.past_session_search_k,
                     excerpt_chars=self._pressure_config.past_session_excerpt_chars,
+                    store=self._conversation_store,
                 )
                 session_block = format_past_session_block(session_hits)
                 if session_block:
@@ -1279,6 +1421,12 @@ class ConversationEngine:
                 str(focus_doc.output_path)
                 if focus_doc and focus_doc.output_path
                 else ""
+            ),
+            "active_conversation_id": (
+                self.active_conversation.id if self.active_conversation else ""
+            ),
+            "active_conversation_title": (
+                self.active_conversation.title if self.active_conversation else ""
             ),
         }
 
@@ -1715,6 +1863,7 @@ class ConversationEngine:
 
         label = path.name
         self._loaded_files[label] = content
+        self._loaded_file_paths[label] = str(path)
         self._sync_loaded_files_budget()
 
         size_kb = len(content) / 1024
@@ -1793,6 +1942,7 @@ class ConversationEngine:
     def clear_loaded_files(self) -> None:
         """Remove all loaded files from the context."""
         self._loaded_files.clear()
+        self._loaded_file_paths.clear()
         self._sync_loaded_files_budget()
 
     def list_loaded_files(self) -> list[tuple[str, int]]:

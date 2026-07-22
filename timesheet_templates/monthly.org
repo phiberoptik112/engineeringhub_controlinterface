@@ -1,0 +1,32 @@
+:PROPERTIES:
+:ID:       ${export_id}
+:PURPOSE:  monthly-timesheet-final
+:MONTH:    ${month}
+:PROJECT_ID: ${project_id}
+:END:
+#+title: ${month} Timesheet — ${project}
+#+filetags: :timesheet:monthly:final:${project_tag}:
+#+created: ${created}
+
+* Summary
+
+Project: ${project}
+Month: ${month}
+Client: ${client}
+Total hours: ${total_hours}
+
+* Hours
+
+${entry_lines}
+
+* Time breakdown
+
+${entry_table}
+
+* Notes
+
+${notes}
+
+* Review
+
+${review}

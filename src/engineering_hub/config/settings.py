@@ -397,6 +397,10 @@ class Settings(BaseSettings):
         default="09:00",
         description="Time for morning briefing (HH:MM, local time)",
     )
+    journaler_briefing_append_to_journal: bool = Field(
+        default=True,
+        description="Upsert morning and discussion briefings into today's org journal",
+    )
     journaler_end_of_day_time: str = Field(
         default="15:30",
         description="Time to generate the daily conversation summary and archive history (HH:MM, local time)",
@@ -501,6 +505,8 @@ class Settings(BaseSettings):
             "Pending Agent Tasks",
             "Timesheet",
             "Journaler Cross-References",
+            "Morning Briefing",
+            "Discussion Briefing",
         ],
         description="Daily-journal headings the Task-Integrator must not read as intake (agent-managed sections)",
     )
@@ -620,6 +626,10 @@ class Settings(BaseSettings):
         default=None,
         description="Directory of skill YAML files for Journaler agent delegation",
     )
+    journaler_timesheet_export_template: Path | None = Field(
+        default=None,
+        description="Org template for /timesheet export (default: repo timesheet_templates/monthly.org)",
+    )
     journaler_anthropic_api_key: SecretStr | None = Field(
         default=None,
         description="Optional Anthropic key for Journaler /agent; falls back to anthropic_api_key",
@@ -687,6 +697,35 @@ class Settings(BaseSettings):
     journaler_org_link_on_relation: bool = Field(
         default=True,
         description="When True, write a cross-reference link into today's journal when a related past conversation is detected",
+    )
+    journaler_conversations_enabled: bool = Field(
+        default=True,
+        description="Enable named multi-conversation support (/convo)",
+    )
+    journaler_conversations_db_path: Path | None = Field(
+        default=None,
+        description="Path to conversations.db (default: .journaler/conversations.db)",
+    )
+    journaler_conversations_store_dir: Path | None = Field(
+        default=None,
+        description="Directory for per-conversation stores (default: .journaler/conversations)",
+    )
+    journaler_conversations_default_project: int | None = Field(
+        default=None,
+        description="Default Django project id for new conversations",
+    )
+    journaler_conversations_restore_files_on_switch: bool = Field(
+        default=False,
+        description="Auto-reload remembered files when switching conversations",
+    )
+    journaler_conversations_max_restore_history_turns: int = Field(
+        default=20,
+        ge=1,
+        description="Max turns to rehydrate from JSONL on conversation switch",
+    )
+    journaler_conversations_suggest_split_on_topic_shift: bool = Field(
+        default=True,
+        description="Suggest /convo new on topic drift instead of auto-compress",
     )
 
     # Zettelkasten proposal workflow
@@ -928,6 +967,16 @@ class Settings(BaseSettings):
         if self.journaler_pending_tasks_file is not None:
             return Path(self.journaler_pending_tasks_file).expanduser().resolve()
         return (self.workspace_dir / ".journaler" / "pending-tasks.org").resolve()
+
+    @property
+    def resolved_timesheet_export_template(self) -> Path:
+        """Effective org template for monthly ``/timesheet export``."""
+        if self.journaler_timesheet_export_template is not None:
+            return Path(self.journaler_timesheet_export_template).expanduser()
+        from engineering_hub.journaler.timesheet_export import (
+            default_timesheet_export_template_path,
+        )
+        return default_timesheet_export_template_path()
 
     @property
     def resolved_journaler_model_path(self) -> str:
@@ -1189,6 +1238,10 @@ class Settings(BaseSettings):
                 flat_config["journaler_briefing_enabled"] = j["briefing_enabled"]
             if j.get("briefing_time"):
                 flat_config["journaler_briefing_time"] = j["briefing_time"]
+            if j.get("briefing_append_to_journal") is not None:
+                flat_config["journaler_briefing_append_to_journal"] = bool(
+                    j["briefing_append_to_journal"]
+                )
             if j.get("end_of_day_time"):
                 flat_config["journaler_end_of_day_time"] = j["end_of_day_time"]
             if j.get("discussion_briefing_enabled") is not None:
@@ -1321,6 +1374,10 @@ class Settings(BaseSettings):
                 flat_config["journaler_agent_backend"] = j["agent_backend"]
             if j.get("skills_dir"):
                 flat_config["journaler_skills_dir"] = Path(j["skills_dir"]).expanduser()
+            if j.get("timesheet_export_template"):
+                flat_config["journaler_timesheet_export_template"] = Path(
+                    j["timesheet_export_template"]
+                ).expanduser()
             j_anthropic = j.get("anthropic_api_key")
             if j_anthropic:
                 flat_config["journaler_anthropic_api_key"] = SecretStr(str(j_anthropic))
@@ -1370,6 +1427,34 @@ class Settings(BaseSettings):
                 flat_config["journaler_org_link_on_relation"] = bool(
                     j["org_link_on_relation"]
                 )
+            conv = j.get("conversations")
+            if isinstance(conv, dict):
+                if conv.get("enabled") is not None:
+                    flat_config["journaler_conversations_enabled"] = bool(conv["enabled"])
+                if conv.get("db_path"):
+                    flat_config["journaler_conversations_db_path"] = Path(
+                        conv["db_path"]
+                    ).expanduser()
+                if conv.get("store_dir"):
+                    flat_config["journaler_conversations_store_dir"] = Path(
+                        conv["store_dir"]
+                    ).expanduser()
+                if conv.get("default_project") is not None:
+                    flat_config["journaler_conversations_default_project"] = int(
+                        conv["default_project"]
+                    )
+                if conv.get("restore_files_on_switch") is not None:
+                    flat_config["journaler_conversations_restore_files_on_switch"] = bool(
+                        conv["restore_files_on_switch"]
+                    )
+                if conv.get("max_restore_history_turns") is not None:
+                    flat_config["journaler_conversations_max_restore_history_turns"] = int(
+                        conv["max_restore_history_turns"]
+                    )
+                if conv.get("suggest_split_on_topic_shift") is not None:
+                    flat_config["journaler_conversations_suggest_split_on_topic_shift"] = bool(
+                        conv["suggest_split_on_topic_shift"]
+                    )
 
         if "agents" in config:
             agents = config["agents"]

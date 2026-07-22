@@ -260,11 +260,15 @@ class QuickContextPanel(Vertical):
         else:
             files = []
 
-        conversation_log = state_dir / "conversation.jsonl"
+        conversation_log = getattr(self._engine, "_log_file", state_dir / "conversation.jsonl")
         if conversation_log.exists():
+            active = getattr(self._engine, "active_conversation", None)
+            preview = "Full conversation log (current session)"
+            if active is not None:
+                preview = f"Active: {active.title} ({active.id})"
             item = ContextFileItem(
                 conversation_log,
-                preview="Full conversation log (current session)",
+                preview=preview,
             )
             if self._is_loaded(conversation_log):
                 item.add_class("--loaded")

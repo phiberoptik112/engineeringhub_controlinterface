@@ -229,10 +229,19 @@ def _execute_journaler_export(
         return 1
 
     state_dir = settings.journaler_state_dir
+    from engineering_hub.journaler.conversations_config import (
+        build_store_from_config,
+        conversations_config_from_settings,
+        resolve_transcript_path,
+    )
+
+    conv_cfg = conversations_config_from_settings(settings)
+    store = build_store_from_config(state_dir, conv_cfg)
+    default_jsonl = resolve_transcript_path(state_dir, store=store)
     jsonl_path = (
         Path(jsonl_override).expanduser().resolve()
         if jsonl_override
-        else state_dir / "conversation.jsonl"
+        else default_jsonl
     )
 
     if not jsonl_path.is_file():
@@ -1049,6 +1058,8 @@ def _handle_chat_slash_command(
       /files                     List all currently loaded files.
       /files clear               Remove all loaded files from the context.
       /clear [--hard|--summarize] Clear conversation history (soft by default).
+      /convo                       Open conversation picker (interactive).
+      /convo new|list|status|…     Switch or manage named conversations.
       /summarize                 Generate today's daily summary now and archive history.
       /status                    Show context management state (pressure, turns, etc.)
       /budget                    Show token budget breakdown.
@@ -1617,6 +1628,8 @@ def _handle_chat_slash_command(
             "  [cyan]/budget[/cyan]                    Show token budget breakdown\n"
             "  [cyan]/output[/cyan]                    Show/set output-limit policy (summarize/continue/stop)\n"
             "  [cyan]/topic[/cyan]                     Show currently detected conversation topic\n"
+            "  [cyan]/convo[/cyan]                     Browse/switch named conversations (picker)\n"
+            "  [cyan]/convo new|list|status|…[/cyan]   Manage conversation sessions\n"
             "  [cyan]/agent <type> <desc>[/cyan]      Delegate to a named agent (see README)\n"
             "  [cyan]/history <query>[/cyan]           Retrieve prior chat excerpts\n"
             "  [cyan]/history --agent <type> <query>[/cyan]  Have an agent review retrieved history\n"
@@ -1639,7 +1652,15 @@ def _handle_chat_slash_command(
         if journal_dir is None:
             chat_console.print("[yellow]/timesheet requires a daily journal directory.[/yellow]")
             return
-        msg = handle_timesheet_slash_command(raw, journal_dir)
+        msg = handle_timesheet_slash_command(
+            raw,
+            journal_dir,
+            export_template=(
+                export_settings.resolved_timesheet_export_template
+                if export_settings is not None
+                else None
+            ),
+        )
         chat_console.print(f"[green]{escape(msg)}[/green]")
         return
 
@@ -1658,6 +1679,54 @@ def _handle_chat_slash_command(
             for label, char_count in entries:
                 chat_console.print(f"  [cyan]{label}[/cyan]  ({char_count:,} chars)")
             chat_console.print()
+        return
+
+    if cmd == "/convo":
+        from engineering_hub.journaler.convo_slash import handle_convo_command
+        from engineering_hub.journaler.file_browser import _NEW_CONVERSATION, browse_conversations
+
+        conv_cfg = (
+            export_config.get_conversations_config()
+            if export_config is not None and hasattr(export_config, "get_conversations_config")
+            else None
+        )
+        default_project = conv_cfg.default_project if conv_cfg else None
+
+        def _run_picker() -> str:
+            store = engine.conversation_store
+            if store is None:
+                return "Multi-conversation mode is disabled."
+            chat_console.print("[dim]Opening conversation picker...[/dim]")
+            choice = browse_conversations(store.list(), resolve_project=None)
+            if choice is None:
+                return "Conversation picker cancelled."
+            if choice == _NEW_CONVERSATION:
+                try:
+                    title = input("Title for new conversation: ").strip()
+                except (KeyboardInterrupt, EOFError):
+                    return "Cancelled."
+                if not title:
+                    return "Cancelled."
+                conv = store.create(title, project_id=default_project)
+                return engine.switch_session(conv)
+            return engine.switch_session(choice)
+
+        def _confirm_delete(target_id: str) -> bool:
+            try:
+                ans = input(f"Delete conversation '{target_id}'? [y/N] ").strip().lower()
+            except (KeyboardInterrupt, EOFError):
+                return False
+            return ans in ("y", "yes")
+
+        result = handle_convo_command(
+            raw,
+            engine,
+            default_project=default_project,
+            interactive_picker=_run_picker if len(parts) == 1 else None,
+            confirm_delete=_confirm_delete,
+        )
+        if result:
+            chat_console.print(f"[green]{escape(result)}[/green]")
         return
 
     if cmd == "/clear":
@@ -2322,6 +2391,7 @@ def cmd_journaler(args: argparse.Namespace) -> int:
 
     from engineering_hub.corpus_service_factory import build_corpus_service_from_settings
     from engineering_hub.journaler.context import JournalContext
+    from engineering_hub.journaler.conversations_config import conversations_config_from_settings
     from engineering_hub.journaler.daemon import (
         JournalerConfig,
         generate_briefing_now,
@@ -2357,6 +2427,7 @@ def cmd_journaler(args: argparse.Namespace) -> int:
         briefing_enabled=settings.journaler_briefing_enabled,
         briefing_time=settings.journaler_briefing_time,
         briefing_output_dir=settings.journaler_briefing_output_dir,
+        briefing_append_to_journal=settings.journaler_briefing_append_to_journal,
         chat_enabled=settings.journaler_chat_enabled,
         chat_host=settings.journaler_chat_host,
         chat_port=settings.journaler_chat_port,
@@ -2433,6 +2504,7 @@ def cmd_journaler(args: argparse.Namespace) -> int:
         task_integrator_max_questions=settings.journaler_task_integrator_max_questions,
         task_integrator_weekdays_only=settings.journaler_task_integrator_weekdays_only,
         task_integrator_max_tokens=settings.journaler_task_integrator_max_tokens,
+        conversations=conversations_config_from_settings(settings),
     )
 
     if sub == "start":
@@ -2538,6 +2610,12 @@ def cmd_journaler(args: argparse.Namespace) -> int:
         # Interactive truncation recovery menu for output_limit.policy == "prompt".
         engine.set_output_choice_provider(_interactive_output_choice(console))
 
+        from engineering_hub.journaler.conversations_config import attach_conversations_to_engine
+
+        conv_status = attach_conversations_to_engine(engine, config)
+        if conv_status:
+            console.print(f"[dim]{escape(conv_status)}[/dim]")
+
         delegator = build_delegator(
             backend,
             anthropic_api_key=settings.journaler_delegation_api_key(),
@@ -2568,10 +2646,10 @@ def cmd_journaler(args: argparse.Namespace) -> int:
 
         configure_chat_readline(
             config.state_dir,
-            conversation_jsonl=config.state_dir / "conversation.jsonl",
+            conversation_jsonl=engine._log_file,
         )
 
-        transcript_path = config.state_dir / "conversation.jsonl"
+        transcript_path = engine._log_file
         max_hist = config.max_conversation_history
         console.print(
             "[green]Journaler ready. "
@@ -2815,6 +2893,10 @@ def cmd_journaler(args: argparse.Namespace) -> int:
             web_search_anthropic_tool_version=config.web_search_anthropic_tool_version,
             web_search_anthropic_max_uses=config.web_search_anthropic_max_uses,
         )
+
+        from engineering_hub.journaler.conversations_config import attach_conversations_to_engine
+
+        attach_conversations_to_engine(engine, config)
 
         delegator = build_delegator(
             backend,

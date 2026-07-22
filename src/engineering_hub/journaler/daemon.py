@@ -37,6 +37,7 @@ from engineering_hub.journaler.model_profiles import (
 )
 from engineering_hub.journaler.models import ContextSnapshot
 from engineering_hub.journaler.output_limit import OutputLimitConfig
+from engineering_hub.journaler.org_writer import upsert_section_in_today_journal
 from engineering_hub.journaler.prompts import (
     build_skills_block,
     build_workspace_layout,
@@ -80,6 +81,19 @@ logger = logging.getLogger(__name__)
 
 
 @dataclass
+class ConversationsConfig:
+    """Multi-conversation (/convo) settings."""
+
+    enabled: bool = True
+    db_path: Path | None = None
+    store_dir: Path | None = None
+    default_project: int | None = None
+    restore_files_on_switch: bool = False
+    max_restore_history_turns: int = 20
+    suggest_split_on_topic_shift: bool = True
+
+
+@dataclass
 class JournalerConfig:
     """All settings needed to run the Journaler daemon."""
 
@@ -93,6 +107,7 @@ class JournalerConfig:
     briefing_enabled: bool = True
     briefing_time: str = "09:00"
     briefing_output_dir: Path | None = None
+    briefing_append_to_journal: bool = True
 
     # Discussion briefing (multi-persona roundtable)
     discussion_briefing_enabled: bool = False
@@ -217,6 +232,13 @@ class JournalerConfig:
     roam_task_max_files: int = 30
     prose_completion_detection: bool = True
 
+    # Multi-conversation (/convo) settings
+    conversations: ConversationsConfig | None = None
+
+    def get_conversations_config(self) -> ConversationsConfig:
+        """Return conversations config with defaults."""
+        return self.conversations or ConversationsConfig()
+
     def get_pressure_config(self) -> PressureConfig:
         """Return the PressureConfig, defaulting from scalar fields if not set."""
         if self.context_management is not None:
@@ -258,6 +280,17 @@ def pressure_config_from_settings(
 def output_limit_config_from_settings(settings: Settings) -> OutputLimitConfig:
     """Build the Journaler output-length config from YAML-backed settings."""
     return OutputLimitConfig.from_raw(dict(settings.journaler_output_limit or {}))
+
+
+def _resolve_chat_log_file(config: JournalerConfig) -> Path:
+    """Active conversation JSONL path for chat lookback helpers."""
+    from engineering_hub.journaler.conversations_config import (
+        build_store_from_config,
+        resolve_transcript_path,
+    )
+
+    store = build_store_from_config(config.state_dir, config.get_conversations_config())
+    return resolve_transcript_path(config.state_dir, store=store)
 
 
 def run_daemon(config: JournalerConfig, settings: Settings | None = None) -> None:
@@ -338,6 +371,12 @@ def run_daemon(config: JournalerConfig, settings: Settings | None = None) -> Non
         web_search_anthropic_tool_version=config.web_search_anthropic_tool_version,
         web_search_anthropic_max_uses=config.web_search_anthropic_max_uses,
     )
+
+    from engineering_hub.journaler.conversations_config import attach_conversations_to_engine
+
+    conv_msg = attach_conversations_to_engine(engine, config)
+    if conv_msg:
+        logger.info("Conversations: %s", conv_msg)
 
     # Do initial scan
     logger.info("Running initial scan...")
@@ -571,6 +610,67 @@ def run_daemon(config: JournalerConfig, settings: Settings | None = None) -> Non
         logger.info("Journaler daemon stopped.")
 
 
+MORNING_BRIEFING_JOURNAL_HEADING = "Morning Briefing"
+DISCUSSION_BRIEFING_JOURNAL_HEADING = "Discussion Briefing"
+
+
+def _write_briefing_to_journal(
+    config: JournalerConfig,
+    *,
+    heading: str,
+    text: str,
+) -> None:
+    """Upsert briefing content into today's org journal (non-fatal on failure)."""
+    if not config.briefing_append_to_journal:
+        return
+    ok, msg = upsert_section_in_today_journal(config.journal_dir, heading, text)
+    if ok:
+        logger.info("Briefing appended to org journal: %s", msg)
+    else:
+        logger.warning("Could not append briefing to org journal: %s", msg)
+
+
+def _persist_morning_briefing(
+    config: JournalerConfig,
+    today_str: str,
+    briefing: str,
+) -> Path:
+    """Write morning briefing to state dir and today's org journal."""
+    output_dir = config.briefing_output_dir or (config.state_dir / "briefings")
+    output_dir.mkdir(parents=True, exist_ok=True)
+    output_path = output_dir / f"{today_str}.md"
+    output_path.write_text(
+        f"# Morning Briefing — {today_str}\n\n{briefing}",
+        encoding="utf-8",
+    )
+    logger.info("Morning briefing written to %s", output_path)
+    _write_briefing_to_journal(
+        config,
+        heading=MORNING_BRIEFING_JOURNAL_HEADING,
+        text=briefing,
+    )
+    return output_path
+
+
+def _persist_discussion_briefing(
+    config: JournalerConfig,
+    today_str: str,
+    discussion: str,
+) -> Path:
+    """Write discussion briefing to state dir and today's org journal."""
+    output_dir = config.briefing_output_dir or (config.state_dir / "briefings")
+    output_dir.mkdir(parents=True, exist_ok=True)
+    output_path = output_dir / f"discussion-{today_str}.md"
+    output_path.write_text(discussion, encoding="utf-8")
+    logger.info("Discussion briefing written to %s", output_path)
+    _write_briefing_to_journal(
+        config,
+        heading=DISCUSSION_BRIEFING_JOURNAL_HEADING,
+        text=discussion,
+    )
+    return output_path
+
+
 def generate_briefing_now(
     config: JournalerConfig,
     context: JournalContext | None = None,
@@ -638,15 +738,7 @@ def generate_briefing_now(
         )
     )
 
-    # Save to file
-    output_dir = config.briefing_output_dir or (config.state_dir / "briefings")
-    output_dir.mkdir(parents=True, exist_ok=True)
-    output_path = output_dir / f"{today_str}.md"
-    output_path.write_text(
-        f"# Morning Briefing — {today_str}\n\n{briefing}",
-        encoding="utf-8",
-    )
-    logger.info(f"Briefing written to {output_path}")
+    _persist_morning_briefing(config, today_str, briefing)
 
     return briefing
 
@@ -743,11 +835,7 @@ def generate_discussion_now(
         topic="on-demand discussion briefing",
     )
 
-    output_dir = config.briefing_output_dir or (config.state_dir / "briefings")
-    output_dir.mkdir(parents=True, exist_ok=True)
-    output_path = output_dir / f"discussion-{today_str}.md"
-    output_path.write_text(discussion, encoding="utf-8")
-    logger.info("Discussion briefing written to %s", output_path)
+    _persist_discussion_briefing(config, today_str, discussion)
 
     return discussion
 
@@ -763,7 +851,14 @@ def generate_summary_now(config: JournalerConfig) -> Path:
 
     from engineering_hub.journaler.context_manager import ConversationTurn
 
-    log_file = config.state_dir / "conversation.jsonl"
+    from engineering_hub.journaler.conversations_config import (
+        build_store_from_config,
+        resolve_transcript_path,
+    )
+
+    conv_cfg = config.get_conversations_config()
+    store = build_store_from_config(config.state_dir, conv_cfg)
+    log_file = resolve_transcript_path(config.state_dir, store=store)
     today_prefix = date.today().isoformat()  # "YYYY-MM-DD"
 
     today_turns: list[ConversationTurn] = []
@@ -1007,14 +1102,7 @@ def _morning_briefing(
         )
     )
 
-    output_dir = config.briefing_output_dir or (config.state_dir / "briefings")
-    output_dir.mkdir(parents=True, exist_ok=True)
-    briefing_path = output_dir / f"{today_str}.md"
-    briefing_path.write_text(
-        f"# Morning Briefing — {today_str}\n\n{briefing}",
-        encoding="utf-8",
-    )
-    logger.info(f"Morning briefing generated: {briefing_path}")
+    _persist_morning_briefing(config, today_str, briefing)
 
     if slack:
         slack.post_briefing(briefing)
@@ -1079,11 +1167,7 @@ def _discussion_briefing(
         topic="morning discussion briefing",
     )
 
-    output_dir = config.briefing_output_dir or (config.state_dir / "briefings")
-    output_dir.mkdir(parents=True, exist_ok=True)
-    discussion_path = output_dir / f"discussion-{today_str}.md"
-    discussion_path.write_text(discussion, encoding="utf-8")
-    logger.info("Discussion briefing generated: %s", discussion_path)
+    _persist_discussion_briefing(config, today_str, discussion)
 
     if task_extractor is not None and work_queue is not None:
         _extract_and_queue_tasks(
@@ -1187,7 +1271,9 @@ def _background_work_tick(
 
     briefing_context = context.get_briefing_context()
     chat_excerpt = _read_recent_chat_context(
-        config.state_dir, lookback_days=config.background_work_chat_lookback_days
+        config.state_dir,
+        lookback_days=config.background_work_chat_lookback_days,
+        log_file=_resolve_chat_log_file(config),
     )
     enriched_context = briefing_context
     if chat_excerpt and chat_excerpt != "(no recent chat activity)":
@@ -1283,7 +1369,10 @@ def _end_of_day_clear(
     briefing_text = _read_todays_briefing(config)
     work_status_text = _read_todays_work_status(config)
     chat_excerpt = _read_recent_chat_context(
-        config.state_dir, lookback_days=0, max_chars=3000
+        config.state_dir,
+        lookback_days=0,
+        max_chars=3000,
+        log_file=_resolve_chat_log_file(config),
     )
 
     eod_prompt_parts = [

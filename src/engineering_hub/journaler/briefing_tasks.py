@@ -91,13 +91,15 @@ def _read_recent_chat_context(
     *,
     lookback_days: int = 3,
     max_chars: int = 3000,
+    log_file: Path | None = None,
 ) -> str:
-    """Read recent user turns from conversation.jsonl for priority signals.
+    """Read recent user turns from conversation JSONL for priority signals.
 
     Returns a condensed excerpt of user messages, focusing on topics discussed,
     questions asked, and /agent commands already run.
     """
-    log_file = state_dir / "conversation.jsonl"
+    if log_file is None:
+        log_file = state_dir / "conversation.jsonl"
     if not log_file.exists():
         return ""
 

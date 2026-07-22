@@ -198,6 +198,13 @@ DEFAULT_AGENT_CONFIGS = {
         tools=[],
         max_tokens=6000,
     ),
+    AgentType.TIMESHEET_REVIEWER: AgentConfig(
+        agent_type=AgentType.TIMESHEET_REVIEWER,
+        prompt_file="timesheet-reviewer.txt",
+        model_class=ModelClass.REASONING,
+        tools=[],
+        max_tokens=6000,
+    ),
 }
 
 

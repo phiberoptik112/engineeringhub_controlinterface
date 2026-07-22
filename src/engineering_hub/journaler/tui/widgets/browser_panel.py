@@ -25,7 +25,7 @@ from textual.widgets import Input, Label, ListItem, ListView, Static
 if TYPE_CHECKING:
     pass
 
-BrowserMode = Literal["load", "edit", "skills", "capture", "models"]
+BrowserMode = Literal["load", "edit", "skills", "capture", "models", "conversations"]
 
 SUPPORTED_EXTENSIONS = frozenset({
     ".md", ".txt", ".org", ".py", ".yaml", ".yml",
@@ -231,6 +231,8 @@ class BrowserPanel(Vertical):
             skill: Any = None,
             template: Any = None,
             model_entry: Any = None,
+            conversation: Any = None,
+            new_conversation: bool = False,
         ) -> None:
             super().__init__()
             self.mode = mode
@@ -238,6 +240,8 @@ class BrowserPanel(Vertical):
             self.skill = skill
             self.template = template
             self.model_entry = model_entry
+            self.conversation = conversation
+            self.new_conversation = new_conversation
 
     class Cancelled(Message):
         """Posted when the user presses Escape or explicitly cancels."""
@@ -353,6 +357,8 @@ class BrowserPanel(Vertical):
             self._build_capture_list(lv)
         elif self._mode == "models":
             self._build_models_list(lv)
+        elif self._mode == "conversations":
+            self._build_conversations_list(lv)
 
     def _build_file_list(self, lv: ListView) -> None:
         root = self._root
@@ -440,6 +446,18 @@ class BrowserPanel(Vertical):
     # Header / footer
     # ------------------------------------------------------------------
 
+    def _build_conversations_list(self, lv: ListView) -> None:
+        query = self.query_one("#bp-filter", Input).value.strip().lower()
+        lv.append(BrowserItem("  ＋ New conversation", "__new__"))
+        for item in self._items:
+            title = getattr(item, "title", str(item))
+            conv_id = getattr(item, "id", "")
+            turns = getattr(item, "turn_count", 0)
+            label = f"  {title}  ({conv_id}, {turns} turns)"
+            if query and query not in label.lower():
+                continue
+            lv.append(BrowserItem(label, item))
+
     def _update_header(self) -> None:
         header = self.query_one("#bp-header", Static)
         if self._mode == "load":
@@ -456,6 +474,8 @@ class BrowserPanel(Vertical):
             header.update(" 📋 Capture Browse: Select a capture template")
         elif self._mode == "models":
             header.update(" 🧠 Model Browse: Select an MLX model")
+        elif self._mode == "conversations":
+            header.update(" 💬 Conversations: Select or create")
 
     def _update_footer(self) -> None:
         footer = self.query_one("#bp-footer", Static)
@@ -561,3 +581,9 @@ class BrowserPanel(Vertical):
 
         elif self._mode == "models":
             self.post_message(self.Confirmed(self._mode, model_entry=item.entry))
+
+        elif self._mode == "conversations":
+            if item.entry == "__new__":
+                self.post_message(self.Confirmed(self._mode, new_conversation=True))
+            else:
+                self.post_message(self.Confirmed(self._mode, conversation=item.entry))

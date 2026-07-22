@@ -172,6 +172,32 @@ class ConversationHistory:
         self._archive.clear()
         return archived
 
+    def clear(self) -> None:
+        """Drop all in-memory turns and pending archive."""
+        self.turns.clear()
+        self._archive.clear()
+
+    def rehydrate_from_jsonl_turns(self, turns: list[dict]) -> None:
+        """Load turns from JSONL dicts (preserving timestamps)."""
+        self.clear()
+        for raw in turns:
+            role = raw.get("role")
+            content = raw.get("content")
+            if not isinstance(role, str) or not isinstance(content, str):
+                continue
+            if not content.strip():
+                continue
+            ts = raw.get("timestamp")
+            if not isinstance(ts, str) or not ts:
+                ts = datetime.now(timezone.utc).isoformat()
+            turn = ConversationTurn(
+                role=role,
+                content=content,
+                timestamp=ts,
+                tokens=estimate_tokens(content),
+            )
+            self.turns.append(turn)
+
 
 # ---------------------------------------------------------------------------
 # Compression (Strategy 2)
@@ -695,6 +721,8 @@ class ContextPressureManager:
         self.compressor = compressor
         self.topic_tracker = topic_tracker
         self.config = config
+        self.named_conversation_active: bool = False
+        self.suggest_split_on_topic_shift: bool = True
 
     def pre_call_check(self) -> list[str]:
         """Run before every model call. Returns action descriptions (empty if none)."""
@@ -743,14 +771,20 @@ class ContextPressureManager:
         actions: list[str] = []
 
         shift = self.topic_tracker.observe(user_message, response)
-        if shift and self.config.auto_clear_on_topic_shift:
-            result = self.compressor.compress(self.history)
-            if result.compressed:
+        if shift:
+            if self.named_conversation_active and self.suggest_split_on_topic_shift:
                 actions.append(
-                    f"[Topic shifted: {shift.old_topic} → {shift.new_topic}, "
-                    f"archived {result.turns_compressed} earlier turns]"
+                    f"[Topic drifted to {shift.new_topic} — "
+                    f"/convo new to split it out?]"
                 )
-                self.budget.history_tokens = self.history.total_tokens
+            elif self.config.auto_clear_on_topic_shift:
+                result = self.compressor.compress(self.history)
+                if result.compressed:
+                    actions.append(
+                        f"[Topic shifted: {shift.old_topic} → {shift.new_topic}, "
+                        f"archived {result.turns_compressed} earlier turns]"
+                    )
+                    self.budget.history_tokens = self.history.total_tokens
 
         return actions
 

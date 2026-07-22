@@ -203,6 +203,9 @@ _AGENT_ALIASES: dict[str, str] = {
     "compliance-advisor": "compliance-advisor",
     "compliance": "compliance-advisor",
     "legal-review": "compliance-advisor",
+    "timesheet-reviewer": "timesheet-reviewer",
+    "timesheet": "timesheet-reviewer",
+    "timesheets": "timesheet-reviewer",
 }
 
 

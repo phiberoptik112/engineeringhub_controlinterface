@@ -13,7 +13,7 @@ import textwrap
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Callable
 
 if TYPE_CHECKING:
     from engineering_hub.journaler.delegator import SkillDef
@@ -1514,3 +1514,187 @@ def _browse_captures_inner(
             cursor = 0
         elif key == curses.KEY_END:
             cursor = len(templates) - 1
+
+
+# ---------------------------------------------------------------------------
+# Conversation picker (used by /convo)
+# ---------------------------------------------------------------------------
+
+_NEW_CONVERSATION = "__new__"
+
+
+def _relative_time_short(iso_ts: str) -> str:
+    try:
+        ts = datetime.fromisoformat(iso_ts.replace("Z", "+00:00"))
+    except ValueError:
+        return iso_ts[:10] if iso_ts else ""
+    delta = datetime.now() - ts.replace(tzinfo=None)
+    secs = int(delta.total_seconds())
+    if secs < 3600:
+        return f"{max(1, secs // 60)}m ago"
+    if secs < 86400:
+        return f"{secs // 3600}h ago"
+    if secs < 172800:
+        return "yesterday"
+    return f"{secs // 86400}d ago"
+
+
+def _group_conversations(
+    conversations: list,
+    resolve_project: Callable[[int], str] | None,
+) -> list[tuple[str, list]]:
+    """Return (group_label, convs) sorted by updated_at within group."""
+    from engineering_hub.journaler.conversation_store import Conversation
+
+    by_project: dict[str, list[Conversation]] = {}
+    by_topic: dict[str, list[Conversation]] = {}
+    ungrouped: list[Conversation] = []
+
+    for conv in conversations:
+        if not isinstance(conv, Conversation):
+            continue
+        if conv.project_id is not None:
+            label = f"Project {conv.project_id}"
+            if resolve_project is not None:
+                try:
+                    label = resolve_project(conv.project_id)
+                except Exception:
+                    pass
+            by_project.setdefault(label, []).append(conv)
+        elif conv.topic:
+            by_topic.setdefault(f"Topic: {conv.topic}", []).append(conv)
+        else:
+            ungrouped.append(conv)
+
+    groups: list[tuple[str, list]] = []
+    for label in sorted(by_project.keys()):
+        convs = sorted(by_project[label], key=lambda c: c.updated_at, reverse=True)
+        groups.append((label, convs))
+    for label in sorted(by_topic.keys()):
+        convs = sorted(by_topic[label], key=lambda c: c.updated_at, reverse=True)
+        groups.append((label, convs))
+    if ungrouped:
+        convs = sorted(ungrouped, key=lambda c: c.updated_at, reverse=True)
+        groups.append(("Ungrouped", convs))
+    return groups
+
+
+def browse_conversations(
+    conversations: list,
+    resolve_project: Callable[[int], str] | None = None,
+) -> object | None:
+    """Open conversation picker. Returns Conversation, NEW sentinel str, or None."""
+    from engineering_hub.journaler.conversation_store import Conversation
+
+    rows: list[tuple[str, Conversation | str | None, bool]] = []
+    rows.append(("+ New conversation", _NEW_CONVERSATION, False))
+    for group_label, convs in _group_conversations(conversations, resolve_project):
+        rows.append((group_label, None, True))
+        for conv in convs:
+            rel = _relative_time_short(conv.updated_at)
+            line = f"  {conv.title}  {conv.turn_count} turns  {rel}"
+            rows.append((line, conv, False))
+
+    try:
+        return curses.wrapper(_browse_conversations_inner, rows)
+    except Exception:
+        return None
+
+
+def _browse_conversations_inner(
+    stdscr: curses.window,
+    rows: list[tuple[str, object | None, bool]],
+) -> object | None:
+    from engineering_hub.journaler.conversation_store import Conversation
+
+    _init_colors()
+    curses.curs_set(0)
+    stdscr.keypad(True)
+
+    selectable = [i for i, (_, entry, is_header) in enumerate(rows) if not is_header]
+    cursor = 0
+    scroll_offset = 0
+
+    while True:
+        stdscr.erase()
+        max_y, max_x = stdscr.getmaxyx()
+        header_lines = 2
+        footer_lines = 2
+        list_height = max(1, max_y - header_lines - footer_lines)
+
+        stdscr.attron(curses.color_pair(_CP_HEADER) | curses.A_BOLD)
+        stdscr.addnstr(0, 0, " Browse: Conversations", max_x - 1)
+        stdscr.attroff(curses.color_pair(_CP_HEADER) | curses.A_BOLD)
+        stdscr.addnstr(1, 0, "─" * max_x, max_x)
+
+        if not selectable:
+            stdscr.addnstr(header_lines + 1, 2, "(no conversations)", max_x - 3)
+        else:
+            cursor = max(0, min(cursor, len(selectable) - 1))
+            target_row = selectable[cursor]
+            if target_row < scroll_offset:
+                scroll_offset = target_row
+            if target_row >= scroll_offset + list_height:
+                scroll_offset = target_row - list_height + 1
+
+            for i in range(list_height):
+                vr = scroll_offset + i
+                if vr >= len(rows):
+                    break
+                text, entry, is_header = rows[vr]
+                row_y = header_lines + i
+                if row_y >= max_y - footer_lines:
+                    break
+                is_active = vr == selectable[cursor]
+                if is_header:
+                    attr = curses.color_pair(_CP_CATEGORY) | curses.A_BOLD | curses.A_DIM
+                    line = f" ▸ {text.lstrip()}"
+                elif is_active:
+                    attr = curses.color_pair(_CP_CURSOR) | curses.A_BOLD
+                    line = f" >{text}"
+                else:
+                    attr = curses.color_pair(_CP_FILE)
+                    line = text
+                try:
+                    stdscr.addnstr(row_y, 0, line.ljust(max_x), max_x - 1, attr)
+                except curses.error:
+                    pass
+
+        footer_y = max_y - footer_lines
+        if footer_y > header_lines:
+            try:
+                stdscr.addnstr(footer_y, 0, "─" * max_x, max_x)
+                stdscr.addnstr(
+                    footer_y + 1,
+                    0,
+                    " ↑↓ navigate  Enter select  Esc cancel",
+                    max_x - 1,
+                    curses.color_pair(_CP_FOOTER),
+                )
+            except curses.error:
+                pass
+        stdscr.refresh()
+
+        key = stdscr.getch()
+        if key in (27, ord("q")):
+            return None
+        if key == curses.KEY_UP or key == ord("k"):
+            if cursor > 0:
+                cursor -= 1
+        elif key == curses.KEY_DOWN or key == ord("j"):
+            if cursor < len(selectable) - 1:
+                cursor += 1
+        elif key == curses.KEY_SR:
+            cursor = max(0, cursor - _FAST_SCROLL_LINES)
+        elif key == curses.KEY_SF:
+            cursor = min(len(selectable) - 1, cursor + _FAST_SCROLL_LINES)
+        elif key in (curses.KEY_ENTER, 10, 13):
+            _, entry, _ = rows[selectable[cursor]]
+            if entry == _NEW_CONVERSATION:
+                return _NEW_CONVERSATION
+            if isinstance(entry, Conversation):
+                return entry
+        elif key == curses.KEY_HOME:
+            cursor = 0
+        elif key == curses.KEY_END:
+            cursor = max(0, len(selectable) - 1)

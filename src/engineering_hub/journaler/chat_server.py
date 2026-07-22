@@ -26,6 +26,8 @@ Slash commands (parsed before reaching the LLM):
         All numeric data must be pre-computed; the pipeline drafts prose only.
     /timesheet <hours> project "<project>" :: <description>
         Log hours to today's journal under * Timesheet, grouped by project.
+    /timesheet export --month YYYY-MM --project "<project>" [--project-id <id>]
+        Export a final monthly timesheet org file from the configured template.
 """
 
 from __future__ import annotations
@@ -243,10 +245,37 @@ def _make_handler(
                         message, engine, resolved_pending
                     )
                 elif mlow.startswith("/timesheet"):
+                    export_template = None
+                    if model_context is not None and hasattr(
+                        model_context, "settings"
+                    ) and hasattr(
+                        model_context.settings, "resolved_timesheet_export_template"
+                    ):
+                        export_template = (
+                            model_context.settings.resolved_timesheet_export_template
+                        )
                     response = handle_timesheet_slash_command(
                         message,
                         context.journal_dir,
+                        export_template=export_template,
                     )
+                elif mlow.startswith("/convo"):
+                    from engineering_hub.journaler.convo_slash import handle_convo_command
+
+                    conv_cfg = None
+                    if model_context is not None and hasattr(
+                        model_context.settings, "journaler_conversations_default_project"
+                    ):
+                        from engineering_hub.journaler.conversations_config import (
+                            conversations_config_from_settings,
+                        )
+
+                        conv_cfg = conversations_config_from_settings(model_context.settings)
+                    response = handle_convo_command(
+                        message,
+                        engine,
+                        default_project=conv_cfg.default_project if conv_cfg else None,
+                    ) or "Unknown /convo command."
                 else:
                     settings_obj = (
                         model_context.settings if model_context is not None else None
@@ -608,6 +637,7 @@ def _handle_history_command(
             if engine is not None
             else 1200
         ),
+        store=engine.conversation_store if engine is not None else None,
     )
     block = format_past_session_block(hits)
     if not block:

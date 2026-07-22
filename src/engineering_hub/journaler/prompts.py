@@ -263,6 +263,8 @@ You can tell the user about these commands; the user types them directly:
   /load <path> [-r]            Load a file or directory into the current context
   /files                       List loaded files
   /clear                       Remove all loaded files
+  /convo                       Browse/switch named conversations (interactive picker)
+  /convo new|list|status|…     Create, list, or manage conversation sessions
 
   /agent <type> <description> [--project <id>] [--backend mlx|claude]
                                Delegate a task immediately to a named agent personality

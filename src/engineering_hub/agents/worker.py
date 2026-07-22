@@ -564,6 +564,7 @@ class AgentWorker:
                 AgentType.LATEX_WRITER: "latex",
                 AgentType.PANNING_FOR_GOLD: "panning",
                 AgentType.ZETTELKASTEN_CURATOR: "zettelkasten",
+                AgentType.TIMESHEET_REVIEWER: "timesheets",
             }
             agent_extensions = {
                 AgentType.LATEX_WRITER: ".tex",

@@ -7,11 +7,16 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from engineering_hub.journaler.org_writer import append_timesheet_entry
+from engineering_hub.journaler.timesheet_export import (
+    EXPORT_USAGE,
+    handle_timesheet_export_command,
+)
 
 USAGE = (
     "Usage: `/timesheet <hours> project \"<project>\" :: <description>`\n"
     "   or: `/timesheet <hours> --project \"<project>\" --desc \"<description>\"`\n"
-    "   optional: `--project-id <id>` to link a named project to Django."
+    "   optional: `--project-id <id>` to link a named project to Django.\n"
+    f"   export: {EXPORT_USAGE.splitlines()[0].replace('Usage: ', '')}"
 )
 
 
@@ -30,6 +35,14 @@ def parse_timesheet_slash_command(raw: str) -> TimesheetEntry:
     line = raw.strip()
     if not line.lower().startswith("/timesheet"):
         raise ValueError(USAGE)
+
+    try:
+        tokens = shlex.split(line)
+    except ValueError as exc:
+        raise ValueError(f"{exc}\n\n{USAGE}") from exc
+
+    if len(tokens) >= 2 and tokens[1].lower() == "export":
+        raise ValueError("Use handle_timesheet_slash_command for export subcommands.")
 
     left, separator, right = line.partition("::")
     try:
@@ -68,8 +81,25 @@ def parse_timesheet_slash_command(raw: str) -> TimesheetEntry:
     )
 
 
-def handle_timesheet_slash_command(raw: str, journal_dir: Path) -> str:
+def handle_timesheet_slash_command(
+    raw: str,
+    journal_dir: Path,
+    export_template: Path | None = None,
+) -> str:
     """Handle a ``/timesheet`` command and append it to today's journal."""
+    line = raw.strip()
+    try:
+        tokens = shlex.split(line)
+    except ValueError as exc:
+        return str(exc)
+
+    if len(tokens) >= 2 and tokens[0].lower() == "/timesheet" and tokens[1].lower() == "export":
+        return handle_timesheet_export_command(
+            raw,
+            journal_dir,
+            template_path=export_template,
+        )
+
     try:
         entry = parse_timesheet_slash_command(raw)
     except ValueError as exc:

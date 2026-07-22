@@ -103,6 +103,15 @@ def test_append_timesheet_entry_creates_daily_journal_and_groups_projects(
     assert reference_text.count("** Project X :project:project_project_x:") == 1
     assert f"[[file:{journal}][{journal.name}]]" in reference_text
 
+    monthly = tmp_path / "timesheets" / f"{now.strftime('%Y-%m')}-project_x.org"
+    monthly_text = monthly.read_text(encoding="utf-8")
+    assert "#+title: 2026-05 Timesheet — Project X" in monthly_text
+    assert "#+filetags: :timesheet:monthly:project_project_x:" in monthly_text
+    assert "* Hours" in monthly_text
+    assert "* Notes" in monthly_text
+    assert "* Review" in monthly_text
+    assert "- [2026-05-07 Thu 22:55] 2.00h :: report drafting" in monthly_text
+
 
 def test_append_timesheet_entry_links_project_id(tmp_path: Path) -> None:
     journal_dir = _journal_dir(tmp_path)
@@ -135,5 +144,6 @@ def test_handle_timesheet_slash_command_writes_entry(tmp_path: Path) -> None:
 
     assert "Logged 1.00h to Project X" in msg
     assert "Updated timesheet reference:" in msg
+    assert "Updated monthly timesheet:" in msg
     journal = journal_dir / f"{datetime.now().strftime('%Y-%m-%d')}.org"
     assert "1.00h :: planning" in journal.read_text(encoding="utf-8")

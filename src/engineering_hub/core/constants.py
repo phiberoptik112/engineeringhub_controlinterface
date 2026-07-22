@@ -35,6 +35,7 @@ class AgentType(str, Enum):
     CAREER_COACH = "career-coach"
     PRODUCT_MANAGER = "product-manager"
     COMPLIANCE_ADVISOR = "compliance-advisor"
+    TIMESHEET_REVIEWER = "timesheet-reviewer"
 
 
 def is_ingest_task(description: str) -> bool:
@@ -68,4 +69,5 @@ AGENT_PROMPT_FILES = {
     AgentType.CAREER_COACH: "career-coach.txt",
     AgentType.PRODUCT_MANAGER: "product-manager.txt",
     AgentType.COMPLIANCE_ADVISOR: "compliance-advisor.txt",
+    AgentType.TIMESHEET_REVIEWER: "timesheet-reviewer.txt",
 }

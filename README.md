@@ -302,7 +302,7 @@ The Journaler is a persistent daemon that runs a local ~32B model on Apple Silic
 - **Knows** the workspace layout and org-roam format conventions — injected into the system prompt when the conversation engine starts so the model can reason about file locations and produce valid org syntax
 - **Loads agent personas** from `skills/*.yaml`: a concise **skills block** (display name, description, when-to-use, example `/agent` lines) is appended to the system prompt for **both** `journaler start` and **`journaler chat`**. On the daemon, each scheduled org-roam scan refreshes the rolling context snapshot **and re-attaches** that skills block so personas are not dropped mid-run
 - **Uses** `journaler.agent_backend`, optional `journaler.skills_dir`, and optional `journaler.anthropic_api_key` (else `anthropic.api_key` / `ENGINEERING_HUB_ANTHROPIC_API_KEY`) for delegation — same resolution for daemon and interactive chat
-- **Generates** a morning briefing at a configurable time (default 9:00 AM), with concise 2-3 sentence items that emphasize trends across the journal window and an extra **pending-tasks.org** summary when recent queue timestamps appear in that file. Pending/stale/completed tasks are rebuilt from the full journal lookback window (plus recent org-roam project notes) on every scan, with source file/date provenance in briefing context; prose lines like “finished X” can mark tasks complete when `prose_completion_detection` is enabled (default).
+- **Generates** a morning briefing at a configurable time (default 9:00 AM), with concise 2-3 sentence items that emphasize trends across the journal window and an extra **pending-tasks.org** summary when recent queue timestamps appear in that file. Pending/stale/completed tasks are rebuilt from the full journal lookback window (plus recent org-roam project notes) on every scan, with source file/date provenance in briefing context; prose lines like “finished X” can mark tasks complete when `prose_completion_detection` is enabled (default). When `journaler.briefing_append_to_journal` is enabled (default), the report is also upserted under `* Morning Briefing` in today's org journal (`journal.org_journal_dir`, default `~/org-roam/journal/YYYY-MM-DD.org`).
 - **Runs a proactive topic scout** on significant scan ticks (journal / pending-tasks / output changes): one light MLX call writes `topic_hints/YYYY-MM-DD.md` and injects **Topic hints (auto)** into the live system prompt for HTTP chat
 - **Delegates** scheduled coordination scans through the same `AgentDelegator` as `/agent` (local MLX by default, with corpus/memory when configured)
 - **Responds** to ad-hoc questions via an HTTP chat endpoint on `localhost:18790`
@@ -321,6 +321,7 @@ journaler:
   scan_interval_min: 10
   briefing_enabled: true
   briefing_time: "09:00"
+  briefing_append_to_journal: true   # upsert morning/discussion reports into today's org journal
   # scan_org_roam_tree: true        # false = only journal.org_journal_dir + watch_dirs (faster; significance is content-based either way)
   # journal_lookback_days: 30
   # journal_max_files: 30
@@ -727,6 +728,20 @@ While in `engineering-hub journaler chat`, any input starting with `/` is handle
 | `/files` | List all files currently loaded, with character counts |
 | `/files clear` | Remove all loaded files from context |
 
+**Conversations** (`journaler.conversations.enabled`, default true)
+
+| Command | Description |
+| --- | --- |
+| `/convo` | Interactive picker (chat/TUI only) — switch or create conversations grouped by project/topic |
+| `/convo new [--project N] [--topic L] <title>` | Create and switch to a new conversation |
+| `/convo list` | Text listing grouped by project then topic |
+| `/convo status` | Active conversation id, turns, remembered files |
+| `/convo <id\|title-fragment>` | Jump to a matching conversation |
+| `/convo rename <title>` | Rename the active conversation |
+| `/convo restore-files` | Re-load the active conversation's remembered file paths |
+| `/convo archive [id]` | Hide from picker (JSONL retained) |
+| `/convo delete <id> --confirm` | Delete metadata and store |
+
 **Export transcript** (same pipeline as `engineering-hub journaler export`; default file target differs in chat)
 
 | Command | Description |
@@ -766,6 +781,7 @@ While in `engineering-hub journaler chat`, any input starting with `/` is handle
 | `/done <fragment>` | Mark the first matching `- [ ]` item as `- [X]` with a `CLOSED:` timestamp |
 | `/timesheet <hours> project "<project>" :: <description>` | Log hours to today's journal under `* Timesheet`, grouped by project |
 | `/timesheet <hours> --project "<project>" --desc "<description>"` | Same as above, using flag syntax; add `--project-id <id>` to create a `django://project/<id>` link |
+| `/timesheet export --month YYYY-MM --project "<project>"` | Export a final monthly timesheet org file from the configured template |
 | `/note <heading> :: <text>` | Append text under a heading in today's journal (creates the heading if absent) |
 | `/open` | Print the current `/edit` target path, if any |
 | `/open clear` | Clear the session edit target |
@@ -776,7 +792,17 @@ While in `engineering-hub journaler chat`, any input starting with `/` is handle
 | `/edit_browse` | Interactive file browser to set the `/edit` target — browse `.org` files, Enter to select |
 | `/find <title fragment>` | Search all org-roam files for a case-insensitive `#+title:` match; prints matching paths |
 
-`/timesheet` writes an append-only line such as `- [2026-05-07 Thu 22:55] 2.00h :: report drafting` under `* Timesheet` → `** Project X` in the daily journal. It also maintains an agent-searchable org-roam note at `<org-roam>/timesheets/timesheet-reference.org` tagged `:timesheet:agent-context:worklog:`; that reference groups entries by project, adds project heading tags such as `:project_42:`, and links back to the daily journal plus `django://project/<id>` when `--project-id` is provided. The existing `/capture contracting-hours ...` template remains available when you want one org-roam node per contracting-hour entry instead.
+`/timesheet` writes an append-only line such as `- [2026-05-07 Thu 22:55] 2.00h :: report drafting` under `* Timesheet` → `** Project X` in the daily journal. It also maintains an agent-searchable org-roam note at `<org-roam>/timesheets/timesheet-reference.org` tagged `:timesheet:agent-context:worklog:`; that reference groups entries by project, adds project heading tags such as `:project_42:`, and links back to the daily journal plus `django://project/<id>` when `--project-id` is provided. Each log also mirrors into a **monthly working note** at `<org-roam>/timesheets/YYYY-MM-<project-slug>.org` with `* Hours`, `* Notes`, and `* Review` sections for org-native review and `/edit`. The existing `/capture contracting-hours ...` template remains available when you want one org-roam node per contracting-hour entry instead.
+
+**Monthly review chat flow (org-native)**
+
+1. Log during the month with `/timesheet` (include `--project-id` when the project maps to Django).
+2. Open the working note: `/open` with a title fragment such as `2026-07 Timesheet` or the path under `timesheets/`.
+3. Discuss and edit in chat: `/edit Notes :: …`, `/edit Review :: …`, or delegate `/agent timesheet-reviewer reconcile July hours for project 42`.
+4. Export the final client-facing month: `/timesheet export --month 2026-07 --project "LVT Phase B" --project-id 42`.
+5. Optional: set `journaler.timesheet_export_template` in YAML to a customized org template (default: `timesheet_templates/monthly.org` in the repo).
+
+Exported finals are written to `<org-roam>/timesheets/exports/YYYY-MM-<project-slug>-final.org` unless `-o <path>` is provided. The template uses `${placeholder}` fields (project, month, totals, entry lines/table, notes, review) filled from the monthly working note and reference ledger.
 
 Examples:
 
@@ -790,6 +816,10 @@ Examples:
 
 # Numeric project shorthand; logs under "Project 42" and links django://project/42
 /timesheet 0.75 project 42 :: prepared field measurement checklist
+
+# Export final monthly timesheet (template from journaler.timesheet_export_template)
+/timesheet export --month 2026-07 --project "LVT Phase B" --project-id 42
+/timesheet export --month 2026-07 --project "LVT Phase B" --template ~/templates/monthly.org -o ~/org-roam/timesheets/exports/custom-final.org
 ```
 
 The persistent reference note is intentionally separate from the daily journal so agents can search across accumulated time logs by project, tags, and links. A project-linked entry in `<org-roam>/timesheets/timesheet-reference.org` looks like:
@@ -820,7 +850,7 @@ Tasks added with `/task` use the `- [ ] @agent:` format understood by the Orches
 
 With **`journaler.default_task_mode: immediate`** (default), ordinary messages that describe agent work may be **classified** and **delegated inline** (no `/agent` prefix) unless you use explicit **queue** language (“run later”, “queue for tonight”, …) or **`/queue`**. With **`default_task_mode: propose`**, that auto-path is off; the model uses **`DISPATCH:`** lines and you confirm before the agent runs (interactive chat prompts **Run it? [y/N]**; HTTP `/chat` still auto-runs a `DISPATCH` after the model responds, as before).
 
-**`/model`** and **`/model_browse`** in interactive chat reload the MLX weights but **keep the delegator’s adapter in sync**, so `/agent --backend mlx` continues to use the active checkpoint (same behavior as HTTP `/chat` for `/model`). **`/export`**, **`/open`**, **`/edit`**, and the **`/load_browse`** / **`/agent_browse`** / **`/edit_browse`** / **`/model_browse`** TUIs are in interactive **`journaler chat`** and **`journaler tui`**; the HTTP endpoint handles **`/model`**, **`/agent`**, **`/tasks`**, **`/queue`**, **`/timesheet`**, and **`/skills`**. Loaded files are appended to the system prompt as fenced blocks and persist for the life of the chat session only.
+**`/model`** and **`/model_browse`** in interactive chat reload the MLX weights but **keep the delegator’s adapter in sync**, so `/agent --backend mlx` continues to use the active checkpoint (same behavior as HTTP `/chat` for `/model`). **`/export`**, **`/open`**, **`/edit`**, bare **`/convo`** (picker), and the **`/load_browse`** / **`/agent_browse`** / **`/edit_browse`** / **`/model_browse`** TUIs are in interactive **`journaler chat`** and **`journaler tui`**; the HTTP endpoint handles **`/model`**, **`/agent`**, **`/convo`** (text subcommands only, no picker), **`/tasks`**, **`/queue`**, **`/timesheet`**, and **`/skills`**. **`/convo`** switches named conversations with per-convo JSONL history; loaded files reset on switch unless you **`/convo restore-files`**. **`/history`** searches prior chat excerpts; **`/convo`** switches the active session.
 
 To persist files for long-term retrieval across sessions, use `engineering-hub load` instead (see [Load Files into Context](#6-load-files-into-context)).
 
@@ -918,6 +948,18 @@ Output: markdown weekly review under `outputs/`.
 /agent weekly-reviewer summarize this week's work and open loops across all active projects
 /agent weekly-reviewer what's the status of the LVT and Oak Street projects this week
 /agent weekly-reviewer what deliverables are outstanding and which projects need follow-up
+```
+
+---
+
+**`timesheet-reviewer`** — Reconcile monthly org-roam timesheet working notes against the reference ledger; propose missing entries and Notes/Review text before export.
+Output: reconciliation summary under `outputs/timesheets/`. Run `/timesheet export` for the final templated org deliverable.
+
+```text
+/agent timesheet-reviewer reconcile July 2026 hours for project 42
+/agent timesheet-reviewer review the monthly LVT timesheet and flag missing entries
+/agent timesheet-reviewer draft Notes for the July timesheet after reconciling reference entries
+/agent timesheets prepare month-end summary for LVT Phase B --project 42
 ```
 
 ---
@@ -1131,7 +1173,7 @@ journaler:
   discussion_briefing_time: "08:45"
 ```
 
-Output is saved to `.journaler/briefings/discussion-YYYY-MM-DD.md`.
+Output is saved to `.journaler/briefings/discussion-YYYY-MM-DD.md`. When `briefing_append_to_journal` is enabled (default), the discussion report is also upserted under `* Discussion Briefing` in today's org journal.
 
 ### Background Agent Work Loop
 

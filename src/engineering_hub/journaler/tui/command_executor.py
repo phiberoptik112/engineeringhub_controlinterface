@@ -128,6 +128,17 @@ class CommandExecutor:
                 f"Use the sidebar or command palette to access this functionality."
             )
 
+        if cmd == "/convo" and len(parts) == 1:
+            return (
+                "/convo opens the conversation browser. "
+                "Use the sidebar or command palette, or /convo list."
+            )
+
+        if cmd == "/convo" or raw.lower().startswith("/convo "):
+            from engineering_hub.journaler.convo_slash import handle_convo_command
+
+            return handle_convo_command(raw, self.engine) or "Unknown /convo command."
+
         return f"Unknown command: {cmd}. Press Ctrl+P for the command palette."
 
     def _cmd_status(self) -> str:
@@ -447,7 +458,17 @@ class CommandExecutor:
         if journal_dir is None:
             return "/timesheet requires a daily journal directory."
         from engineering_hub.journaler.timesheet_slash import handle_timesheet_slash_command
-        return handle_timesheet_slash_command(raw, journal_dir)
+
+        export_template = None
+        if self.settings is not None and hasattr(
+            self.settings, "resolved_timesheet_export_template"
+        ):
+            export_template = self.settings.resolved_timesheet_export_template
+        return handle_timesheet_slash_command(
+            raw,
+            journal_dir,
+            export_template=export_template,
+        )
 
     def _cmd_agent(self, raw: str) -> str:
         if self.delegator is None:
@@ -608,6 +629,7 @@ class CommandExecutor:
             "  /task <description>       Add TODO to today's journal",
             "  /done <fragment>          Mark a TODO as done",
             "  /timesheet <hours> ...    Log hours by project",
+            "  /timesheet export ...     Export final monthly timesheet",
             "  /note <heading> :: <text> Append to today's journal",
             "",
             "Session:",

@@ -231,6 +231,9 @@ class JournalerApp(App):
         cmd = parts[0].lower() if parts else ""
 
         # Intercept browse commands — open the native browser widget.
+        if cmd == "/convo" and len(parts) == 1:
+            await self._open_browser("/convo")
+            return
         if cmd in _BROWSE_COMMANDS:
             await self._open_browser(cmd)
             return
@@ -350,6 +353,17 @@ class JournalerApp(App):
                 "/model_browse", status="info", detail=f"{len(catalog)} models"
             )
 
+        elif cmd == "/convo":
+            store = self.engine.conversation_store
+            if store is None:
+                self.query_one(ChatView).add_system_message(
+                    "Multi-conversation mode is disabled (journaler.conversations.enabled: false)."
+                )
+                return
+            browser.configure("conversations", items=store.list())
+            self._enter_browser_mode("conversations")
+            activity_log.log_command("/convo", status="info", detail="conversation picker")
+
         # Focus the browser list for immediate keyboard navigation.
         self.call_after_refresh(self._focus_browser_list)
 
@@ -438,11 +452,25 @@ class JournalerApp(App):
                 settings=self.settings,
                 model_ctx=self.model_ctx,
                 engine=self.engine,
-                delegator=self.delegator,
             )
             chat_view.add_system_message(msg)
-            self.model_label = entry.profile_name or entry.label
-            activity_log.log_command("/model_browse", status="ok", detail=entry.label)
+            activity_log.log_command("/model_browse", status="ok", detail=getattr(entry, "label", ""))
+
+        elif event.mode == "conversations":
+            store = self.engine.conversation_store
+            if store is None:
+                return
+            if event.new_conversation:
+                chat_view.add_system_message(
+                    "Enter: /convo new <title> to create a new conversation."
+                )
+                return
+            conv = event.conversation
+            if conv is None:
+                return
+            msg = self.engine.switch_session(conv)
+            chat_view.add_system_message(msg)
+            activity_log.log_command("/convo", status="ok", detail=getattr(conv, "id", ""))
 
         self._update_status()
 

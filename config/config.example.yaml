@@ -382,6 +382,7 @@ chunking:
 #   # Morning briefing schedule
 #   briefing_enabled: true
 #   briefing_time: "09:00"       # local time (HH:MM); default 9:00
+#   briefing_append_to_journal: true  # upsert reports under * Morning Briefing / * Discussion Briefing in today's org journal
 #
 #   # Topics Discussion Briefing — multi-persona roundtable (disabled by default)
 #   # discussion_briefing_enabled: false
@@ -543,6 +544,10 @@ chunking:
 #   # Drop a new .yaml here to add a delegation capability without code changes.
 #   # Default: skills/ directory at the repo root (alongside prompts/).
 #   # skills_dir: "~/org-roam/engineering-hub/skills"
+#
+#   # Org template for final monthly timesheet export (/timesheet export).
+#   # Default: repo timesheet_templates/monthly.org
+#   # timesheet_export_template: "~/org-roam/timesheet_templates/monthly.org"
 #
 #   # Anthropic API key for Claude-backed delegation.
 #   # Prefer ENGINEERING_HUB_ANTHROPIC_API_KEY or ENGINEERING_HUB_JOURNALER_ANTHROPIC_API_KEY in the environment
