@@ -16,22 +16,49 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
+from engineering_hub.actions.file_ingest import read_path_content_for_load
 from engineering_hub.config.loader import find_config_file
 from engineering_hub.config.settings import Settings
-from engineering_hub.journaler.constants import DEFAULT_JOURNALER_MLX_MODEL_ID
+from engineering_hub.journaler.constants import (
+    DEFAULT_JOURNALER_MLX_MODEL_ID,
+    JOURNALER_CONVERSATION_EXPORT_DIRNAME,
+)
 from engineering_hub.journaler.engine import (
     SUPPORTED_EXTENSIONS,
     ConversationEngine,
     _is_model_cached,
 )
+from engineering_hub.journaler.file_browser import browse_org_roam
+from engineering_hub.journaler.output_limit import (
+    Action,
+    GenerationOutcome,
+    OutputLimitConfig,
+)
 from engineering_hub.journaler.model_profiles import (
     JournalerChatModelContext,
+    JournalerModelSpec,
     build_journaler_mlx_backend,
+    effective_generation_max_tokens,
     ensure_spec_model_path,
+    journaler_model_display_label,
     journaler_slash_model_command,
+    model_status_data,
+    parse_model_slash_message,
     resolve_journaler_model_spec,
 )
+from engineering_hub.horn_iterator import service as horn_service
+from engineering_hub.journaler.timesheet_slash import handle_timesheet_slash_command
+from engineering_hub.memory.service import MemoryService
 from engineering_hub.orchestration.orchestrator import Orchestrator
+from engineering_hub.search import build_agent_search_provider_from_settings
+from engineering_hub.zettelkasten import (
+    apply_proposal_batch,
+    create_proposal_batch,
+    detect_candidates,
+    load_proposal_batch,
+)
+from engineering_hub.zettelkasten.proposals import write_proposal_batch
+from engineering_hub.zettelkasten.state import ZettelkastenState, default_state_path
 
 console = Console()
 
@@ -47,6 +74,9 @@ class _ExportSlashHelp(Exception):
 def _export_slash_usage() -> str:
     return (
         "/export — same as `engineering-hub journaler export` (transcript → org).\n\n"
+        "With no -o / --note / --find-title / --new-node, exports are written under\n"
+        f"  <org-roam>/{JOURNALER_CONVERSATION_EXPORT_DIRNAME}/\n"
+        "as a new org-roam node (CLI `journaler export` still prints to stdout by default).\n\n"
         "Examples:\n"
         "  /export\n"
         "  /export --summarize\n"
@@ -151,12 +181,20 @@ def _execute_journaler_export(
     spec: object,
     log: Console,
     body_to_stdout: bool,
+    chat_default_roam_export: bool = False,
 ) -> int:
     """Shared implementation for `journaler export` CLI and `/export` in chat.
 
-    When *body_to_stdout* is False, the export body is printed with Rich markup
-    escaped (interactive chat). When True, raw body is written to sys.stdout
-    if no file/note/new-node target consumed it.
+    When *body_to_stdout* is True (CLI default), raw body is written to
+    ``sys.stdout`` if no file/note/new-node target consumed it.
+
+    When *chat_default_roam_export* is True and nothing else consumed the body,
+    writes a new node under the configured org-roam root, in the
+    ``conversation_exports`` subdirectory (see
+    :data:`~engineering_hub.journaler.constants.JOURNALER_CONVERSATION_EXPORT_DIRNAME`).
+
+    When *body_to_stdout* is False and *chat_default_roam_export* is False, the
+    export body is printed with Rich markup escaped (legacy behavior).
     """
     from engineering_hub.journaler.conversation_export import (
         build_summarize_prompt,
@@ -191,10 +229,19 @@ def _execute_journaler_export(
         return 1
 
     state_dir = settings.journaler_state_dir
+    from engineering_hub.journaler.conversations_config import (
+        build_store_from_config,
+        conversations_config_from_settings,
+        resolve_transcript_path,
+    )
+
+    conv_cfg = conversations_config_from_settings(settings)
+    store = build_store_from_config(state_dir, conv_cfg)
+    default_jsonl = resolve_transcript_path(state_dir, store=store)
     jsonl_path = (
         Path(jsonl_override).expanduser().resolve()
         if jsonl_override
-        else state_dir / "conversation.jsonl"
+        else default_jsonl
     )
 
     if not jsonl_path.is_file():
@@ -282,12 +329,34 @@ def _execute_journaler_export(
         wrote_file = True
 
     if not wrote_file:
+        if chat_default_roam_export:
+            export_dir = org_roam_dir / JOURNALER_CONVERSATION_EXPORT_DIRNAME
+            export_dir.mkdir(parents=True, exist_ok=True)
+            ok, msg = create_org_node(
+                export_dir,
+                "Journaler chat export",
+                filetags=["journaler-export"],
+                body=body,
+            )
+            color = "green" if ok else "red"
+            log.print(f"[{color}]{escape(msg)}[/{color}]")
+            return 0 if ok else 1
         if body_to_stdout:
             sys.stdout.write(body)
         else:
             log.print(escape(body))
 
     return 0
+
+
+_NOISY_LOGGERS = (
+    "httpx",
+    "httpcore",
+    "huggingface_hub",
+    "transformers",
+    "sentence_transformers",
+    "urllib3",
+)
 
 
 def setup_logging(verbose: bool = False) -> None:
@@ -299,6 +368,9 @@ def setup_logging(verbose: bool = False) -> None:
         datefmt="[%X]",
         handlers=[RichHandler(console=console, rich_tracebacks=True)],
     )
+    if not verbose:
+        for name in _NOISY_LOGGERS:
+            logging.getLogger(name).setLevel(logging.WARNING)
 
 
 def load_settings(config_path: Path | None = None) -> Settings:
@@ -456,6 +528,9 @@ def cmd_status(args: argparse.Namespace) -> int:
             use_org_mode=settings.use_org_mode,
             org_task_sections=settings.org_task_sections,
             org_lookback_days=settings.org_lookback_days,
+            pending_tasks_file=settings.resolved_journaler_pending_tasks_file
+            if settings.use_org_mode
+            else None,
         )
         pending = manager.get_pending_tasks()
 
@@ -494,7 +569,7 @@ def cmd_run_once(args: argparse.Namespace) -> int:
         success_count = sum(1 for r in results if r.success)
         fail_count = len(results) - success_count
 
-        console.print(f"\n[bold]Results:[/bold]")
+        console.print("\n[bold]Results:[/bold]")
         console.print(f"  ✓ Completed: {success_count}")
         console.print(f"  ✗ Failed: {fail_count}")
 
@@ -676,7 +751,7 @@ def cmd_weekly_review(args: argparse.Namespace) -> int:
         console.print(f"[red]Error:[/red] Weekly review failed: {exc}")
         return 1
 
-    console.print(f"[bold green]Weekly review complete![/bold green]")
+    console.print("[bold green]Weekly review complete![/bold green]")
     console.print(f"  Report: {output_path}")
     return 0
 
@@ -700,6 +775,181 @@ def cmd_mcp_server(args: argparse.Namespace) -> int:
     return 0
 
 
+def _handle_domain_shift_confirmation(
+    engine: ConversationEngine,
+    delegator: object | None,
+    console: Console,
+) -> None:
+    """Display the domain-shift confirmation prompt and act on the user's reply.
+
+    Called after a chat turn when ``engine.domain_shift_detector.pending_shift``
+    is set.  Handles three responses:
+      - ``y`` / ``yes``   → swap persona immediately
+      - ``a`` / ``always`` → swap persona (config persistence is a future enhancement)
+      - anything else     → reject and suppress for the configured number of turns
+    """
+    detector = engine.domain_shift_detector
+    if detector is None or detector.pending_shift is None:
+        return
+
+    shift = detector.pending_shift
+    console.print(
+        f"\n[cyan]Domain shift detected:[/cyan] The conversation appears to be moving "
+        f"toward [bold]{shift.new_domain}[/bold] territory.\n"
+        f"[cyan]Activate[/cyan] [bold]{shift.display_name}[/bold] [cyan]persona?[/cyan] "
+        f"[dim]([y]es / [a]lways / Enter to stay)[/dim]"
+    )
+    try:
+        reply = input("Activate? [y/a/N]: ").strip().lower()
+    except (KeyboardInterrupt, EOFError):
+        reply = ""
+
+    if reply in ("y", "yes", "a", "always"):
+        skill_def = None
+        if delegator is not None and hasattr(delegator, "list_skills"):
+            skill_def = next(
+                (s for s in delegator.list_skills() if s.name == shift.skill_name),
+                None,
+            )
+        if skill_def is not None:
+            swap_note = engine.swap_persona(
+                skill_def.name,
+                skill_def.display_name,
+                skill_def.description,
+            )
+            console.print(f"[green]{escape(swap_note)}[/green]\n")
+        else:
+            detector.reject_shift()
+            console.print(
+                f"[yellow]Could not find skill '{shift.skill_name}'. "
+                "Staying in current persona.[/yellow]\n"
+            )
+    else:
+        detector.reject_shift()
+        console.print(
+            "[dim]Staying in current persona. "
+            f"You can switch manually with /persona {shift.skill_name}[/dim]\n"
+        )
+
+
+_OUTPUT_POLICY_CHOICES = ("prompt", "auto_continue", "auto_summarize", "stop")
+_OUTPUT_CONTINUE_CHOICES = ("ask", "same_turn", "follow_up")
+_OUTPUT_SCOPE_CHOICES = ("history", "history_and_partial")
+
+
+def _render_output_limit_table(cfg: "OutputLimitConfig") -> Table:
+    """Build a Rich table summarizing the active output-limit policy."""
+    table = Table(title="Output Limit", show_header=True, header_style="bold cyan")
+    table.add_column("Setting", style="cyan", no_wrap=True)
+    table.add_column("Value", style="green")
+    table.add_column("How to change", style="dim")
+    table.add_row("policy", cfg.policy, "/output set policy prompt|auto_continue|auto_summarize|stop")
+    table.add_row("max_output_tokens", str(cfg.max_output_tokens), "/output set max_tokens <int>")
+    table.add_row("max_continuation_passes", str(cfg.max_continuation_passes), "/output set passes <int>")
+    table.add_row("continue_mode", cfg.continue_mode, "/output set continue_mode ask|same_turn|follow_up")
+    table.add_row(
+        "summarize_scope_default",
+        cfg.summarize_scope_default,
+        "/output set summarize_scope history|history_and_partial",
+    )
+    table.add_row("force_answer_on_thinking_cut", str(cfg.force_answer_on_thinking_cut), "(config)")
+    table.add_row("summarize_before_continue", str(cfg.summarize_before_continue), "(config)")
+    return table
+
+
+def _handle_output_command(
+    parts: list[str], engine: ConversationEngine, chat_console: Console
+) -> None:
+    """Handle ``/output`` and ``/output set <key> <value>`` slash commands."""
+    cfg = engine.get_output_limit()
+    if len(parts) == 1:
+        chat_console.print(_render_output_limit_table(cfg))
+        return
+
+    if parts[1].lower() != "set" or len(parts) < 4:
+        chat_console.print(
+            "[yellow]Usage:[/yellow] /output  |  /output set "
+            "policy|max_tokens|passes|continue_mode|summarize_scope <value>"
+        )
+        return
+
+    key = parts[2].lower()
+    val = parts[3]
+    try:
+        if key == "policy":
+            if val not in _OUTPUT_POLICY_CHOICES:
+                raise ValueError(f"policy must be one of {_OUTPUT_POLICY_CHOICES}")
+            cfg.policy = val  # type: ignore[assignment]
+        elif key in ("max_tokens", "max_output_tokens"):
+            cfg.max_output_tokens = int(val)
+        elif key in ("passes", "max_continuation_passes"):
+            cfg.max_continuation_passes = int(val)
+        elif key == "continue_mode":
+            if val not in _OUTPUT_CONTINUE_CHOICES:
+                raise ValueError(f"continue_mode must be one of {_OUTPUT_CONTINUE_CHOICES}")
+            cfg.continue_mode = val  # type: ignore[assignment]
+        elif key in ("summarize_scope", "summarize_scope_default"):
+            if val not in _OUTPUT_SCOPE_CHOICES:
+                raise ValueError(f"summarize_scope must be one of {_OUTPUT_SCOPE_CHOICES}")
+            cfg.summarize_scope_default = val  # type: ignore[assignment]
+        else:
+            raise ValueError(f"unknown setting {key!r}")
+        cfg.validate()
+        engine.set_output_limit(cfg)
+        chat_console.print(f"[green]output {key} → {val}[/green]")
+    except ValueError as exc:
+        chat_console.print(f"[red]Error:[/red] {escape(str(exc))}")
+
+
+def _interactive_output_choice(
+    chat_console: Console,
+) -> "Callable[[GenerationOutcome], Action | None]":
+    """Build a choice provider that prompts the user when output is truncated."""
+
+    def _provider(outcome: "GenerationOutcome") -> "Action | None":
+        phase_note = (
+            " (model was still reasoning — choosing continue will jump to the answer)"
+            if outcome.phase == "thinking"
+            else ""
+        )
+        chat_console.print(
+            f"\n[yellow]Output may be incomplete[/yellow] "
+            f"(reason: {outcome.reason}{phase_note}).\n"
+            "\n"
+            "  [s] Summarize history and retry\n"
+            "      Compress older exchanges to free context, then ask the model again.\n"
+            "      The cut-off reply stays in context but is not summarized.\n"
+            "\n"
+            "  [S] Summarize history + partial answer, then retry\n"
+            "      Same as [s], and also summarizes the incomplete reply into a brief.\n"
+            "      Use when both chat history and the partial answer are using space.\n"
+            "\n"
+            "  [c] Continue (same turn)\n"
+            "      Resume where generation stopped and append more text to this reply.\n"
+            "      May run several hidden passes; output is stitched into one message.\n"
+            "\n"
+            "  [f] Continue (new follow-up turn)\n"
+            "      Continue via an explicit follow-up request after the partial reply.\n"
+            "      Use when you want a separate continuation pass instead of a seamless seam.\n"
+            "\n"
+            "  [Enter] Stop and keep partial\n"
+            "      Accept the incomplete answer as-is; no further generation."
+        )
+        try:
+            choice = input("Choice [s/S/c/f, or Enter to stop]: ").strip()
+        except (KeyboardInterrupt, EOFError):
+            return "stop"
+        mapping: dict[str, Action] = {
+            "s": "summarize_history",
+            "S": "summarize_both",
+            "c": "continue_same",
+            "f": "continue_followup",
+        }
+        return mapping.get(choice, "stop")
+
+    return _provider
+
+
 def _build_status_bar(engine: ConversationEngine, model_label: str) -> Panel:
     """Render a one-line status panel for the journaler chat loop."""
     status = engine.get_status()
@@ -711,17 +961,25 @@ def _build_status_bar(engine: ConversationEngine, model_label: str) -> Panel:
     topic = status["current_topic"] or "—"
     turns = status["history_turns"]
     files = len(engine.list_loaded_files())
+    focus_doc = engine.get_focus_document()
+    gen_headroom = status.get("gen_headroom", 0)
+    gen_color = "red" if gen_headroom < 512 else ("yellow" if gen_headroom < 2048 else "green")
 
     t = Text(overflow="ellipsis", no_wrap=True)
     t.append(f" Model: {model_label}", style="cyan")
     t.append(" │ ", style="dim")
     t.append(f"Context: {raw_pct} {gauge}", style=color)
     t.append(" │ ", style="dim")
+    t.append(f"Gen: ~{gen_headroom:,}", style=gen_color)
+    t.append(" │ ", style="dim")
     t.append(f"Turns: {turns}", style="white")
     t.append(" │ ", style="dim")
     t.append(f"Topic: {topic}", style="magenta")
     t.append(" │ ", style="dim")
     t.append(f"Files: {files} ", style="blue")
+    if focus_doc is not None:
+        t.append(" │ ", style="dim")
+        t.append(f"Focus: {focus_doc.label} ", style="yellow")
     return Panel(t, height=3, padding=(0, 0))
 
 
@@ -730,6 +988,46 @@ def _print_chat_markdown(console: Console, text: str) -> None:
     if not text.strip():
         return
     console.print(Markdown(text))
+
+
+def _print_focus_status(chat_console: Console, engine: ConversationEngine) -> None:
+    """Render the current focus writing mode state."""
+    document = engine.get_focus_document()
+    if document is None:
+        chat_console.print("[dim]Focus mode is off.[/dim]")
+        return
+
+    table = Table(title="Focus Technical Writing Mode")
+    table.add_column("Field", style="cyan")
+    table.add_column("Value", style="green")
+    table.add_row("Mode", document.mode)
+    table.add_row("Document", str(document.path))
+    table.add_row("Label", document.label)
+    table.add_row("Characters", f"{len(document.content):,}")
+    table.add_row("Truncated", "yes" if document.truncated else "no")
+    table.add_row("Output", str(document.output_path) if document.output_path else "")
+    chat_console.print(table)
+
+
+def _render_model_status_table(
+    spec: JournalerModelSpec,
+    *,
+    thinking_floor: int = 16_384,
+) -> Table:
+    """Build a Rich Table for ``/model`` status output.
+
+    Three columns: Setting / Current value / How to change.
+    Adjustable settings show the exact ``/model set`` command in the
+    third column so the output is self-documenting.
+    """
+    table = Table(title="Active Model", show_header=True, header_style="bold cyan")
+    table.add_column("Setting", style="cyan", no_wrap=True)
+    table.add_column("Value", style="green")
+    table.add_column("How to change", style="dim")
+
+    for setting, value, how in model_status_data(spec, thinking_floor=thinking_floor):
+        table.add_row(setting, value, how)
+    return table
 
 
 def _handle_chat_slash_command(
@@ -744,31 +1042,45 @@ def _handle_chat_slash_command(
     export_settings: Settings | None = None,
     export_config: object | None = None,
     export_spec: object | None = None,
+    task_integrator: object | None = None,
 ) -> None:
     """Intercept and execute a /slash command from the journaler chat loop.
 
     Recognised commands:
       /model                     Show or switch HF model (profile or path).
+      /model_browse              Interactive picker for mlx-community models.
       /load <path> [-r]          Load a file or directory into context.
+      /load_recent [N] [--days D] [--list]  Load most recently created files across the workspace.
       /load_browse               Interactive file browser for org-roam files.
+      /focus <path>|status|off   Focus chat on one technical document.
       /agent_browse              Interactive skill picker for agent delegation.
       /edit_browse               Interactive file browser to set /edit target.
       /files                     List all currently loaded files.
       /files clear               Remove all loaded files from the context.
       /clear [--hard|--summarize] Clear conversation history (soft by default).
+      /convo                       Open conversation picker (interactive).
+      /convo new|list|status|…     Switch or manage named conversations.
+      /summarize                 Generate today's daily summary now and archive history.
       /status                    Show context management state (pressure, turns, etc.)
       /budget                    Show token budget breakdown.
+      /output [set <k> <v>]      Show or change output-limit policy (summarize/continue/stop).
       /topic                     Show the currently detected conversation topic.
+      /persona [<name>|reset|list]  Show, swap, reset, or list active Journaler persona.
       /find <title fragment>     Search org-roam files by #+title:.
+      /timesheet <hours> project "<project>" :: <description>
+                                  Log hours to today's journal, grouped by project.
       /task <description>        Add a TODO to today's journal.
       /done <fragment>           Mark a matching TODO as done in today's journal.
       /note <heading> :: <text>  Append text under a heading in today's journal.
       /open [today|clear|<path>|<title>]  Set session org-roam target for /edit.
       /edit <heading> :: <text>  Append under a heading in the /open target.
       /exit, /quit               Leave the chat (same as bare exit, quit, or :q).
+      /tasks … /queue            Overnight queue in pending-tasks.org (confirm, commit, rollback).
       /agent … /skills           Delegate to agent personalities (when delegator is configured).
+      /history …                 Retrieve prior chat excerpts or dispatch an agent to review them.
       /validate-latex <path>     Compile a .tex file with pdflatex and report errors/warnings.
       /export …                  Export conversation.jsonl to org (same flags as journaler export).
+      /zettel …                  Propose/apply Zettelkasten notes from marked journals.
       /model                     Show model, or switch profile / path (see /help).
       /help                      Show available slash commands.
     """
@@ -789,8 +1101,91 @@ def _handle_chat_slash_command(
                 "[yellow]/model requires internal context; if you see this, file a bug.[/yellow]"
             )
             return
-        msg = journaler_slash_model_command(
-            raw,
+        mode, _arg1, _arg2 = parse_model_slash_message(raw)
+        if mode == "status":
+            chat_console.print(
+                _render_model_status_table(
+                    journaler_model_ctx.spec,
+                    thinking_floor=journaler_model_ctx.settings.journaler_thinking_max_tokens,
+                )
+            )
+        else:
+            msg = journaler_slash_model_command(
+                raw,
+                settings=journaler_model_ctx.settings,
+                model_ctx=journaler_model_ctx,
+                engine=engine,
+                delegator=delegator,
+            )
+            chat_console.print(f"[green]{escape(msg)}[/green]")
+        return
+
+    if cmd == "/model_browse":
+        if journaler_model_ctx is None:
+            chat_console.print(
+                "[yellow]/model_browse requires internal context; if you see this, file a bug.[/yellow]"
+            )
+            return
+        from engineering_hub.journaler.file_browser import browse_models
+        from engineering_hub.journaler.model_catalog import build_model_catalog
+        from engineering_hub.journaler.model_profiles import load_model_from_catalog_entry
+
+        catalog = build_model_catalog(
+            journaler_model_ctx.settings,
+            journaler_model_ctx.spec,
+        )
+        if not catalog:
+            chat_console.print(
+                "[yellow]No mlx-community models found in HF cache and no journaler.models "
+                "profiles configured. Run [cyan]engineering-hub journaler download[/cyan] first.[/yellow]"
+            )
+            return
+        chat_console.print(
+            f"[dim]Opening model picker ({len(catalog)} entries)… (Esc or q to cancel)[/dim]"
+        )
+        selected = browse_models(catalog)
+        if selected is None:
+            chat_console.print("[dim]No model selected.[/dim]")
+            return
+        msg = load_model_from_catalog_entry(
+            selected,
+            settings=journaler_model_ctx.settings,
+            model_ctx=journaler_model_ctx,
+            engine=engine,
+            delegator=delegator,
+        )
+        chat_console.print(f"[green]{escape(msg)}[/green]")
+        return
+
+    if cmd == "/model_browse":
+        if journaler_model_ctx is None:
+            chat_console.print(
+                "[yellow]/model_browse requires internal context; if you see this, file a bug.[/yellow]"
+            )
+            return
+        from engineering_hub.journaler.file_browser import browse_models
+        from engineering_hub.journaler.model_catalog import build_model_catalog
+        from engineering_hub.journaler.model_profiles import load_model_from_catalog_entry
+
+        catalog = build_model_catalog(
+            journaler_model_ctx.settings,
+            journaler_model_ctx.spec,
+        )
+        if not catalog:
+            chat_console.print(
+                "[yellow]No mlx-community models found in HF cache and no journaler.models "
+                "profiles configured. Run [cyan]engineering-hub journaler download[/cyan] first.[/yellow]"
+            )
+            return
+        chat_console.print(
+            f"[dim]Opening model picker ({len(catalog)} entries)… (Esc or q to cancel)[/dim]"
+        )
+        selected = browse_models(catalog)
+        if selected is None:
+            chat_console.print("[dim]No model selected.[/dim]")
+            return
+        msg = load_model_from_catalog_entry(
+            selected,
             settings=journaler_model_ctx.settings,
             model_ctx=journaler_model_ctx,
             engine=engine,
@@ -808,10 +1203,144 @@ def _handle_chat_slash_command(
         candidate = org_roam_dir / "journal"
         journal_dir = candidate if candidate.exists() else org_roam_dir
 
+    if cmd == "/focus":
+        try:
+            tokens = shlex.split(raw)
+        except ValueError as exc:
+            chat_console.print(f"[red]{escape(str(exc))}[/red]")
+            return
+
+        action = tokens[1].lower() if len(tokens) > 1 else "status"
+        if action == "status":
+            _print_focus_status(chat_console, engine)
+            return
+
+        if action in ("off", "clear"):
+            if engine.focus_is_active():
+                engine.clear_focus_document()
+                engine.clear(ClearStrategy.SOFT)
+                chat_console.print(
+                    "[green]Focus mode disabled. Focus-mode turn history cleared.[/green]"
+                )
+            else:
+                chat_console.print("[dim]Focus mode is already off.[/dim]")
+            return
+
+        if action == "output":
+            if not engine.focus_is_active():
+                chat_console.print(
+                    "[yellow]No focus document is active. Use /focus <path> first.[/yellow]"
+                )
+                return
+            if len(tokens) < 3:
+                chat_console.print("[yellow]Usage: /focus output <path>[/yellow]")
+                return
+            output_path = Path(tokens[2]).expanduser()
+            engine.set_focus_output_path(output_path)
+            chat_console.print(
+                f"[green]Focus output target set to {escape(str(output_path))}[/green]"
+            )
+            return
+
+        if action == "browse":
+            if org_roam_dir is None:
+                chat_console.print(
+                    "[yellow]/focus browse requires org-roam dir "
+                    "(set journaler.org_journal_dir or start with 'journaler chat').[/yellow]"
+                )
+                return
+
+            chat_console.print("[dim]Opening file browser… (Esc or q to cancel)[/dim]")
+            selected = browse_org_roam(org_roam_dir, SUPPORTED_EXTENSIONS)
+            if not selected:
+                chat_console.print("[dim]No focus document selected.[/dim]")
+                return
+            focus_path = selected[0]
+        else:
+            focus_path = Path(tokens[1]).expanduser() if len(tokens) > 1 else None
+
+        if focus_path is None:
+            chat_console.print(
+                "[yellow]Usage: /focus <path>|status|off|clear|browse|output <path>[/yellow]"
+            )
+            return
+
+        resolved_focus_path = focus_path.expanduser().resolve()
+        if not resolved_focus_path.exists():
+            chat_console.print(f"[red]File not found: {escape(str(resolved_focus_path))}[/red]")
+            return
+        if not resolved_focus_path.is_file():
+            chat_console.print(
+                f"[red]Path is not a file: {escape(str(resolved_focus_path))}[/red]"
+            )
+            return
+        if resolved_focus_path.suffix.lower() not in SUPPORTED_EXTENSIONS:
+            supported = ", ".join(sorted(SUPPORTED_EXTENSIONS))
+            chat_console.print(
+                f"[red]Extension '{resolved_focus_path.suffix}' is not supported. "
+                f"Supported: {supported}[/red]"
+            )
+            return
+
+        engine.clear(ClearStrategy.SOFT)
+        ok, msg = engine.load_focus_document(
+            resolved_focus_path,
+            extensions=SUPPORTED_EXTENSIONS,
+        )
+        color = "green" if ok else "red"
+        chat_console.print(f"[{color}]{escape(msg)}[/{color}]")
+        if ok:
+            chat_console.print(
+                "[dim]Focus mode uses only this document and new focus-mode turns; "
+                "ambient Journaler context and retrieval are disabled.[/dim]"
+            )
+            if (
+                org_roam_dir is not None
+                and resolved_focus_path.suffix.lower() == ".org"
+            ):
+                try:
+                    assert_org_path_under_roam(resolved_focus_path, org_roam_dir)
+                except ValueError:
+                    pass
+                else:
+                    engine.set_roam_edit_target(resolved_focus_path)
+                    chat_console.print(
+                        "[dim]This org file is also set as the /edit target.[/dim]"
+                    )
+        return
+
     if cmd == "/skills":
         from engineering_hub.journaler.chat_server import _handle_skills_command
 
         msg = _handle_skills_command(delegator)
+        chat_console.print(f"[green]{escape(msg)}[/green]")
+        return
+
+    if cmd == "/blender":
+        from engineering_hub.blender import service as blender_service
+
+        sub = parts[1].lower() if len(parts) > 1 else "status"
+        if sub != "status":
+            chat_console.print("[yellow]Usage: /blender status[/yellow]")
+            return
+        chat_console.print(blender_service.format_status_message())
+        return
+
+    if cmd == "/horn":
+        chat_console.print(Markdown(horn_service.handle_slash_command(raw)))
+        return
+
+    if cmd in ("/tasks", "/queue"):
+        if export_settings is None:
+            chat_console.print(
+                "[yellow]/tasks requires workspace settings (pending_tasks_file).[/yellow]"
+            )
+            return
+        from engineering_hub.journaler.task_slash import handle_tasks_slash_command
+
+        msg = handle_tasks_slash_command(
+            raw, engine, export_settings.resolved_journaler_pending_tasks_file
+        )
         chat_console.print(f"[green]{escape(msg)}[/green]")
         return
 
@@ -824,6 +1353,30 @@ def _handle_chat_slash_command(
         from engineering_hub.journaler.chat_server import _handle_agent_command
 
         msg = _handle_agent_command(raw, delegator, journal_ctx, engine=engine)
+        _print_chat_markdown(chat_console, msg)
+        return
+
+    if cmd == "/history":
+        if journal_ctx is None:
+            chat_console.print(
+                "[yellow]/history requires journal context; start from a configured workspace.[/yellow]"
+            )
+            return
+        from engineering_hub.journaler.chat_server import _handle_history_command
+
+        msg = _handle_history_command(raw, delegator, journal_ctx, engine=engine)
+        _print_chat_markdown(chat_console, msg)
+        return
+
+    if cmd == "/pipeline":
+        if journal_ctx is None:
+            chat_console.print(
+                "[yellow]/pipeline requires journal context; start from a configured workspace.[/yellow]"
+            )
+            return
+        from engineering_hub.journaler.chat_server import _handle_pipeline_command
+
+        msg = _handle_pipeline_command(raw, delegator, journal_ctx, engine=engine)
         _print_chat_markdown(chat_console, msg)
         return
 
@@ -979,6 +1532,58 @@ def _handle_chat_slash_command(
             spec=export_spec,
             log=chat_console,
             body_to_stdout=False,
+            chat_default_roam_export=True,
+        )
+        return
+
+    if cmd == "/zettel":
+        if export_settings is None:
+            chat_console.print(
+                "[yellow]/zettel requires workspace config; "
+                "start from a configured workspace.[/yellow]"
+            )
+            return
+        action = parts[1].lower() if len(parts) >= 2 else "status"
+        state_path = default_state_path(export_settings.workspace_dir)
+        state = ZettelkastenState.load(state_path)
+        if action == "propose":
+            days = int(parts[2]) if len(parts) >= 3 and parts[2].isdigit() else None
+            memory_service = getattr(journal_ctx, "memory_service", None)
+            code, msg = _propose_zettelkasten_notes(
+                export_settings,
+                memory_service=memory_service,
+                lookback_days=days,
+            )
+            color = "green" if code == 0 else "red"
+            for line in msg.splitlines():
+                chat_console.print(f"[{color}]{escape(line)}[/{color}]")
+            return
+        if action == "apply":
+            if len(parts) < 3:
+                chat_console.print("[yellow]Usage: /zettel apply <proposal-json>[/yellow]")
+                return
+            batch = load_proposal_batch(Path(" ".join(parts[2:])))
+            created = apply_proposal_batch(
+                batch,
+                roam_dir=export_settings.org_journal_dir.parent,
+                state=state,
+            )
+            state.save(state_path)
+            chat_console.print(f"[green]Applied {len(created)} Zettelkasten note(s).[/green]")
+            for path in created:
+                chat_console.print(f"  [cyan]{path}[/cyan]")
+            return
+        if action == "status":
+            chat_console.print(
+                f"[cyan]Zettelkasten state:[/cyan] {len(state.processed_hashes)} "
+                f"processed span(s), {len(state.proposal_batches)} proposal batch(es)."
+            )
+            chat_console.print(
+                f"[dim]Proposal dir: {export_settings.zettelkasten_resolved_proposal_dir}[/dim]"
+            )
+            return
+        chat_console.print(
+            "[yellow]Usage: /zettel {propose [days]|apply <json>|status}[/yellow]"
         )
         return
 
@@ -987,7 +1592,10 @@ def _handle_chat_slash_command(
             "\n  [bold]File operations (requires org-roam dir):[/bold]\n"
             "  [cyan]/task <description>[/cyan]          Add a TODO to today's journal\n"
             "  [cyan]/done <fragment>[/cyan]             Mark a matching TODO as done\n"
-            "  [cyan]/note <heading> :: <text>[/cyan]   Append text under a heading in today's journal\n"
+            "  [cyan]/timesheet <hours> project \"<project>\" :: <desc>[/cyan]\n"
+            "                                 Log hours grouped by project\n"
+            "  [cyan]/note <heading> :: <text>[/cyan]   Append text under "
+            "a heading in today's journal\n"
             "  [cyan]/open[/cyan]                       Show current /edit target\n"
             "  [cyan]/open clear[/cyan]                  Clear /edit target\n"
             "  [cyan]/open today[/cyan]                  Target today's daily journal\n"
@@ -1002,10 +1610,15 @@ def _handle_chat_slash_command(
             "\n[bold cyan]Slash commands:[/bold cyan]\n"
             "  [cyan]/load <path> [-r][/cyan]          Load a file or directory into context\n"
             "                                 (-r / --recursive scans subdirectories)\n"
+            "  [cyan]/load_recent [N] [--days D] [--list][/cyan]  Load most recently created workspace files\n"
             "  [cyan]/load_browse[/cyan]               Browse and select org-roam files to load\n"
+            "  [cyan]/focus <path>[/cyan]               Focus chat on one technical document\n"
+            "  [cyan]/focus status|off[/cyan]           Show or leave focus writing mode\n"
+            "  [cyan]/focus output <path>[/cyan]        Set intended edited-output path\n"
             "  [cyan]/model[/cyan]                     Show active MLX model / profile\n"
             "  [cyan]/model <profile>[/cyan]           Switch to a named journaler.models profile\n"
             "  [cyan]/model path <id-or-path>[/cyan]   Load a Hugging Face id or local path\n"
+            "  [cyan]/model_browse[/cyan]              Browse mlx-community models and profiles\n"
             "  [cyan]/files[/cyan]                     List loaded files\n"
             "  [cyan]/files clear[/cyan]               Remove all loaded files from context\n"
             "  [cyan]/clear[/cyan]                     Clear conversation history (keeps context snapshot)\n"
@@ -1013,17 +1626,42 @@ def _handle_chat_slash_command(
             "  [cyan]/clear --hard[/cyan]              Full reset: conversation + scan state\n"
             "  [cyan]/status[/cyan]                    Show context pressure and token usage\n"
             "  [cyan]/budget[/cyan]                    Show token budget breakdown\n"
+            "  [cyan]/output[/cyan]                    Show/set output-limit policy (summarize/continue/stop)\n"
             "  [cyan]/topic[/cyan]                     Show currently detected conversation topic\n"
+            "  [cyan]/convo[/cyan]                     Browse/switch named conversations (picker)\n"
+            "  [cyan]/convo new|list|status|…[/cyan]   Manage conversation sessions\n"
             "  [cyan]/agent <type> <desc>[/cyan]      Delegate to a named agent (see README)\n"
+            "  [cyan]/history <query>[/cyan]           Retrieve prior chat excerpts\n"
+            "  [cyan]/history --agent <type> <query>[/cyan]  Have an agent review retrieved history\n"
             "  [cyan]/agent_browse[/cyan]              Browse and pick an agent skill\n"
             "  [cyan]/skills[/cyan]                    List agent delegation skills / personas\n"
             "  [cyan]/validate-latex <path>[/cyan]    Compile a .tex file and report errors\n"
             "                                 (prompts to auto-fix via agent on failure)\n"
             "  [cyan]/export[/cyan]                    Export transcript (`/export --help`)\n"
+            "  [cyan]/zettel propose [days][/cyan]     Create reviewable "
+            "atomic-note proposals\n"
+            "  [cyan]/zettel apply <json>[/cyan]       Apply approved proposals into org-roam\n"
             + write_cmds +
-            "  [cyan]/exit[/cyan], [cyan]/quit[/cyan]          Leave chat (or type exit, quit, :q)\n"
+            "  [cyan]/exit[/cyan], [cyan]/quit[/cyan]          Leave chat "
+            "(or type exit, quit, :q)\n"
             "  [cyan]/help[/cyan]                      Show this help\n"
         )
+        return
+
+    if cmd == "/timesheet":
+        if journal_dir is None:
+            chat_console.print("[yellow]/timesheet requires a daily journal directory.[/yellow]")
+            return
+        msg = handle_timesheet_slash_command(
+            raw,
+            journal_dir,
+            export_template=(
+                export_settings.resolved_timesheet_export_template
+                if export_settings is not None
+                else None
+            ),
+        )
+        chat_console.print(f"[green]{escape(msg)}[/green]")
         return
 
     if cmd == "/files":
@@ -1043,6 +1681,54 @@ def _handle_chat_slash_command(
             chat_console.print()
         return
 
+    if cmd == "/convo":
+        from engineering_hub.journaler.convo_slash import handle_convo_command
+        from engineering_hub.journaler.file_browser import _NEW_CONVERSATION, browse_conversations
+
+        conv_cfg = (
+            export_config.get_conversations_config()
+            if export_config is not None and hasattr(export_config, "get_conversations_config")
+            else None
+        )
+        default_project = conv_cfg.default_project if conv_cfg else None
+
+        def _run_picker() -> str:
+            store = engine.conversation_store
+            if store is None:
+                return "Multi-conversation mode is disabled."
+            chat_console.print("[dim]Opening conversation picker...[/dim]")
+            choice = browse_conversations(store.list(), resolve_project=None)
+            if choice is None:
+                return "Conversation picker cancelled."
+            if choice == _NEW_CONVERSATION:
+                try:
+                    title = input("Title for new conversation: ").strip()
+                except (KeyboardInterrupt, EOFError):
+                    return "Cancelled."
+                if not title:
+                    return "Cancelled."
+                conv = store.create(title, project_id=default_project)
+                return engine.switch_session(conv)
+            return engine.switch_session(choice)
+
+        def _confirm_delete(target_id: str) -> bool:
+            try:
+                ans = input(f"Delete conversation '{target_id}'? [y/N] ").strip().lower()
+            except (KeyboardInterrupt, EOFError):
+                return False
+            return ans in ("y", "yes")
+
+        result = handle_convo_command(
+            raw,
+            engine,
+            default_project=default_project,
+            interactive_picker=_run_picker if len(parts) == 1 else None,
+            confirm_delete=_confirm_delete,
+        )
+        if result:
+            chat_console.print(f"[green]{escape(result)}[/green]")
+        return
+
     if cmd == "/clear":
         flags = {p.lower() for p in parts[1:]}
         if "--hard" in flags:
@@ -1053,6 +1739,25 @@ def _handle_chat_slash_command(
             strategy = ClearStrategy.SOFT
         msg = engine.clear(strategy)
         chat_console.print(f"[green]{escape(msg)}[/green]")
+        return
+
+    if cmd == "/summarize":
+        if export_config is None:
+            chat_console.print(
+                "[yellow]/summarize requires workspace config; if you see this, file a bug.[/yellow]"
+            )
+            return
+        from engineering_hub.journaler.daemon import _end_of_day_clear
+
+        chat_console.print("[bold]Generating daily summary and archiving history...[/bold]")
+        try:
+            _end_of_day_clear(engine, export_config)
+            summary_path = export_config.state_dir / "daily_summaries"
+            chat_console.print(
+                f"[green]Daily summary written to[/green] [cyan]{summary_path}[/cyan]"
+            )
+        except Exception as exc:
+            chat_console.print(f"[red]Summary generation failed:[/red] {escape(str(exc))}")
         return
 
     if cmd == "/status":
@@ -1082,8 +1787,19 @@ def _handle_chat_slash_command(
         table.add_row("─" * 20, "─" * 10)
         table.add_row("[bold]Used[/bold]", f"[bold]{b.used:,}[/bold]")
         table.add_row("[bold]Available[/bold]", f"[bold]{b.available:,}[/bold]")
+        gen_headroom = max(
+            0,
+            b.window_size - b.used - engine.get_output_limit().headroom_safety_tokens,
+        )
+        table.add_row(
+            "[bold]Generation headroom (est.)[/bold]", f"[bold]{gen_headroom:,}[/bold]"
+        )
         table.add_row("[bold]Utilization[/bold]", f"[bold]{b.utilization:.0%}[/bold]")
         chat_console.print(table)
+        return
+
+    if cmd == "/output":
+        _handle_output_command(parts, engine, chat_console)
         return
 
     if cmd == "/topic":
@@ -1092,6 +1808,98 @@ def _handle_chat_slash_command(
             chat_console.print(f"[cyan]Current topic:[/cyan] {topic}")
         else:
             chat_console.print("[dim]No topic detected yet.[/dim]")
+        return
+
+    if cmd == "/persona":
+        action = parts[1].lower() if len(parts) >= 2 else ""
+
+        if action == "reset":
+            note = engine.reset_persona()
+            chat_console.print(f"[green]{escape(note)}[/green]")
+            return
+
+        if action == "list":
+            if delegator is not None and hasattr(delegator, "list_skills"):
+                skills = delegator.list_skills()
+                domain_skills = [s for s in skills if s.domain]
+                if domain_skills:
+                    chat_console.print("[bold]Domain-aware personas:[/bold]")
+                    for s in sorted(domain_skills, key=lambda x: x.domain):
+                        active_marker = (
+                            " [green](active)[/green]"
+                            if s.name == engine.active_persona
+                            else ""
+                        )
+                        chat_console.print(
+                            f"  [cyan]{s.name}[/cyan]{active_marker} "
+                            f"[dim](domain: {s.domain})[/dim] — "
+                            f"{s.description.splitlines()[0]}"
+                        )
+                else:
+                    chat_console.print(
+                        "[dim]No skills with domain fields loaded. "
+                        "Add 'domain:' to skill YAML files to enable routing.[/dim]"
+                    )
+            else:
+                chat_console.print("[dim]Delegator not available.[/dim]")
+            return
+
+        if not action:
+            if engine.active_persona:
+                chat_console.print(
+                    f"[cyan]Active persona:[/cyan] [bold]{engine.active_persona}[/bold]"
+                )
+                if engine.domain_shift_detector is not None:
+                    chat_console.print(
+                        f"[dim]Active domain:[/dim] "
+                        f"{engine.domain_shift_detector.active_domain or '—'}"
+                    )
+            else:
+                chat_console.print("[dim]No persona active (default Journaler).[/dim]")
+                if engine.domain_shift_detector is not None:
+                    chat_console.print(
+                        "[dim]Use /persona list to see domain-aware personas, "
+                        "/persona <name> to switch.[/dim]"
+                    )
+            return
+
+        # /persona <name> — immediate swap
+        skill_name = action
+        skill_def = None
+        if delegator is not None and hasattr(delegator, "list_skills"):
+            skill_def = next(
+                (s for s in delegator.list_skills() if s.name == skill_name),
+                None,
+            )
+            if skill_def is None:
+                # Try alias resolution
+                resolved = delegator.resolve_agent_type(skill_name) if hasattr(delegator, "resolve_agent_type") else None
+                if resolved:
+                    skill_def = next(
+                        (s for s in delegator.list_skills() if s.name == resolved),
+                        None,
+                    )
+
+        if skill_def is not None:
+            note = engine.swap_persona(
+                skill_def.name,
+                skill_def.display_name,
+                skill_def.description,
+            )
+            chat_console.print(f"[green]{escape(note)}[/green]")
+        else:
+            available = (
+                ", ".join(
+                    s.name for s in delegator.list_skills() if s.domain
+                )
+                if delegator is not None and hasattr(delegator, "list_skills")
+                else "none"
+            )
+            chat_console.print(
+                f"[yellow]Unknown persona '{skill_name}'.[/yellow] "
+                f"Available domain personas: {available or '(none loaded)'}\n"
+                "[dim]Use /persona list to see all options.[/dim]"
+            )
         return
 
     if cmd == "/load":
@@ -1124,6 +1932,82 @@ def _handle_chat_slash_command(
             chat_console.print(f"[{color}]{escape(line)}[/{color}]")
         return
 
+    if cmd == "/load_recent":
+        from datetime import datetime as _dt
+
+        from engineering_hub.journaler.recent_files import (
+            collect_recent_files,
+            default_recent_roots,
+        )
+
+        list_only = "--list" in parts
+        default_limit = int(
+            getattr(export_settings, "journaler_load_recent_max_files", 5) or 5
+        )
+        default_days = getattr(export_settings, "journaler_load_recent_days", 30)
+
+        limit = default_limit
+        days: int | None = default_days
+        positional = [p for p in parts[1:] if not p.startswith("-")]
+        if positional:
+            try:
+                limit = int(positional[0])
+            except ValueError:
+                chat_console.print(
+                    "[yellow]Usage: /load_recent [N] [--days D] [--list][/yellow]"
+                )
+                return
+        if "--days" in parts:
+            idx = parts.index("--days")
+            try:
+                days = int(parts[idx + 1])
+            except (IndexError, ValueError):
+                chat_console.print("[yellow]--days expects an integer[/yellow]")
+                return
+
+        roots = default_recent_roots(export_config, export_settings)
+        if not roots:
+            chat_console.print(
+                "[yellow]/load_recent could not resolve any scan roots "
+                "(start with 'journaler chat').[/yellow]"
+            )
+            return
+
+        files = collect_recent_files(
+            roots,
+            extensions=SUPPORTED_EXTENSIONS,
+            limit=limit,
+            days=days,
+        )
+        if not files:
+            window = f" in the last {days} day(s)" if days else ""
+            chat_console.print(f"[dim]No recent files found{window}.[/dim]")
+            return
+
+        if list_only:
+            chat_console.print(
+                f"[bold]Most recently created files (top {len(files)}):[/bold]"
+            )
+            for i, rf in enumerate(files, 1):
+                created = _dt.fromtimestamp(rf.created_ts).strftime("%Y-%m-%d %H:%M")
+                chat_console.print(
+                    f"  [cyan]{i}.[/cyan] [dim]{created}[/dim] "
+                    f"[magenta]{rf.root_label}[/magenta] {escape(str(rf.path))}"
+                )
+            chat_console.print("[dim]Run /load_recent without --list to load them.[/dim]")
+            return
+
+        for rf in files:
+            created = _dt.fromtimestamp(rf.created_ts).strftime("%Y-%m-%d %H:%M")
+            chat_console.print(
+                f"[dim]({rf.root_label}, created {created})[/dim] {escape(str(rf.path))}"
+            )
+            ok, msg = engine.load_file(rf.path, extensions=SUPPORTED_EXTENSIONS)
+            color = "green" if ok else "red"
+            for line in msg.splitlines():
+                chat_console.print(f"[{color}]{escape(line)}[/{color}]")
+        return
+
     if cmd == "/load_browse":
         if org_roam_dir is None:
             chat_console.print(
@@ -1131,8 +2015,6 @@ def _handle_chat_slash_command(
                 "(set journaler.org_journal_dir or start with 'journaler chat')[/yellow]"
             )
             return
-
-        from engineering_hub.journaler.file_browser import browse_org_roam
 
         chat_console.print("[dim]Opening file browser… (Esc or q to cancel)[/dim]")
         selected = browse_org_roam(org_roam_dir, SUPPORTED_EXTENSIONS)
@@ -1307,8 +2189,7 @@ def _handle_chat_slash_command(
         if not heading or not text:
             chat_console.print("[yellow]Usage: /note <heading> :: <text>[/yellow]")
             return
-        from datetime import datetime as _dt
-        from engineering_hub.journaler.org_writer import _today_journal_path, _create_journal_file
+        from engineering_hub.journaler.org_writer import _create_journal_file, _today_journal_path
         today_path = _today_journal_path(journal_dir)
         _create_journal_file(today_path)
         ok, msg = append_to_heading(today_path, heading, text, create_heading_if_missing=True)
@@ -1438,6 +2319,26 @@ def _handle_chat_slash_command(
             chat_console.print(f"[green]Opened for /edit:[/green] {res}")
         return
 
+    if cmd == "/integrate":
+        if task_integrator is None:
+            chat_console.print(
+                "[yellow]/integrate requires a configured Task-Integrator "
+                "(start from a configured workspace).[/yellow]"
+            )
+            return
+        sub = parts[1].lower() if len(parts) > 1 else ""
+        if sub == "status":
+            chat_console.print(f"[green]{escape(task_integrator.status_summary())}[/green]")
+            return
+        chat_console.print("[dim]Running Task-Integrator cycle…[/dim]")
+        result = task_integrator.run_cycle()
+        chat_console.print(f"[green]{escape(result.summary())}[/green]")
+        chat_console.print(
+            f"[dim]Review and reply inline under "
+            f"'* {task_integrator.conversation_section}' in today's journal.[/dim]"
+        )
+        return
+
     chat_console.print(
         f"[yellow]Unknown command '{cmd}'. Type /help for available commands.[/yellow]"
     )
@@ -1449,13 +2350,13 @@ def cmd_journaler(args: argparse.Namespace) -> int:
     if sub is None:
         console.print(
             "[yellow]Usage: engineering-hub journaler"
-            " {start|chat|briefing|export|status|scan|clear|download}[/yellow]"
+            " {start|chat|tui|briefing|summarize|export|status|scan|clear|download|pipeline}[/yellow]"
         )
         return 1
 
     settings = load_settings(args.config)
 
-    needs_model = sub in ("start", "chat") or (
+    needs_model = sub in ("start", "chat", "tui", "summarize") or (
         sub == "briefing" and not getattr(args, "latest", False)
     ) or (sub == "export" and getattr(args, "summarize", False))
 
@@ -1490,7 +2391,14 @@ def cmd_journaler(args: argparse.Namespace) -> int:
 
     from engineering_hub.corpus_service_factory import build_corpus_service_from_settings
     from engineering_hub.journaler.context import JournalContext
-    from engineering_hub.journaler.daemon import JournalerConfig, generate_briefing_now, run_daemon
+    from engineering_hub.journaler.conversations_config import conversations_config_from_settings
+    from engineering_hub.journaler.daemon import (
+        JournalerConfig,
+        generate_briefing_now,
+        output_limit_config_from_settings,
+        pressure_config_from_settings,
+        run_daemon,
+    )
 
     memory_service = None
     if settings.memory_enabled:
@@ -1507,6 +2415,7 @@ def cmd_journaler(args: argparse.Namespace) -> int:
             console.print(f"[yellow]Warning:[/yellow] Memory service unavailable: {exc}")
 
     corpus_service = build_corpus_service_from_settings(settings)
+    web_search_provider = build_agent_search_provider_from_settings(settings)
 
     config = JournalerConfig(
         model_path=spec.model_path,
@@ -1518,6 +2427,7 @@ def cmd_journaler(args: argparse.Namespace) -> int:
         briefing_enabled=settings.journaler_briefing_enabled,
         briefing_time=settings.journaler_briefing_time,
         briefing_output_dir=settings.journaler_briefing_output_dir,
+        briefing_append_to_journal=settings.journaler_briefing_append_to_journal,
         chat_enabled=settings.journaler_chat_enabled,
         chat_host=settings.journaler_chat_host,
         chat_port=settings.journaler_chat_port,
@@ -1525,7 +2435,14 @@ def cmd_journaler(args: argparse.Namespace) -> int:
         slack_webhook_url=settings.journaler_slack_webhook_url,
         max_conversation_history=settings.journaler_max_conversation_history,
         max_tokens=spec.max_tokens,
+        max_thinking_tokens=spec.max_thinking_tokens,
         model_context_window=spec.model_context_window,
+        context_management=pressure_config_from_settings(
+            settings,
+            model_context_window=spec.model_context_window,
+            max_history_turns=settings.journaler_max_conversation_history,
+        ),
+        output_limit=output_limit_config_from_settings(settings),
         temp=spec.temp,
         top_p=spec.top_p,
         min_p=spec.min_p,
@@ -1534,6 +2451,13 @@ def cmd_journaler(args: argparse.Namespace) -> int:
         mlx_backend=spec.mlx_backend,
         memory_service=memory_service,
         corpus_service=corpus_service,
+        web_search_provider=web_search_provider,
+        web_search_enabled=settings.agent_web_search_enabled,
+        web_search_max_results=settings.agent_web_search_max_results,
+        web_search_max_chars=settings.agent_web_search_max_chars,
+        web_search_anthropic_backup_enabled=settings.agent_web_search_anthropic_backup_enabled,
+        web_search_anthropic_tool_version=settings.agent_web_search_anthropic_tool_version,
+        web_search_anthropic_max_uses=settings.agent_web_search_anthropic_max_uses,
         load_max_context_fraction=settings.journaler_load_max_context_fraction,
         load_max_chars_absolute=settings.journaler_load_max_chars_absolute,
         load_min_chars=settings.journaler_load_min_chars,
@@ -1546,6 +2470,41 @@ def cmd_journaler(args: argparse.Namespace) -> int:
         scan_org_roam_tree=settings.journaler_scan_org_roam_tree,
         journal_lookback_days=settings.journaler_journal_lookback_days,
         journal_max_files=settings.journaler_journal_max_files,
+        pending_tasks_file=settings.resolved_journaler_pending_tasks_file,
+        conversation_lookback_days=settings.journaler_conversation_lookback_days,
+        conversation_summary_excerpt_chars=(
+            settings.journaler_conversation_summary_excerpt_chars
+        ),
+        roam_task_lookback_days=settings.journaler_roam_task_lookback_days,
+        roam_task_max_files=settings.journaler_roam_task_max_files,
+        prose_completion_detection=settings.journaler_prose_completion_detection,
+        org_link_on_relation=settings.journaler_org_link_on_relation,
+        discussion_briefing_enabled=settings.journaler_discussion_briefing_enabled,
+        discussion_briefing_time=settings.journaler_discussion_briefing_time,
+        personas_dir=settings.journaler_personas_dir,
+        discussion_persona_lookback_days=settings.journaler_discussion_persona_lookback_days,
+        discussion_max_tokens_per_persona=settings.journaler_discussion_max_tokens_per_persona,
+        coordination_scan_enabled=settings.journaler_coordination_scan_enabled,
+        coordination_scan_interval_min=settings.journaler_coordination_scan_interval_min,
+        proactive_topic_scout_enabled=settings.journaler_proactive_topic_scout_enabled,
+        proactive_topic_scout_max_tokens=settings.journaler_proactive_topic_scout_max_tokens,
+        background_work_enabled=settings.journaler_background_work_enabled,
+        background_work_interval_min=settings.journaler_background_work_interval_min,
+        background_work_max_tasks_per_day=settings.journaler_background_work_max_tasks_per_day,
+        background_work_auto_approve=settings.journaler_background_work_auto_approve,
+        background_work_agent_backend=settings.journaler_background_work_agent_backend,
+        background_work_chat_lookback_days=settings.journaler_background_work_chat_lookback_days,
+        task_integrator_enabled=settings.journaler_task_integrator_enabled,
+        task_integrator_interval_min=settings.journaler_task_integrator_interval_min,
+        task_integrator_conversation_section=settings.journaler_task_integrator_conversation_section,
+        task_integrator_output_section=settings.journaler_task_integrator_output_section,
+        task_integrator_excluded_sections=list(
+            settings.journaler_task_integrator_excluded_sections
+        ),
+        task_integrator_max_questions=settings.journaler_task_integrator_max_questions,
+        task_integrator_weekdays_only=settings.journaler_task_integrator_weekdays_only,
+        task_integrator_max_tokens=settings.journaler_task_integrator_max_tokens,
+        conversations=conversations_config_from_settings(settings),
     )
 
     if sub == "start":
@@ -1559,6 +2518,12 @@ def cmd_journaler(args: argparse.Namespace) -> int:
         )
         if config.briefing_enabled:
             console.print(f"  Briefing at: {config.briefing_time}")
+        if config.discussion_briefing_enabled:
+            console.print(f"  Discussion briefing at: {config.discussion_briefing_time}")
+        if config.coordination_scan_enabled and config.coordination_scan_interval_min > 0:
+            console.print(
+                f"  Coordination scan every: {config.coordination_scan_interval_min}min"
+            )
         if config.chat_enabled:
             console.print(f"  Chat: http://{config.chat_host}:{config.chat_port}")
         try:
@@ -1572,15 +2537,16 @@ def cmd_journaler(args: argparse.Namespace) -> int:
 
     elif sub == "chat":
         from engineering_hub.journaler.chat_repl import (
-            COMMAND_CATALOG,
             _PALETTE_SENTINEL,
+            COMMAND_CATALOG,
             configure_chat_readline,
             prompt_line,
             set_pending_insertion,
         )
-        from engineering_hub.journaler.file_browser import browse_commands
+        from engineering_hub.code.pi_executor import build_pi_executor
         from engineering_hub.journaler.delegator import build_delegator
         from engineering_hub.journaler.engine import ConversationEngine
+        from engineering_hub.journaler.file_browser import browse_commands
         from engineering_hub.journaler.prompts import (
             build_skills_block,
             build_workspace_layout,
@@ -1601,6 +2567,9 @@ def cmd_journaler(args: argparse.Namespace) -> int:
             scan_org_roam_tree=config.scan_org_roam_tree,
             journal_lookback_days=config.journal_lookback_days,
             journal_max_files=config.journal_max_files,
+            pending_tasks_file=settings.resolved_journaler_pending_tasks_file,
+            conversation_lookback_days=config.conversation_lookback_days,
+            conversation_summary_excerpt_chars=config.conversation_summary_excerpt_chars,
         )
         ctx.scan()
 
@@ -1613,17 +2582,39 @@ def cmd_journaler(args: argparse.Namespace) -> int:
             ctx.get_current_context(),
             workspace_map=workspace_map,
         )
+        pressure_cfg_chat = config.get_pressure_config()
         engine = ConversationEngine(
             backend=backend,
             system_prompt=system_prompt,
             log_dir=config.state_dir,
             max_history=config.max_conversation_history,
             max_tokens=config.max_tokens,
-            pressure_config=config.get_pressure_config(),
+            max_thinking_tokens=config.max_thinking_tokens,
+            pressure_config=pressure_cfg_chat,
+            output_limit=config.get_output_limit(),
             model_context_window=config.model_context_window,
             corpus_service=config.corpus_service,
             load_file_budget=config.get_load_file_budget(),
+            memory_service=config.memory_service,
+            journal_dir=config.journal_dir,
+            relation_threshold=pressure_cfg_chat.conversation_relation_threshold,
+            org_link_on_relation=config.org_link_on_relation,
+            web_search_provider=config.web_search_provider,
+            web_search_enabled=config.web_search_enabled,
+            web_search_max_results=config.web_search_max_results,
+            web_search_max_chars=config.web_search_max_chars,
+            web_search_anthropic_backup_enabled=config.web_search_anthropic_backup_enabled,
+            web_search_anthropic_tool_version=config.web_search_anthropic_tool_version,
+            web_search_anthropic_max_uses=config.web_search_anthropic_max_uses,
         )
+        # Interactive truncation recovery menu for output_limit.policy == "prompt".
+        engine.set_output_choice_provider(_interactive_output_choice(console))
+
+        from engineering_hub.journaler.conversations_config import attach_conversations_to_engine
+
+        conv_status = attach_conversations_to_engine(engine, config)
+        if conv_status:
+            console.print(f"[dim]{escape(conv_status)}[/dim]")
 
         delegator = build_delegator(
             backend,
@@ -1631,24 +2622,39 @@ def cmd_journaler(args: argparse.Namespace) -> int:
             skills_dir=config.skills_dir,
             default_backend=config.agent_backend,
             output_dir=config.workspace_dir / "outputs",
+            pi_executor=build_pi_executor(settings),
+            proposal_dir=settings.zettelkasten_resolved_proposal_dir,
+            zettel_state_path=settings.journaler_state_dir / "zettelkasten_state.json",
+            org_journal_dir=settings.org_journal_dir,
+            corpus_service=config.corpus_service,
+            memory_service=config.memory_service,
         )
         if delegator is not None:
             skills_text = build_skills_block(delegator)
             if skills_text:
                 engine._system_prompt = engine._system_prompt.rstrip() + "\n\n" + skills_text
+            # Sync base_system_prompt so persona swaps preserve the skills block.
+            engine.base_system_prompt = engine._system_prompt
+            # Wire domain-shift detection to the loaded skills.
+            from engineering_hub.journaler.context_manager import DomainShiftDetector
+            skills_map = {s.name: s for s in delegator.list_skills()}
+            engine.domain_shift_detector = DomainShiftDetector(skills_map)
+
+        from engineering_hub.journaler.task_integrator import build_task_integrator
+
+        task_integrator = build_task_integrator(config, engine, delegator)
 
         configure_chat_readline(
             config.state_dir,
-            conversation_jsonl=config.state_dir / "conversation.jsonl",
+            conversation_jsonl=engine._log_file,
         )
 
-        transcript_path = config.state_dir / "conversation.jsonl"
+        transcript_path = engine._log_file
         max_hist = config.max_conversation_history
-        model_label = spec.profile_name or Path(spec.model_path).name
         console.print(
             "[green]Journaler ready. "
             "Type your questions (Ctrl-C, /exit, or exit to leave).[/green]\n"
-            "[dim]Tip: /agent and /skills for agent personas; /model to switch profile; "
+            "[dim]Tip: /agent and /skills for agent personas; /model_browse to switch model; "
             "/load for files; /load_browse to browse; /help for commands.[/dim]\n"
             "[dim]Ctrl+P opens the command palette. Tab completes slash commands.[/dim]\n"
             "[dim]Context: /status, /budget, /topic — "
@@ -1658,7 +2664,11 @@ def cmd_journaler(args: argparse.Namespace) -> int:
             f"Longer model memory: raise journaler.max_conversation_history "
             f"(now {max_hist}).[/dim]\n"
         )
-        console.print(_build_status_bar(engine, model_label))
+        console.print(
+            _build_status_bar(
+                engine, journaler_model_display_label(chat_model_ctx.spec)
+            )
+        )
         log = logging.getLogger(__name__)
         try:
             while True:
@@ -1689,6 +2699,7 @@ def cmd_journaler(args: argparse.Namespace) -> int:
                             export_settings=settings,
                             export_config=config,
                             export_spec=spec,
+                            task_integrator=task_integrator,
                         )
                     except JournalerChatExit:
                         break
@@ -1698,10 +2709,62 @@ def cmd_journaler(args: argparse.Namespace) -> int:
                             f"[red]Command failed:[/red] {escape(str(exc))}\n"
                             "[dim]Type /help for commands. You can keep chatting.[/dim]\n"
                         )
-                    console.print(_build_status_bar(engine, model_label))
+                    console.print(
+                        _build_status_bar(
+                            engine,
+                            journaler_model_display_label(chat_model_ctx.spec),
+                        )
+                    )
                     continue
                 try:
-                    raw_response = engine.chat(user_input)
+                    from engineering_hub.journaler.chat_router import (
+                        route_natural_language_task,
+                    )
+                    from engineering_hub.journaler.chat_server import (
+                        _handle_agent_command,
+                    )
+
+                    mode = (settings.journaler_default_task_mode or "immediate").lower()
+                    if ctx is not None and not engine.focus_is_active():
+                        routed_result = route_natural_language_task(
+                            user_input,
+                            engine=engine,
+                            delegator=delegator,
+                            mode=mode,
+                            pending_tasks_file=settings.resolved_journaler_pending_tasks_file,
+                            run_agent_command=lambda cmd: _handle_agent_command(
+                                cmd, delegator, ctx, engine=engine
+                            ),
+                        )
+                    else:
+                        routed_result = None
+
+                    if routed_result is not None:
+                        console.print("\n[bold]Journaler:[/bold]")
+                        _print_chat_markdown(console, routed_result.response)
+                        console.print()
+                        console.print(
+                            _build_status_bar(
+                                engine,
+                                journaler_model_display_label(chat_model_ctx.spec),
+                            )
+                        )
+                        continue
+
+                    # Observe the message for domain shifts before the model call.
+                    if engine.domain_shift_detector is not None:
+                        engine.domain_shift_detector.observe(user_input)
+
+                    if chat_model_ctx.spec.streaming:
+                        console.print("\n[bold]Journaler:[/bold]")
+                        _chunks: list[str] = []
+                        for _tok in engine.stream_chat(user_input):
+                            console.print(_tok, end="", highlight=False)
+                            _chunks.append(_tok)
+                        console.print()
+                        raw_response = "".join(_chunks)
+                    else:
+                        raw_response = engine.chat(user_input)
                 except Exception as exc:
                     log.exception("Journaler chat turn failed")
                     console.print(
@@ -1716,8 +2779,13 @@ def cmd_journaler(args: argparse.Namespace) -> int:
                 )
 
                 response, dispatch_cmd = _extract_dispatch(raw_response)
-                console.print("\n[bold]Journaler:[/bold]")
-                _print_chat_markdown(console, response)
+                if not chat_model_ctx.spec.streaming:
+                    console.print("\n[bold]Journaler:[/bold]")
+                    _print_chat_markdown(console, response)
+                else:
+                    # In streaming mode the tokens were already printed above;
+                    # still parse for dispatch commands but skip re-printing.
+                    pass
                 console.print()
 
                 if dispatch_cmd and ctx is not None:
@@ -1746,27 +2814,248 @@ def cmd_journaler(args: argparse.Namespace) -> int:
                     else:
                         console.print("[dim]Dispatch cancelled.[/dim]\n")
 
-                console.print(_build_status_bar(engine, model_label))
+                # Domain shift confirmation — propose persona swap when warranted.
+                if (
+                    engine.domain_shift_detector is not None
+                    and engine.domain_shift_detector.pending_shift is not None
+                ):
+                    _handle_domain_shift_confirmation(
+                        engine, delegator, console
+                    )
+
+                console.print(
+                    _build_status_bar(
+                        engine, journaler_model_display_label(chat_model_ctx.spec)
+                    )
+                )
         except (KeyboardInterrupt, EOFError):
             pass
         console.print("\n[dim]Chat ended.[/dim]")
         return 0
 
+    elif sub == "tui":
+        from engineering_hub.journaler.delegator import build_delegator
+        from engineering_hub.journaler.engine import ConversationEngine
+        from engineering_hub.journaler.prompts import (
+            build_skills_block,
+            build_workspace_layout,
+            format_system_prompt,
+            load_system_prompt,
+        )
+
+        console.print("[bold]Loading Journaler for TUI mode...[/bold]")
+        backend = build_journaler_mlx_backend(spec)
+        ctx = JournalContext(
+            org_roam_dir=config.org_roam_dir,
+            journal_dir=config.journal_dir,
+            workspace_dir=config.workspace_dir,
+            memory_service=config.memory_service,
+            state_dir=config.state_dir,
+            watch_dirs=config.watch_dirs,
+            scan_org_roam_tree=config.scan_org_roam_tree,
+            journal_lookback_days=config.journal_lookback_days,
+            journal_max_files=config.journal_max_files,
+            pending_tasks_file=settings.resolved_journaler_pending_tasks_file,
+            conversation_lookback_days=config.conversation_lookback_days,
+            conversation_summary_excerpt_chars=config.conversation_summary_excerpt_chars,
+        )
+        ctx.scan()
+
+        system_template = load_system_prompt(config.state_dir)
+        workspace_map = build_workspace_layout(
+            config.org_roam_dir, config.workspace_dir, config.journal_dir
+        )
+        system_prompt = format_system_prompt(
+            system_template,
+            ctx.get_current_context(),
+            workspace_map=workspace_map,
+        )
+        pressure_cfg_tui = config.get_pressure_config()
+        engine = ConversationEngine(
+            backend=backend,
+            system_prompt=system_prompt,
+            log_dir=config.state_dir,
+            max_history=config.max_conversation_history,
+            max_tokens=config.max_tokens,
+            pressure_config=pressure_cfg_tui,
+            model_context_window=config.model_context_window,
+            corpus_service=config.corpus_service,
+            load_file_budget=config.get_load_file_budget(),
+            memory_service=config.memory_service,
+            journal_dir=config.journal_dir,
+            relation_threshold=pressure_cfg_tui.conversation_relation_threshold,
+            org_link_on_relation=config.org_link_on_relation,
+            web_search_provider=config.web_search_provider,
+            web_search_enabled=config.web_search_enabled,
+            web_search_max_results=config.web_search_max_results,
+            web_search_max_chars=config.web_search_max_chars,
+            web_search_anthropic_backup_enabled=config.web_search_anthropic_backup_enabled,
+            web_search_anthropic_tool_version=config.web_search_anthropic_tool_version,
+            web_search_anthropic_max_uses=config.web_search_anthropic_max_uses,
+        )
+
+        from engineering_hub.journaler.conversations_config import attach_conversations_to_engine
+
+        attach_conversations_to_engine(engine, config)
+
+        delegator = build_delegator(
+            backend,
+            anthropic_api_key=settings.journaler_delegation_api_key(),
+            skills_dir=config.skills_dir,
+            default_backend=config.agent_backend,
+            output_dir=config.workspace_dir / "outputs",
+            proposal_dir=settings.zettelkasten_resolved_proposal_dir,
+            zettel_state_path=settings.journaler_state_dir / "zettelkasten_state.json",
+            org_journal_dir=settings.org_journal_dir,
+            corpus_service=config.corpus_service,
+            memory_service=config.memory_service,
+        )
+        if delegator is not None:
+            skills_text = build_skills_block(delegator)
+            if skills_text:
+                engine._system_prompt = engine._system_prompt.rstrip() + "\n\n" + skills_text
+
+        chat_model_ctx = JournalerChatModelContext(settings, spec)
+        model_label = spec.profile_name or Path(spec.model_path).name
+
+        from engineering_hub.journaler.tui import run_tui
+
+        run_tui(
+            engine=engine,
+            delegator=delegator,
+            config=config,
+            model_label=model_label,
+            settings=settings,
+            model_ctx=chat_model_ctx,
+        )
+        return 0
+
     elif sub == "briefing":
-        if args.latest:
-            briefing_dir = config.briefing_output_dir or (config.state_dir / "briefings")
+        briefing_dir = config.briefing_output_dir or (config.state_dir / "briefings")
+
+        if getattr(args, "latest_discussion", False):
             if briefing_dir and briefing_dir.exists():
-                files = sorted(briefing_dir.glob("*.md"), reverse=True)
+                files = sorted(briefing_dir.glob("discussion-*.md"), reverse=True)
+                if files:
+                    console.print(files[0].read_text(encoding="utf-8"))
+                    return 0
+            console.print("[dim]No discussion briefings available yet.[/dim]")
+            return 0
+
+        if args.latest:
+            if briefing_dir and briefing_dir.exists():
+                # Exclude discussion-*.md files from standard --latest
+                files = sorted(
+                    [f for f in briefing_dir.glob("*.md") if not f.name.startswith("discussion-")],
+                    reverse=True,
+                )
                 if files:
                     console.print(files[0].read_text(encoding="utf-8"))
                     return 0
             console.print("[dim]No briefings available yet.[/dim]")
             return 0
 
+        if getattr(args, "coordination_scan", False):
+            from engineering_hub.journaler.daemon import (
+                _coordination_scan,
+                generate_briefing_now,
+            )
+
+            console.print("[bold]Running Coordination Analyst scan...[/bold]")
+            try:
+                # Build minimal context + engine via generate_briefing_now's bootstrap path
+                from engineering_hub.journaler.context import JournalContext
+                from engineering_hub.journaler.engine import (
+                    ConversationalMLXBackend,
+                    ConversationEngine,
+                )
+
+                ptf = config.pending_tasks_file
+                if ptf is None:
+                    ptf = config.workspace_dir / ".journaler" / "pending-tasks.org"
+                ctx = JournalContext(
+                    org_roam_dir=config.org_roam_dir,
+                    journal_dir=config.journal_dir,
+                    workspace_dir=config.workspace_dir,
+                    memory_service=config.memory_service,
+                    state_dir=config.state_dir,
+                    watch_dirs=config.watch_dirs,
+                    scan_org_roam_tree=config.scan_org_roam_tree,
+                    journal_lookback_days=config.journal_lookback_days,
+                    journal_max_files=config.journal_max_files,
+                    pending_tasks_file=ptf,
+                    conversation_lookback_days=config.conversation_lookback_days,
+                    conversation_summary_excerpt_chars=config.conversation_summary_excerpt_chars,
+                )
+                ctx.scan()
+                backend = ConversationalMLXBackend(
+                    model_path=config.model_path,
+                    temp=config.temp,
+                    top_p=config.top_p,
+                    min_p=config.min_p,
+                    repetition_penalty=config.repetition_penalty,
+                    backend=config.mlx_backend,
+                    enable_thinking=config.enable_thinking,
+                )
+                from engineering_hub.journaler.delegator import build_delegator
+
+                delegator = build_delegator(
+                    backend,
+                    anthropic_api_key=settings.journaler_delegation_api_key(),
+                    skills_dir=config.skills_dir,
+                    default_backend=config.agent_backend,
+                    output_dir=config.workspace_dir / "outputs",
+                    proposal_dir=settings.zettelkasten_resolved_proposal_dir,
+                    zettel_state_path=settings.journaler_state_dir / "zettelkasten_state.json",
+                    org_journal_dir=settings.org_journal_dir,
+                    corpus_service=config.corpus_service,
+                    memory_service=config.memory_service,
+                )
+                _coordination_scan(config=config, context=ctx, delegator=delegator)
+                output_dir = config.state_dir / "outputs" / "coordination"
+                from datetime import date as _date
+                today_str = _date.today().isoformat()
+                output_path = output_dir / f"{today_str}.md"
+                if output_path.exists():
+                    console.print(f"\n{escape(output_path.read_text(encoding='utf-8'))}")
+                else:
+                    console.print("[yellow]Coordination scan completed but produced no output.[/yellow]")
+            except Exception as exc:
+                console.print(f"[red]Error:[/red] {exc}")
+                return 1
+            return 0
+
+        if getattr(args, "discussion", False):
+            from engineering_hub.journaler.daemon import generate_discussion_now
+
+            console.print("[bold]Generating Topics Discussion Briefing...[/bold]")
+            try:
+                discussion = generate_discussion_now(config)
+                console.print(f"\n{escape(discussion)}")
+            except Exception as exc:
+                console.print(f"[red]Error:[/red] {exc}")
+                return 1
+            return 0
+
         console.print("[bold]Generating briefing on demand...[/bold]")
         try:
             briefing = generate_briefing_now(config)
             console.print(f"\n{escape(briefing)}")
+        except Exception as exc:
+            console.print(f"[red]Error:[/red] {exc}")
+            return 1
+        return 0
+
+    elif sub == "summarize":
+        from engineering_hub.journaler.daemon import generate_summary_now
+
+        console.print("[bold]Generating daily summary from today's conversation history...[/bold]")
+        try:
+            summary_path = generate_summary_now(config)
+            console.print(f"[green]Daily summary written to[/green] [cyan]{summary_path}[/cyan]")
+        except ValueError as exc:
+            console.print(f"[yellow]{escape(str(exc))}[/yellow]")
+            return 0
         except Exception as exc:
             console.print(f"[red]Error:[/red] {exc}")
             return 1
@@ -1804,6 +3093,9 @@ def cmd_journaler(args: argparse.Namespace) -> int:
             scan_org_roam_tree=config.scan_org_roam_tree,
             journal_lookback_days=config.journal_lookback_days,
             journal_max_files=config.journal_max_files,
+            pending_tasks_file=settings.resolved_journaler_pending_tasks_file,
+            conversation_lookback_days=config.conversation_lookback_days,
+            conversation_summary_excerpt_chars=config.conversation_summary_excerpt_chars,
         )
         snapshot = ctx.scan()
         console.print(f"  Last scan: {snapshot.last_scan}")
@@ -1814,7 +3106,7 @@ def cmd_journaler(args: argparse.Namespace) -> int:
 
     elif sub == "clear":
         from engineering_hub.journaler.context_manager import ClearStrategy
-        from engineering_hub.journaler.engine import ConversationalMLXBackend, ConversationEngine
+        from engineering_hub.journaler.engine import ConversationEngine
 
         hard = getattr(args, "hard", False)
         summarize = getattr(args, "summarize", False)
@@ -1848,8 +3140,8 @@ def cmd_journaler(args: argparse.Namespace) -> int:
             msg = engine.clear(strategy)
         else:
             from engineering_hub.journaler.context_manager import (
-                ConversationHistory,
                 ContextCompressor,
+                ConversationHistory,
                 execute_clear,
             )
             history = ConversationHistory()
@@ -1913,6 +3205,98 @@ def cmd_journaler(args: argparse.Namespace) -> int:
             body_to_stdout=True,
         )
 
+    elif sub == "pipeline":
+        pipeline_cmd = getattr(args, "pipeline_command", None)
+        if pipeline_cmd != "draft-section":
+            console.print(
+                "[yellow]Usage: engineering-hub journaler pipeline draft-section "
+                '--section "<section>" [--project <id>] [--backend auto|mlx|claude] '
+                "[--loop-limit <n>][/yellow]"
+            )
+            return 1
+
+        from engineering_hub.context.data_gatherer import DataGatherer
+        from engineering_hub.orchestration.pipeline import AgentPipeline
+
+        section = args.section
+        project_id: int | str | None = None
+        if args.pipeline_project_id is not None:
+            try:
+                project_id = int(args.pipeline_project_id)
+            except ValueError:
+                project_id = args.pipeline_project_id
+
+        backend = getattr(args, "pipeline_backend", "auto")
+        loop_limit = getattr(args, "pipeline_loop_limit", None)
+
+        output_dir = settings.workspace_dir / "outputs"
+        gatherer = DataGatherer(output_dir=output_dir)
+        pid_for_gather = project_id if project_id is not None else "unknown"
+
+        console.print(f"[bold]Gathering data files for section:[/bold] {section}")
+        bundle = gatherer.gather(project_id=pid_for_gather, section_hint=section)
+        console.print(f"  Files found: {bundle.summary_line()}")
+
+        if bundle.is_empty:
+            console.print(
+                "[yellow]Warning:[/yellow] No pre-processed result files found in staging directory.\n"
+                "  Ensure external scripts have written their output to:\n"
+                f"  {output_dir / 'staging' / f'project-{pid_for_gather}'}\n"
+                "  Continuing with empty data bundle."
+            )
+
+        # Build a lightweight delegator from settings for CLI use
+        from engineering_hub.journaler.delegator import build_delegator
+
+        api_key = settings.anthropic_api_key or ""
+
+        try:
+
+            mlx_backend = build_journaler_mlx_backend(spec)
+            delegator = build_delegator(
+                mlx_backend,
+                anthropic_api_key=api_key,
+                output_dir=output_dir,
+                proposal_dir=settings.zettelkasten_resolved_proposal_dir,
+                zettel_state_path=settings.journaler_state_dir / "zettelkasten_state.json",
+                org_journal_dir=settings.org_journal_dir,
+            )
+        except Exception as exc:
+            console.print(f"[red]Error:[/red] Could not initialise agent delegator: {exc}")
+            return 1
+
+        if delegator is None:
+            console.print(
+                "[red]Error:[/red] No agent backend available. "
+                "Configure 'anthropic.api_key' or ensure the MLX model is loaded."
+            )
+            return 1
+
+        pipeline = AgentPipeline(output_dir=output_dir / "pipeline")
+        console.print("[bold]Running drafting pipeline…[/bold]")
+
+        try:
+            result = pipeline.run(
+                section=section,
+                data_bundle=bundle,
+                delegator=delegator,
+                project_id=project_id,
+                backend=backend,
+                loop_limit=loop_limit,
+            )
+        except Exception as exc:
+            console.print(f"[red]Pipeline error:[/red] {exc}")
+            return 1
+
+        if result.artifact_path:
+            console.print(f"\n[bold green]Pipeline complete.[/bold green] Artifact: {result.artifact_path}")
+        if result.failed:
+            console.print(f"[red]Pipeline failed:[/red] {result.failure_reason}")
+            return 1
+
+        console.print(result.format_summary())
+        return 0
+
     console.print("[yellow]Unknown journaler command.[/yellow]")
     return 1
 
@@ -1949,7 +3333,7 @@ def cmd_template(args: argparse.Namespace) -> int:
             console.print(f"[red]Error:[/red] Analysis failed: {exc}")
             return 1
 
-        console.print(f"[bold green]Template analysis complete![/bold green]")
+        console.print("[bold green]Template analysis complete![/bold green]")
         console.print(f"  Name: {skeleton.name}")
         console.print(f"  Source docs: {skeleton.source_doc_count}")
         console.print(f"  Sections: {len(skeleton.sections)}")
@@ -2361,6 +3745,47 @@ def cmd_capture(args: argparse.Namespace) -> int:
     return 1
 
 
+def cmd_diagnostic(args: argparse.Namespace) -> int:
+    if args.diagnostic_command == "context-pipeline":
+        return cmd_diagnostic_context_pipeline(args)
+    return 1
+
+
+def cmd_diagnostic_context_pipeline(args: argparse.Namespace) -> int:
+    """Run synthetic tasks through ContextManager + optional AgentWorker; write artifacts."""
+    setup_logging(args.verbose)
+    settings = _apply_cli_overrides(load_settings(args.config), args)
+    settings = settings.model_copy(
+        update={
+            "context_pipeline_diagnostic_enabled": True,
+            "diagnostic_context_audit_prompt": getattr(
+                args, "context_audit_prompt", False
+            ),
+        }
+    )
+    tasks_path = Path(args.tasks).expanduser().resolve()
+    if not tasks_path.is_file():
+        console.print(f"[red]Error:[/red] Tasks file not found: {tasks_path}")
+        return 1
+    if not args.dry_run_context_only:
+        if err := _validate_llm_settings(settings):
+            return err
+
+    from engineering_hub.diagnostics.runner import run_context_pipeline_diagnostic
+
+    code, run_root = run_context_pipeline_diagnostic(
+        settings,
+        tasks_path,
+        max_tasks=args.max_tasks,
+        dry_run_context_only=args.dry_run_context_only,
+    )
+    console.print(
+        f"[bold green]Diagnostic run complete.[/bold green] "
+        f"Artifacts under:\n  {run_root}"
+    )
+    return code
+
+
 def cmd_memory(args: argparse.Namespace) -> int:
     """Query or inspect the local memory database."""
     setup_logging(args.verbose)
@@ -2517,8 +3942,8 @@ def cmd_load(args: argparse.Namespace) -> int:
     skipped = 0
     for file_path in candidates:
         try:
-            content = file_path.read_text(encoding="utf-8", errors="replace")
-        except OSError as exc:
+            content = read_path_content_for_load(file_path)
+        except Exception as exc:
             console.print(f"  [red]✗[/red] {file_path.name}: {exc}")
             skipped += 1
             continue
@@ -2543,6 +3968,166 @@ def cmd_load(args: argparse.Namespace) -> int:
         f"\n[bold green]Done.[/bold green] {stored} file(s) captured, {skipped} skipped."
     )
     return 0 if skipped == 0 else 1
+
+
+def _zettel_memory_service(settings: Settings) -> object | None:
+    """Build memory service for link suggestions when memory is enabled."""
+    if not settings.memory_enabled:
+        return None
+
+    return MemoryService.from_workspace(
+        workspace_dir=settings.workspace_dir,
+        ollama_host=settings.ollama_host,
+        ollama_model=settings.ollama_embed_model,
+        enabled=settings.memory_enabled,
+    )
+
+
+def _propose_zettelkasten_notes(
+    settings: Settings,
+    *,
+    memory_service: object | None = None,
+    lookback_days: int | None = None,
+) -> tuple[int, str]:
+    if not settings.zettelkasten_enabled:
+        return 1, "Zettelkasten workflow is disabled in config."
+
+    state_path = default_state_path(settings.workspace_dir)
+    state = ZettelkastenState.load(state_path)
+    days = lookback_days or settings.zettelkasten_journal_lookback_days
+    candidates = detect_candidates(
+        settings.org_journal_dir,
+        markers=settings.zettelkasten_markers,
+        lookback_days=days,
+    )
+    batch = create_proposal_batch(
+        candidates,
+        state=state,
+        memory_service=memory_service,
+        link_top_k=settings.zettelkasten_link_top_k,
+        link_threshold=settings.zettelkasten_link_similarity_threshold,
+    )
+    if not batch.notes:
+        return 0, (
+            f"No new Zettelkasten candidates found in the last {days} day(s). "
+            f"Scanned {len(candidates)} marked span(s)."
+        )
+
+    json_path, org_path = write_proposal_batch(
+        batch,
+        settings.zettelkasten_resolved_proposal_dir,
+        state=state,
+    )
+    state.save(state_path)
+    return 0, (
+        f"Created {len(batch.notes)} proposed note(s).\n"
+        f"Review: {org_path}\n"
+        f"Apply JSON: {json_path}"
+    )
+
+
+def cmd_zettel(args: argparse.Namespace) -> int:
+    """Mine daily journals for Zettelkasten note proposals."""
+    setup_logging(args.verbose)
+    settings = load_settings(args.config)
+    sub = getattr(args, "zettel_command", None)
+    if sub is None:
+        console.print("[yellow]Usage:[/yellow] engineering-hub zettel {propose|apply|status}")
+        return 1
+
+    state_path = default_state_path(settings.workspace_dir)
+    state = ZettelkastenState.load(state_path)
+
+    if sub == "propose":
+        memory_service = _zettel_memory_service(settings)
+        code, msg = _propose_zettelkasten_notes(
+            settings,
+            memory_service=memory_service,
+            lookback_days=args.days,
+        )
+        color = "green" if code == 0 else "red"
+        for line in msg.splitlines():
+            console.print(f"[{color}]{escape(line)}[/{color}]")
+        if memory_service is not None and hasattr(memory_service, "db"):
+            memory_service.db.close()
+        return code
+
+    if sub == "apply":
+        batch = load_proposal_batch(Path(args.proposal_json))
+        selected = set(args.proposal_id or []) or None
+        created = apply_proposal_batch(
+            batch,
+            roam_dir=settings.org_journal_dir.parent,
+            state=state,
+            proposal_ids=selected,
+        )
+        state.save(state_path)
+        if not created:
+            console.print("[yellow]No proposal notes were applied.[/yellow]")
+            return 1
+        console.print(f"[bold green]Applied {len(created)} note(s):[/bold green]")
+        for path in created:
+            console.print(f"  [cyan]{path}[/cyan]")
+        return 0
+
+    if sub == "status":
+        table = Table(title="Zettelkasten State")
+        table.add_column("Field", style="cyan")
+        table.add_column("Value", style="green")
+        table.add_row("State file", str(state_path))
+        table.add_row("Processed spans", str(len(state.processed_hashes)))
+        table.add_row("Proposal batches", str(len(state.proposal_batches)))
+        table.add_row("Proposal dir", str(settings.zettelkasten_resolved_proposal_dir))
+        table.add_row("Markers", ", ".join(settings.zettelkasten_markers))
+        console.print(table)
+        return 0
+
+    console.print("[yellow]Unknown zettel command.[/yellow]")
+    return 1
+
+
+def cmd_horn(args: argparse.Namespace) -> int:
+    """Run horn iterator parametric sweeps and show configured defaults."""
+    setup_logging(args.verbose)
+    settings = load_settings(args.config)
+    sub = getattr(args, "horn_command", None) or "defaults"
+
+    if sub == "defaults":
+        console.print(Markdown(horn_service.format_defaults_report(
+            horn_service.get_defaults(settings)
+        )))
+        return 0
+
+    if sub == "sweep":
+        overrides: dict[str, float] = {}
+        if getattr(args, "step_l", None) is not None:
+            overrides["step_l_mm"] = args.step_l
+        if getattr(args, "step_wh", None) is not None:
+            overrides["step_wh_mm"] = args.step_wh
+        if getattr(args, "flare_rate", None) is not None:
+            overrides["flare_rate_per_m"] = args.flare_rate
+
+        export_fmt = getattr(args, "export", None)
+        if export_fmt:
+            result = horn_service.run_sweep_and_export(
+                settings=settings, overrides=overrides, fmt=export_fmt
+            )
+        else:
+            result = horn_service.run_sweep(settings=settings, overrides=overrides)
+
+        console.print(Markdown(horn_service.format_sweep_report(result)))
+        export = result.get("export")
+        if export:
+            if export.get("success"):
+                console.print(
+                    f"[green]Exported {export['rows']} rows -> {export['path']}[/green]"
+                )
+            else:
+                console.print(f"[yellow]Export failed: {export.get('error')}[/yellow]")
+        return 0
+
+    console.print("[yellow]Usage:[/yellow] engineering-hub horn {sweep|defaults}")
+    return 1
 
 
 def main() -> int:
@@ -2755,12 +4340,33 @@ def main() -> int:
     journaler_sub = journaler_parser.add_subparsers(dest="journaler_command")
     journaler_sub.add_parser("start", help="Start the Journaler daemon")
     journaler_sub.add_parser("chat", help="Interactive chat with the Journaler model")
+    journaler_sub.add_parser(
+        "tui", help="Full-screen Textual TUI with sidebar navigation and command menus"
+    )
 
     briefing_p = journaler_sub.add_parser("briefing", help="Generate or view a briefing")
     briefing_p.add_argument(
         "--latest", action="store_true", help="View the latest briefing instead of generating"
     )
+    briefing_p.add_argument(
+        "--discussion",
+        action="store_true",
+        help="Generate a Topics Discussion Briefing (multi-persona roundtable) instead of the standard briefing",
+    )
+    briefing_p.add_argument(
+        "--latest-discussion",
+        action="store_true",
+        help="View the latest discussion briefing instead of generating",
+    )
+    briefing_p.add_argument(
+        "--coordination-scan",
+        action="store_true",
+        help="Run the Coordination Analyst against recent journal context",
+    )
 
+    journaler_sub.add_parser(
+        "summarize", help="Generate today's daily summary and archive conversation history"
+    )
     journaler_sub.add_parser("status", help="Show Journaler status")
     journaler_sub.add_parser("scan", help="Run a single org-roam scan")
     journaler_sub.add_parser(
@@ -2843,6 +4449,48 @@ def main() -> int:
         help="Create a new org-roam node with this #+title and export as body",
     )
 
+    # journaler pipeline subcommand
+    pipeline_p = journaler_sub.add_parser(
+        "pipeline",
+        help="Multi-stage report section drafting pipeline",
+    )
+    pipeline_sub = pipeline_p.add_subparsers(dest="pipeline_command")
+    draft_section_p = pipeline_sub.add_parser(
+        "draft-section",
+        help=(
+            "Gather pre-processed data files and run the full drafting pipeline: "
+            "technical-writer → standards-checker → technical-reviewer → latex-writer"
+        ),
+    )
+    draft_section_p.add_argument(
+        "--section",
+        required=True,
+        metavar="SECTION",
+        help='Report section label (e.g. "6.0 Noise Impacts")',
+    )
+    draft_section_p.add_argument(
+        "--project",
+        dest="pipeline_project_id",
+        default=None,
+        metavar="ID",
+        help="Django project ID for staging directory lookup",
+    )
+    draft_section_p.add_argument(
+        "--backend",
+        dest="pipeline_backend",
+        default="auto",
+        choices=["auto", "mlx", "claude"],
+        help="Agent backend to use for all stages (default: auto)",
+    )
+    draft_section_p.add_argument(
+        "--loop-limit",
+        dest="pipeline_loop_limit",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Override max retries for the standards-checker loop-back (default: 2)",
+    )
+
     # docker command
     docker_parser = subparsers.add_parser(
         "docker", help="Docker container management for agent tasks"
@@ -2880,6 +4528,55 @@ def main() -> int:
         help="Extra tag to attach (can be used multiple times)",
     )
 
+    # horn command
+    horn_parser = subparsers.add_parser(
+        "horn",
+        help="Parametric exponential-horn sweeps with LVT constraint validation",
+    )
+    horn_sub = horn_parser.add_subparsers(dest="horn_command")
+    horn_sub.add_parser("defaults", help="Show configured LVT constraints and sweep bounds")
+    horn_sweep_p = horn_sub.add_parser("sweep", help="Run the parametric horn sweep")
+    horn_sweep_p.add_argument("--export", choices=["csv", "org"], default=None,
+                              help="Export all rows to the horn_iterator output dir")
+    horn_sweep_p.add_argument("--step-l", dest="step_l", type=float, default=None,
+                              help="Override exponential-length step (mm)")
+    horn_sweep_p.add_argument("--step-wh", dest="step_wh", type=float, default=None,
+                              help="Override mouth width/height step (mm)")
+    horn_sweep_p.add_argument("--flare-rate", dest="flare_rate", type=float, default=None,
+                              help="Override flare rate m (/m)")
+
+    # zettel command
+    zettel_parser = subparsers.add_parser(
+        "zettel",
+        help="Mine org-roam journals for reviewable Zettelkasten note proposals",
+    )
+    zettel_sub = zettel_parser.add_subparsers(dest="zettel_command")
+
+    zettel_propose = zettel_sub.add_parser(
+        "propose",
+        help="Create a proposal buffer from marked daily-journal entries",
+    )
+    zettel_propose.add_argument(
+        "--days",
+        type=int,
+        default=None,
+        help="Override zettelkasten.journal_lookback_days",
+    )
+
+    zettel_apply = zettel_sub.add_parser(
+        "apply",
+        help="Apply approved proposals into the org-roam directory",
+    )
+    zettel_apply.add_argument("proposal_json", help="Proposal batch JSON file")
+    zettel_apply.add_argument(
+        "--proposal-id",
+        action="append",
+        default=None,
+        help="Apply only this proposal id (can be used multiple times)",
+    )
+
+    zettel_sub.add_parser("status", help="Show Zettelkasten proposal state")
+
     # memory command
     memory_parser = subparsers.add_parser("memory", help="Inspect the local memory database")
     memory_sub = memory_parser.add_subparsers(dest="memory_command")
@@ -2893,12 +4590,67 @@ def main() -> int:
     search_p.add_argument("query", help="Search query")
     search_p.add_argument("--k", type=int, default=5, help="Max results")
 
+    diag_parser = subparsers.add_parser(
+        "diagnostic",
+        help="Diagnostic utilities (context pipeline, etc.)",
+    )
+    diag_sub = diag_parser.add_subparsers(dest="diagnostic_command", required=True)
+    _repo_root = Path(__file__).resolve().parents[2]
+    cp_parser = diag_sub.add_parser(
+        "context-pipeline",
+        help="Run context pipeline tasks; write formatted context, checklist, and optional agent output",
+    )
+    cp_parser.add_argument(
+        "--tasks",
+        type=Path,
+        default=_repo_root / "diagnostics" / "context_pipeline_tasks.yaml",
+        help="YAML file with a top-level 'tasks' list",
+    )
+    cp_parser.add_argument(
+        "--max-tasks",
+        type=int,
+        default=10,
+        help="Maximum number of tasks to run from the file",
+    )
+    cp_parser.add_argument(
+        "--dry-run-context-only",
+        action="store_true",
+        help="Build and persist context only (no LLM calls)",
+    )
+    cp_parser.add_argument(
+        "--context-audit-prompt",
+        action="store_true",
+        dest="context_audit_prompt",
+        help="Append CONTEXT AUDIT diagnostic block to agent system prompts",
+    )
+    cp_parser.add_argument(
+        "--docker",
+        action="store_true",
+        default=None,
+        help="Run agent tasks in Docker (overrides docker.enabled)",
+    )
+    cp_parser.add_argument(
+        "--no-docker",
+        action="store_false",
+        dest="docker",
+        help="Force local agent execution",
+    )
+    cp_parser.add_argument(
+        "--llm-provider",
+        dest="llm_provider_override",
+        choices=["anthropic", "mlx", "ollama"],
+        help="Override llm_provider from config",
+    )
+
     args = parser.parse_args()
     setup_logging(args.verbose)
 
     if args.command is None:
         parser.print_help()
         return 0
+
+    if args.command == "diagnostic":
+        return cmd_diagnostic(args)
 
     commands = {
         "start": cmd_start,
@@ -2911,6 +4663,8 @@ def main() -> int:
         "journaler": cmd_journaler,
         "docker": cmd_docker,
         "load": cmd_load,
+        "zettel": cmd_zettel,
+        "horn": cmd_horn,
         "memory": cmd_memory,
         "weekly-review": cmd_weekly_review,
     }

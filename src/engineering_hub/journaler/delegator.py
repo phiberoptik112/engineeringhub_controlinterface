@@ -2,7 +2,7 @@
 
 Allows the Journaler to delegate tasks directly to named agent personalities
 (research, technical-writer, standards-checker, technical-reviewer, weekly-reviewer,
-latex-writer, panning-for-gold)
+latex-writer, panning-for-gold, lvt-task-extractor)
 using either the local MLX model already loaded in memory or the Claude API.
 
 Backend selection
@@ -39,15 +39,27 @@ from typing import TYPE_CHECKING, Any
 import yaml
 from pydantic import SecretStr
 
+from engineering_hub.agents.registry import AgentRegistry, ModelClass
 from engineering_hub.agents.worker import AgentWorker
 from engineering_hub.core.constants import AgentType
 from engineering_hub.core.models import ParsedTask, TaskStatus
 from engineering_hub.journaler.org_writer import add_todo_to_journal
+from engineering_hub.journaler.thinking import strip_think_blocks
 
 if TYPE_CHECKING:
+    from engineering_hub.code.pi_executor import PiExecutor
     from engineering_hub.journaler.engine import ConversationalMLXBackend
 
 logger = logging.getLogger(__name__)
+
+# Thinking-token budget for single-turn delegated agent tasks (Qwen3-style
+# <think> blocks); the reasoning transcript is stripped from the result.
+_DELEGATE_MAX_THINKING_TOKENS = 8192
+
+# Answer budget for delegated MLX agent tasks. Higher than the interactive chat
+# default because delegated deliverables (reports, protocols, plans) are long
+# documents; 4096 truncates them mid-section.
+_DELEGATE_MAX_OUTPUT_TOKENS = 8192
 
 
 def _anthropic_key_str(anthropic_api_key: SecretStr | str) -> str:
@@ -64,13 +76,20 @@ def build_delegator(
     default_backend: str = "mlx",
     output_dir: Path | None = None,
     prompts_dir: Path | None = None,
+    pi_executor: "PiExecutor | None" = None,
     corpus_service: Any | None = None,
     memory_service: Any | None = None,
+    proposal_dir: Path | None = None,
+    zettel_state_path: Path | None = None,
+    org_journal_dir: Path | None = None,
 ) -> AgentDelegator | None:
     """Construct an :class:`AgentDelegator` or return ``None`` if setup fails.
 
     Shared by the Journaler daemon and interactive ``journaler chat`` so both
     inject the same skills/persona metadata into the system prompt.
+
+    ``pi_executor`` (optional) enables the ``code-engineer`` agent; callers build
+    it from settings via :func:`engineering_hub.code.pi_executor.build_pi_executor`.
     """
     if output_dir is None:
         output_dir = Path.cwd() / "outputs"
@@ -86,6 +105,9 @@ def build_delegator(
                 output_dir=output_dir,
                 corpus_service=corpus_service,
                 memory_service=memory_service,
+                proposal_dir=proposal_dir,
+                zettel_state_path=zettel_state_path,
+                org_journal_dir=org_journal_dir,
             )
             logger.info("Claude API worker initialized for agent delegation")
 
@@ -96,8 +118,12 @@ def build_delegator(
             default_backend=default_backend,
             prompts_dir=prompts_dir,
             output_dir=output_dir,
+            pi_executor=pi_executor,
             corpus_service=corpus_service,
             memory_service=memory_service,
+            proposal_dir=proposal_dir,
+            zettel_state_path=zettel_state_path,
+            org_journal_dir=org_journal_dir,
         )
         logger.info(
             "AgentDelegator ready (default backend: %s, skills: %s)",
@@ -133,6 +159,53 @@ _AGENT_ALIASES: dict[str, str] = {
     "panning": "panning-for-gold",
     "pan-for-gold": "panning-for-gold",
     "gold": "panning-for-gold",
+    "code-engineer": "code-engineer",
+    "code": "code-engineer",
+    "coder": "code-engineer",
+    "eng": "code-engineer",
+    "engineer": "code-engineer",
+    "pi": "code-engineer",
+    "zettelkasten-curator": "zettelkasten-curator",
+    "zettelkasten": "zettelkasten-curator",
+    "zettel": "zettelkasten-curator",
+    "curator": "zettelkasten-curator",
+    "lvt-task-extractor": "lvt-task-extractor",
+    "lvt": "lvt-task-extractor",
+    "lvt-tasks": "lvt-task-extractor",
+    "lvt-extractor": "lvt-task-extractor",
+    "coordination-analyst": "coordination-analyst",
+    "coordination": "coordination-analyst",
+    "coordinator": "coordination-analyst",
+    "coord": "coordination-analyst",
+    "acoustic-sim-expert": "acoustic-sim-expert",
+    "acoustic-sim": "acoustic-sim-expert",
+    "sim-expert": "acoustic-sim-expert",
+    "nora": "acoustic-sim-expert",
+    "rental-scout": "rental-scout",
+    "rental": "rental-scout",
+    "scout": "rental-scout",
+    "housing": "rental-scout",
+    "blender": "blender",
+    "3d": "blender",
+    "blender-mcp": "blender",
+    "horn-iterator": "horn-iterator",
+    "horn": "horn-iterator",
+    "horn-sweep": "horn-iterator",
+    "waveguide": "horn-iterator",
+    "career-coach": "career-coach",
+    "career": "career-coach",
+    "coach": "career-coach",
+    "job-search": "career-coach",
+    "product-manager": "product-manager",
+    "product": "product-manager",
+    "pm": "product-manager",
+    "roadmap": "product-manager",
+    "compliance-advisor": "compliance-advisor",
+    "compliance": "compliance-advisor",
+    "legal-review": "compliance-advisor",
+    "timesheet-reviewer": "timesheet-reviewer",
+    "timesheet": "timesheet-reviewer",
+    "timesheets": "timesheet-reviewer",
 }
 
 
@@ -161,7 +234,22 @@ class JournalerMLXBackendAdapter:
             {"role": "system", "content": system},
             {"role": "user", "content": user_message},
         ]
-        return self._backend.chat(messages, max_tokens)
+        raw = self._backend.chat(
+            messages, max_tokens, max_thinking_tokens=_DELEGATE_MAX_THINKING_TOKENS
+        )
+        return strip_think_blocks(raw) or raw
+
+    def complete_with_tools(
+        self,
+        system: str,
+        messages: list[dict],
+        tools: list[dict],
+        max_tokens: int,
+    ) -> None:
+        raise NotImplementedError(
+            "MLX backend does not support tool calling; "
+            "use Claude API for tool-use agents."
+        )
 
     def test_connection(self) -> bool:
         return self._backend.is_loaded()
@@ -182,6 +270,8 @@ class SkillDef:
     description: str
     when_to_use: list[str] = field(default_factory=list)
     invocation_examples: list[str] = field(default_factory=list)
+    domain: str = ""
+    domain_triggers: list[str] = field(default_factory=list)
 
 
 def _load_skills(skills_dir: Path) -> dict[str, SkillDef]:
@@ -201,6 +291,8 @@ def _load_skills(skills_dir: Path) -> dict[str, SkillDef]:
                 description=data.get("description", "").strip(),
                 when_to_use=data.get("when_to_use", []),
                 invocation_examples=data.get("invocation_examples", []),
+                domain=data.get("domain", ""),
+                domain_triggers=data.get("domain_triggers", []),
             )
             skills[skill.name] = skill
             logger.debug(f"Loaded skill: {skill.name} ({skill.display_name})")
@@ -236,19 +328,29 @@ class AgentDelegator:
         default_backend: str = "mlx",
         prompts_dir: Path | None = None,
         output_dir: Path | None = None,
+        pi_executor: "PiExecutor | None" = None,
         corpus_service: Any | None = None,
         memory_service: Any | None = None,
+        proposal_dir: Path | None = None,
+        zettel_state_path: Path | None = None,
+        org_journal_dir: Path | None = None,
     ) -> None:
         self._default_backend = default_backend.lower()
         self._anthropic_worker = anthropic_worker
+        self._pi_executor = pi_executor
 
+        self._registry = AgentRegistry()
         self._mlx_adapter = JournalerMLXBackendAdapter(mlx_backend)
         self._mlx_worker = AgentWorker(
             backend=self._mlx_adapter,
             prompts_dir=prompts_dir,
             output_dir=output_dir,
+            max_tokens=_DELEGATE_MAX_OUTPUT_TOKENS,
             corpus_service=corpus_service,
             memory_service=memory_service,
+            proposal_dir=proposal_dir,
+            zettel_state_path=zettel_state_path,
+            org_journal_dir=org_journal_dir,
         )
 
         resolved_skills = skills_dir or _default_skills_dir()
@@ -269,6 +371,9 @@ class AgentDelegator:
         project_id: int | str | None = None,
         backend: str = "auto",
         journaler_context: str = "",
+        anthropic_web_search: bool = False,
+        anthropic_web_search_tool_version: str = "web_search_20250305",
+        anthropic_web_search_max_uses: int = 3,
     ) -> str:
         """Execute a task via the selected backend and return the result as a string.
 
@@ -296,11 +401,47 @@ class AgentDelegator:
         except ValueError:
             return f"Agent type '{resolved_type}' is not registered in the system."
 
+        # code-engineer runs via the external Pi coding agent (PiExecutor), not an
+        # LLMBackend worker; route it before worker selection.
+        if resolved_type == AgentType.CODE_ENGINEER.value:
+            return self._delegate_code_task(description, project_id, journaler_context)
+
         worker = self._select_worker(backend)
         if worker is None:
             return (
                 "No agent backend is available. "
                 "Configure 'anthropic.api_key' for Claude or ensure the MLX model is loaded."
+            )
+
+        # Auto-promote TOOL_USE agents from MLX to Claude when available, since
+        # MLX does not support structured tool calling.
+        try:
+            agent_model_class = self._registry.get_model_class(AgentType(resolved_type))
+        except ValueError:
+            agent_model_class = ModelClass.REASONING
+
+        if (
+            worker is self._mlx_worker
+            and agent_model_class == ModelClass.TOOL_USE
+            and self._default_backend != "mlx"
+        ):
+            if self._anthropic_worker:
+                logger.info(
+                    "Auto-promoting TOOL_USE agent '%s' from MLX to Claude API",
+                    resolved_type,
+                )
+                worker = self._anthropic_worker
+            else:
+                logger.warning(
+                    "Agent '%s' requires tool calling but MLX does not support it. "
+                    "Results may be incomplete. Configure anthropic.api_key for full capability.",
+                    resolved_type,
+                )
+        elif worker is self._mlx_worker and agent_model_class == ModelClass.TOOL_USE:
+            logger.info(
+                "TOOL_USE agent '%s' running on MLX (agent_backend=mlx); "
+                "tool calls will fall back to single-shot if unsupported.",
+                resolved_type,
             )
 
         task = ParsedTask(
@@ -320,7 +461,15 @@ class AgentDelegator:
         )
 
         try:
-            result = worker.execute(task, context=journaler_context)
+            result = worker.execute_with_options(
+                task,
+                context=journaler_context,
+                anthropic_web_search=(
+                    anthropic_web_search and worker is self._anthropic_worker
+                ),
+                anthropic_web_search_tool_version=anthropic_web_search_tool_version,
+                anthropic_web_search_max_uses=anthropic_web_search_max_uses,
+            )
         except Exception as exc:
             logger.error(f"Agent delegation failed: {exc}")
             return f"Agent execution failed: {exc}"
@@ -339,6 +488,58 @@ class AgentDelegator:
                 f"Agent task failed ({backend_label}): "
                 f"{result.error_message or 'unknown error'}"
             )
+
+    def _delegate_code_task(
+        self,
+        description: str,
+        project_id: int | str | None,
+        journaler_context: str,
+    ) -> str:
+        """Route a code-engineer task to the PiExecutor and format the result.
+
+        In Phase 1 the executor is a stub; the briefing is the journaler context.
+        """
+        if self._pi_executor is None:
+            return (
+                "The code-engineer agent is unavailable: no code projects are "
+                "configured. Add repositories under `code_projects:` in config.yaml."
+            )
+
+        task = ParsedTask(
+            agent=AgentType.CODE_ENGINEER.value,
+            status=TaskStatus.PENDING,
+            project_id=project_id,
+            description=description,
+            start_line=0,
+            end_line=0,
+            raw_block=f"@{AgentType.CODE_ENGINEER.value}: {description}",
+        )
+
+        logger.info(
+            "Delegating to code-engineer (project=%s): %s...",
+            project_id,
+            description[:60],
+        )
+
+        try:
+            result = self._pi_executor.execute_task(
+                task,
+                briefing=journaler_context,
+                mode="implement",
+            )
+        except Exception as exc:
+            logger.error("Code-engineer delegation failed: %s", exc)
+            return f"Code-engineer execution failed: {exc}"
+
+        if result.success:
+            header = f"**{self._skill_display_name(AgentType.CODE_ENGINEER.value)} — completed**"
+            if result.output_path:
+                header += f"\nDiff saved to: `{result.output_path}`"
+            body = result.agent_response or "(No response text returned)"
+            return f"{header}\n\n{body}"
+        return (
+            f"Code-engineer task failed: {result.error_message or 'unknown error'}"
+        )
 
     def write_to_journal(
         self,
@@ -379,6 +580,14 @@ class AgentDelegator:
         """Return the canonical agent type string for a given name/alias, or None."""
         return _AGENT_ALIASES.get(name.lower())
 
+    def aliases_for_agent(self, agent_type: str) -> list[str]:
+        """Return aliases that resolve to ``agent_type`` for routing prompts."""
+        return [
+            alias
+            for alias, resolved in sorted(_AGENT_ALIASES.items())
+            if resolved == agent_type
+        ]
+
     def is_known_agent(self, name: str) -> bool:
         """Return True if the name resolves to a known agent type."""
         return name.lower() in _AGENT_ALIASES
@@ -386,6 +595,11 @@ class AgentDelegator:
     def list_skills(self) -> list[SkillDef]:
         """Return all loaded skill definitions."""
         return list(self._skills.values())
+
+    def will_use_anthropic_backend(self, backend: str) -> bool:
+        """Return True if a backend request resolves to the Claude worker."""
+        worker = self._select_worker(backend)
+        return worker is not None and worker is self._anthropic_worker
 
     def skills_summary(self) -> str:
         """Return a formatted string of available skills for system prompt injection."""

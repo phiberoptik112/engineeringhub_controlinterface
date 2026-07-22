@@ -1,0 +1,47 @@
+name: code-engineer
+display_name: Code Engineer Agent
+agent_type: code-engineer
+
+description: |
+  Delegates software changes to the Pi coding agent inside an isolated git worktree of a
+  registered local repository. Pi reads the source itself (read/grep/find/ls) and edits it
+  (edit/write/bash); this agent supplies a cross-project briefing (prior decisions, standards,
+  related past changes) and captures the resulting diff for human review. Never merges to the
+  repo's default branch — always leaves a review branch plus a diff artifact.
+
+when_to_use:
+  - User wants a code change, refactor, bugfix, or new feature in a known local repo
+  - User wants a read-only code review of an existing repo
+  - User wants to scaffold or modify files in a project tracked in code_projects
+  - A queued overnight task targets a code repository rather than a document deliverable
+
+invocation_examples:
+  - "/agent code-engineer add retry with backoff to the API client --project myrepo"
+  - "/agent code-engineer fix the failing test in tests/test_parser.py --project myrepo"
+  - "/agent code review the auth module for security issues --project myrepo"
+
+domain: software-engineering
+domain_triggers:
+  - refactor
+  - bugfix
+  - implement
+  - patch
+  - unit test
+  - repo
+
+parameters:
+  project_id:
+    description: Key into code_projects (repo name) — selects the local checkout
+    required: true
+  description:
+    description: The coding task, in natural language
+    required: true
+
+output:
+  format: git-diff
+  structure:
+    - Branch name (pi/<slug>-<timestamp>)
+    - Unified diff artifact path
+    - Summary of Pi's actions (files touched)
+    - Pi final message
+  output_dir: code

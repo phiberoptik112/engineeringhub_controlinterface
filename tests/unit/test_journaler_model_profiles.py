@@ -8,9 +8,14 @@ from engineering_hub.config.settings import Settings
 from engineering_hub.journaler.constants import DEFAULT_JOURNALER_MLX_MODEL_ID
 from engineering_hub.journaler.engine import ConversationalMLXBackend
 from engineering_hub.journaler.model_profiles import (
+    DEFAULT_THINKING_MAX_TOKENS,
     JournalerChatModelContext,
     JournalerModelSpec,
+    _apply_model_set_command,
+    effective_generation_max_tokens,
     ensure_spec_model_path,
+    journaler_model_display_label,
+    model_status_data,
     parse_model_slash_message,
     resolve_journaler_model_spec,
     resolve_journaler_model_spec_for_slash,
@@ -83,6 +88,24 @@ def test_ensure_spec_model_path() -> None:
     assert out.model_path == DEFAULT_JOURNALER_MLX_MODEL_ID
 
 
+def test_journaler_model_display_label() -> None:
+    assert (
+        journaler_model_display_label(
+            JournalerModelSpec(model_path="mlx-community/Qwen3.6-35B-A3B-4bit")
+        )
+        == "Qwen3.6-35B-A3B-4bit"
+    )
+    assert (
+        journaler_model_display_label(
+            JournalerModelSpec(
+                model_path="mlx-community/gemma-4-31b-it-8bit",
+                profile_name="default",
+            )
+        )
+        == "default"
+    )
+
+
 def test_parse_model_slash_message() -> None:
     assert parse_model_slash_message("/model") == ("status", None, None)
     assert parse_model_slash_message("/model path  hub/x  ") == ("path", None, "hub/x")
@@ -130,8 +153,107 @@ def test_apply_chat_template_safe_falls_back_without_enable_thinking() -> None:
     assert prompt == "prompt"
 
 
+def test_journaler_model_display_label() -> None:
+    assert (
+        journaler_model_display_label(
+            JournalerModelSpec(model_path="mlx-community/Qwen3.6-35B-A3B-4bit")
+        )
+        == "Qwen3.6-35B-A3B-4bit"
+    )
+    assert (
+        journaler_model_display_label(
+            JournalerModelSpec(
+                model_path="mlx-community/gemma-4-31b-it-8bit",
+                profile_name="default",
+            )
+        )
+        == "default"
+    )
+
+
 def test_journaler_chat_model_context_dataclass() -> None:
     s = Settings()
     spec = JournalerModelSpec(model_path="hub/x")
     ctx = JournalerChatModelContext(s, spec)
     assert ctx.spec.model_path == "hub/x"
+
+
+def test_effective_generation_max_tokens_non_thinking() -> None:
+    spec = JournalerModelSpec(model_path="hub/x", max_tokens=4096, enable_thinking=False)
+    assert effective_generation_max_tokens(spec) == 4096
+
+
+def test_effective_generation_max_tokens_thinking_floor() -> None:
+    spec = JournalerModelSpec(model_path="hub/x", max_tokens=4096, enable_thinking=True)
+    assert effective_generation_max_tokens(spec) == DEFAULT_THINKING_MAX_TOKENS
+
+
+def test_effective_generation_max_tokens_thinking_override() -> None:
+    spec = JournalerModelSpec(
+        model_path="hub/x",
+        max_tokens=4096,
+        enable_thinking=True,
+        thinking_max_tokens=8192,
+    )
+    assert effective_generation_max_tokens(spec) == 8192
+
+
+def test_effective_generation_max_tokens_thinking_high_base() -> None:
+    spec = JournalerModelSpec(model_path="hub/x", max_tokens=20000, enable_thinking=True)
+    assert effective_generation_max_tokens(spec) == 20000
+
+
+def test_resolve_profile_thinking_max_tokens() -> None:
+    s = Settings()
+    s.journaler_model_profile = "reasoning"
+    s.journaler_models = {
+        "reasoning": {
+            "model_path": "hub/reasoning",
+            "enable_thinking": True,
+            "thinking_max_tokens": 8192,
+        }
+    }
+    spec = resolve_journaler_model_spec(s)
+    assert spec.thinking_max_tokens == 8192
+    assert effective_generation_max_tokens(spec) == 8192
+
+
+def test_model_status_shows_effective_when_thinking_on() -> None:
+    spec = JournalerModelSpec(model_path="hub/x", max_tokens=4096, enable_thinking=True)
+    rows = {name: value for name, value, _ in model_status_data(spec)}
+    assert rows["max_tokens"] == "4096"
+    assert rows["effective max_tokens"] == f"{DEFAULT_THINKING_MAX_TOKENS:,}"
+
+
+def test_apply_model_set_thinking_on_updates_engine_max_tokens() -> None:
+    class _Engine:
+        def __init__(self) -> None:
+            self._backend = type("_B", (), {"set_enable_thinking": lambda self, v: None})()
+            self.updated: int | None = None
+
+        def update_max_tokens(self, value: int) -> None:
+            self.updated = value
+
+    spec = JournalerModelSpec(model_path="hub/x", max_tokens=4096, enable_thinking=False)
+    engine = _Engine()
+    new_spec, msg = _apply_model_set_command("thinking", "on", spec, engine)
+    assert new_spec.enable_thinking is True
+    assert engine.updated == DEFAULT_THINKING_MAX_TOKENS
+    assert "effective max_tokens" in msg
+
+
+def test_apply_model_set_max_tokens_while_thinking() -> None:
+    class _Engine:
+        def __init__(self) -> None:
+            self.updated: int | None = None
+
+        def update_max_tokens(self, value: int) -> None:
+            self.updated = value
+
+    spec = JournalerModelSpec(model_path="hub/x", max_tokens=4096, enable_thinking=True)
+    engine = _Engine()
+    new_spec, msg = _apply_model_set_command("max_tokens", "8192", spec, engine)
+    assert new_spec.thinking_max_tokens == 8192
+    assert new_spec.max_tokens == 8192
+    assert engine.updated == 8192
+    assert "effective" in msg

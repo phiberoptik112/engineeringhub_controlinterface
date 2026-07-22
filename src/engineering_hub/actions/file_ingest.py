@@ -256,3 +256,21 @@ class FileIngestAction:
             sections.append({"title": "Content", "content": preview})
 
         return sections
+
+
+def read_path_content_for_load(path: Path) -> str:
+    """Read a file as UTF-8 text for journaler ``/load`` and memory ingest.
+
+    ``.docx`` and ``.pdf`` are converted to markdown via :class:`FileIngestAction`
+    (Docling when installed, otherwise ``python-docx`` / ``pypdf`` fallbacks).
+    All other extensions are read as UTF-8 text.
+    """
+    path = path.expanduser().resolve()
+    suffix = path.suffix.lower()
+    if suffix in (".pdf", ".docx"):
+        ingest = FileIngestAction(path.parent)
+        converted = ingest._convert_to_markdown(path)
+        if converted is None:
+            raise ValueError(f"Could not convert {suffix} file: {path.name}")
+        return converted
+    return path.read_text(encoding="utf-8", errors="replace")

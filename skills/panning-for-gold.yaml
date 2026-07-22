@@ -2,6 +2,16 @@ name: panning-for-gold
 display_name: Panning for Gold
 agent_type: panning-for-gold
 
+domain: pkm
+domain_triggers:
+  - pan for gold
+  - brain dump
+  - process transcript
+  - voice export
+  - what did i say
+  - meeting notes
+  - multi-topic
+
 # Original skill by Jared Irish v2.0.0; adapted for Engineering Hub Journaler delegation.
 
 description: |
@@ -57,6 +67,19 @@ extended_guide: |
 
   Auto speaker labels from recorders are often wrong (environment changes fragment labels). Ask who was present and setting first. If label count > 2× expected speakers, do anchor lines + scene-based re-attribution; batch MEDIUM/LOW guesses for one user correction pass. Re-extract if mis-attribution changes meaning materially.
 
+  ## Phase 0.5 – Domain shift check (Dynamic Prompt Routing)
+
+  Before extraction: inspect whether the input is primarily career, product, compliance, or
+  another non-acoustic domain. If so:
+  1. Note the detected domain at the top of the Phase 1 inventory (e.g. "[Domain: career]").
+  2. Include a gold-found synthesis note suggesting the matching `/persona` swap.
+  3. Recommend `/persona career-coach`, `/persona product-manager`, or
+     `/persona compliance-advisor` as appropriate so the Journaler operates in the
+     correct mode for follow-up questions.
+
+  This step prevents extraction filtered through an acoustic-engineering lens when the
+  content is about job offers, product requirements, or contract review.
+
   ## Lessons log (from original skill)
 
   | Date | Lesson | Change |
@@ -67,6 +90,7 @@ extended_guide: |
   | 2026-03-18 | Fragmented speaker labels misled attribution | Phase 0.5 speaker cleanup |
   | 2026-03-18 | Wrong labels swapped pain vs pitch | Anchors + scenes + re-extract decision |
   | 2026-03-18 | Under-extraction | Default over-extract; Phase 2 triages |
+  | 2026-06-12 | Agent system prompts rigidly tied to acoustic domain broke career/compliance/product content | Phase 0.5 Domain shift check; /persona routing; career-coach, product-manager, compliance-advisor skills added |
 
   ## Red flags: rushing
 

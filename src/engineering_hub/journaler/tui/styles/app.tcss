@@ -1,0 +1,391 @@
+/* Engineering Hub Journaler TUI — Dark theme with cyan/green accents */
+
+Screen {
+    background: $background;
+}
+
+Header {
+    background: $primary-background;
+    color: $text;
+    text-style: bold;
+}
+
+Footer {
+    background: $primary-background;
+}
+
+/* Main layout: sidebar column + content area */
+#main-container {
+    height: 1fr;
+}
+
+/* Left sidebar column — wraps BrowserNavBar + CategorySidebar tree */
+#sidebar-column {
+    width: 28;
+    min-width: 20;
+    max-width: 36;
+    dock: left;
+    border-right: solid $primary-background-lighten-2;
+    background: $surface;
+}
+
+BrowserNavBar {
+    height: auto;
+    min-height: 5;
+    padding: 1;
+    background: $primary-background;
+    color: $accent;
+    border-bottom: solid $primary-background-lighten-2;
+}
+
+/* Tree fills remaining sidebar space */
+#sidebar {
+    height: 1fr;
+    padding: 1 0;
+    background: $surface;
+}
+
+#sidebar > .tree--label {
+    color: $accent;
+    text-style: bold;
+}
+
+/* Content area takes remaining space */
+#content-area {
+    width: 1fr;
+    height: 1fr;
+}
+
+/* Content switcher fills available space */
+#content-switcher {
+    height: 1fr;
+}
+
+/* Chat view */
+ChatView {
+    height: 1fr;
+    border: solid $primary-background-lighten-2;
+    padding: 0 1;
+    scrollbar-gutter: stable;
+    background: $background;
+}
+
+/* Command grid */
+CommandGrid {
+    height: 1fr;
+    padding: 1 2;
+    background: $background;
+}
+
+#category-header {
+    margin-bottom: 1;
+    text-style: bold;
+    color: $accent;
+}
+
+#grid-placeholder {
+    margin: 2;
+    color: $text-muted;
+    text-align: center;
+}
+
+/* Command cards */
+CommandCard {
+    height: auto;
+    min-height: 3;
+    padding: 1 2;
+    margin: 0 1 1 0;
+    border: solid $primary-background-lighten-2;
+    background: $surface;
+}
+
+CommandCard:hover {
+    background: $primary-background-lighten-1;
+    border: solid $accent;
+}
+
+CommandCard:focus {
+    background: $primary-background-lighten-2;
+    border: double $accent;
+}
+
+CommandCard .card-name {
+    text-style: bold;
+    color: $accent;
+}
+
+CommandCard .card-args {
+    color: $text-muted;
+}
+
+CommandCard .card-desc {
+    color: $text;
+    margin-top: 1;
+}
+
+/* Quick Context panel */
+QuickContextPanel {
+    height: 1fr;
+    padding: 1;
+    background: $background;
+}
+
+QuickContextPanel TabbedContent {
+    height: 1fr;
+}
+
+QuickContextPanel TabPane {
+    padding: 1;
+}
+
+QuickContextPanel ListView {
+    height: 1fr;
+    background: $background;
+}
+
+QuickContextPanel ListView:focus {
+    border: solid $accent;
+}
+
+ContextFileItem {
+    height: auto;
+    padding: 0 1;
+    margin-bottom: 0;
+}
+
+ContextFileItem:hover {
+    background: $accent 15%;
+}
+
+ContextFileItem.-highlight {
+    background: $accent 25%;
+}
+
+ContextFileItem.--loaded {
+    background: $success 10%;
+}
+
+/* Browser panel (in ContentSwitcher) */
+BrowserPanel {
+    height: 1fr;
+    background: $background;
+}
+
+#bp-header {
+    height: 2;
+    background: $primary-background;
+    color: $accent;
+    text-style: bold;
+    padding: 0 1;
+    border-bottom: solid $primary-background-lighten-2;
+}
+
+#bp-filter {
+    height: 3;
+    margin: 0;
+    border: solid $primary-background-lighten-2;
+}
+
+#bp-filter:focus {
+    border: solid $accent;
+}
+
+#bp-list {
+    height: 1fr;
+    background: $background;
+    scrollbar-gutter: stable;
+}
+
+#bp-footer {
+    height: 2;
+    background: $primary-background;
+    color: $text-muted;
+    padding: 0 1;
+    border-top: solid $primary-background-lighten-2;
+}
+
+BrowserItem {
+    height: 1;
+    padding: 0 1;
+}
+
+BrowserItem:hover {
+    background: $accent 12%;
+}
+
+BrowserItem:focus {
+    background: $accent 20%;
+}
+
+BrowserItem.--selected {
+    background: $success 15%;
+    color: $success;
+}
+
+BrowserItem.--dir {
+    color: $accent;
+    text-style: bold;
+}
+
+/* Activity log strip — 7 rows to accommodate response preview lines */
+ActivityLog {
+    height: 7;
+    min-height: 4;
+    border-top: solid $primary-background-lighten-2;
+    border-bottom: solid $primary-background-lighten-2;
+    background: $surface;
+    padding: 0 1;
+    scrollbar-gutter: stable;
+    scrollbar-size: 1 1;
+    color: $text;
+}
+
+/* Input bar */
+InputBar {
+    dock: bottom;
+    height: 3;
+    margin: 0;
+    padding: 0 1;
+    border: solid $accent;
+    background: $surface;
+}
+
+InputBar:focus {
+    border: double $accent;
+}
+
+/* Status bar */
+StatusBar {
+    dock: bottom;
+    height: 1;
+    background: $primary-background;
+    color: $text;
+    padding: 0 2;
+}
+
+/* Palette modal */
+PaletteScreen {
+    align: center middle;
+    background: $background 60%;
+}
+
+#palette-container {
+    width: 80;
+    max-width: 90%;
+    height: 24;
+    max-height: 80%;
+    border: thick $accent;
+    background: $surface;
+    padding: 1 2;
+}
+
+#palette-input {
+    margin-bottom: 1;
+    border: solid $primary-background-lighten-2;
+}
+
+#palette-input:focus {
+    border: solid $accent;
+}
+
+#palette-results {
+    height: 1fr;
+    scrollbar-gutter: stable;
+}
+
+PaletteItem {
+    height: auto;
+    padding: 0 2;
+    margin: 0;
+}
+
+PaletteItem:hover {
+    background: $accent 20%;
+}
+
+PaletteItem:focus {
+    background: $accent 30%;
+    text-style: bold;
+}
+
+.palette-category-header {
+    color: $accent;
+    text-style: bold;
+    padding: 0 1;
+}
+
+/* Command input screen */
+CommandInputScreen {
+    align: center middle;
+    background: $background 60%;
+}
+
+#command-input-container {
+    width: 60;
+    max-width: 80%;
+    height: auto;
+    max-height: 60%;
+    border: thick $accent;
+    background: $surface;
+    padding: 2;
+}
+
+#command-input-title {
+    text-style: bold;
+    color: $accent;
+    margin-bottom: 1;
+}
+
+#command-input-desc {
+    color: $text-muted;
+    margin-bottom: 1;
+}
+
+#command-input-field {
+    margin-top: 1;
+    border: solid $primary-background-lighten-2;
+}
+
+#command-input-field:focus {
+    border: solid $accent;
+}
+
+/* Sub-menu screens */
+SubMenuScreen {
+    align: center middle;
+    background: $background 60%;
+}
+
+#submenu-container {
+    width: 70;
+    max-width: 85%;
+    height: auto;
+    max-height: 70%;
+    border: thick $accent;
+    background: $surface;
+    padding: 2;
+}
+
+#submenu-title {
+    text-style: bold;
+    color: $accent;
+    margin-bottom: 1;
+}
+
+.submenu-option {
+    height: auto;
+    padding: 1 2;
+    margin: 0 0 1 0;
+    border: solid $primary-background-lighten-2;
+    background: $surface;
+}
+
+.submenu-option:hover {
+    background: $primary-background-lighten-1;
+    border: solid $accent;
+}
+
+.submenu-option:focus {
+    background: $primary-background-lighten-2;
+    border: double $accent;
+}

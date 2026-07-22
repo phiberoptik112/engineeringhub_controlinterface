@@ -1,0 +1,49 @@
+name: timesheet-reviewer
+display_name: Timesheet Reviewer
+agent_type: timesheet-reviewer
+
+domain: operations
+domain_triggers:
+  - timesheet
+  - billable hours
+  - monthly hours
+  - invoice hours
+  - hour reconciliation
+  - time log review
+
+description: |
+  Reviews org-roam monthly timesheet working notes against the rolling timesheet
+  reference ledger and daily journal entries. Reconciles missing or ambiguous hour
+  logs, proposes additions for Notes and Review sections, and prepares content for
+  final monthly export. Use when closing out a project month or preparing client-facing
+  hour summaries.
+
+when_to_use:
+  - User wants to review or reconcile monthly billable hours for a project
+  - User asks to compare the monthly working note with timesheet-reference.org
+  - User needs proposed hour entries or narrative notes before month-end export
+  - User is preparing invoice-ready timesheet content for a Django-linked project
+  - User wants to discuss additions and edits to the monthly org timesheet note
+
+invocation_examples:
+  - "/agent timesheet-reviewer reconcile July 2026 hours for project 42"
+  - "/agent timesheet-reviewer review the monthly LVT timesheet and flag missing entries"
+  - "/agent timesheet-reviewer draft Notes for the July timesheet after reconciling reference entries"
+  - "/agent timesheet-reviewer prepare month-end summary for LVT Phase B --project 42"
+
+parameters:
+  project_id:
+    description: Django project ID for context enrichment (optional)
+    required: false
+  description:
+    description: The month, project, and review scope
+    required: true
+
+output:
+  format: org
+  structure:
+    - Reconciliation summary (totals, entry count, gaps)
+    - Proposed hour entries (if any)
+    - Suggested Notes / Review text for the monthly working note
+    - Export readiness checklist (run /timesheet export when ready)
+  output_dir: timesheets

@@ -11,6 +11,7 @@ from engineering_hub.actions.file_ingest import FileIngestAction
 from engineering_hub.agents.backends import _resolve_model_for_agent, create_backend
 from engineering_hub.agents.registry import AgentRegistry
 from engineering_hub.agents.worker import AgentWorker
+from engineering_hub.code.pi_executor import PiExecutor, build_pi_executor
 from engineering_hub.config.settings import Settings
 from engineering_hub.container.router import TaskRouter
 from engineering_hub.context.manager import ContextManager
@@ -19,6 +20,11 @@ from engineering_hub.core.models import ParsedTask, TaskResult
 from engineering_hub.corpus.audit_log import RetrievalAuditLog
 from engineering_hub.corpus.citation_verifier import CitationVerifier
 from engineering_hub.corpus_service_factory import build_corpus_service_from_settings
+from engineering_hub.diagnostics.artifacts import (
+    new_diagnostic_run_id,
+    persist_task_diagnostic_bundle,
+    write_task_result_artifacts,
+)
 from engineering_hub.django.client import DjangoClient
 from engineering_hub.memory.service import MemoryService
 from engineering_hub.notes.manager import SharedNotesManager
@@ -42,6 +48,8 @@ class Orchestrator:
         """
         self.settings = settings
         self._shutdown_event = threading.Event()
+        self._diagnostic_run_id: str | None = None
+        self._diagnostic_task_seq: int = 0
 
         # Initialize components
         self._init_components()
@@ -55,6 +63,11 @@ class Orchestrator:
             notes_path = self.settings.notes_file
 
         # Notes manager (org, journal, or legacy mode) — task dispatch window
+        _pending = (
+            self.settings.resolved_journaler_pending_tasks_file
+            if self.settings.use_org_mode
+            else None
+        )
         self.notes_manager = SharedNotesManager(
             notes_path,
             use_journal_mode=self.settings.use_journal_mode,
@@ -62,6 +75,7 @@ class Orchestrator:
             use_org_mode=self.settings.use_org_mode,
             org_task_sections=self.settings.org_task_sections,
             org_lookback_days=self.settings.org_lookback_days,
+            pending_tasks_file=_pending,
         )
 
         # Separate notes manager with a wider lookback for context enrichment
@@ -72,6 +86,7 @@ class Orchestrator:
             use_org_mode=self.settings.use_org_mode,
             org_task_sections=self.settings.org_task_sections,
             org_lookback_days=self.settings.org_context_lookback_days,
+            pending_tasks_file=_pending,
         )
 
         # Django client
@@ -122,8 +137,12 @@ class Orchestrator:
             max_tokens=self.settings.max_tokens,
             corpus_service=corpus_service,
             memory_service=self.memory_service,
+            diagnostic_context_audit=self.settings.diagnostic_context_audit_prompt,
         )
         self._workers["__global__"] = self.agent_worker
+
+        # Code-engineer executor (external Pi coding agent); None if no repos configured
+        self._pi_executor: PiExecutor | None = build_pi_executor(self.settings)
 
         # Task router (local or Docker container execution)
         self.task_router = TaskRouter(self.settings, self.agent_worker)
@@ -170,6 +189,7 @@ class Orchestrator:
                 max_tokens=self.settings.max_tokens,
                 corpus_service=self._corpus_service,
                 memory_service=self.memory_service,
+                diagnostic_context_audit=self.settings.diagnostic_context_audit_prompt,
             )
             logger.info(
                 "Created worker for model '%s' (agent class: %s)",
@@ -188,6 +208,11 @@ class Orchestrator:
         Returns:
             TaskResult with execution outcome
         """
+        # Route code-engineer tasks to the Pi executor (repo + briefing, not an
+        # AgentWorker or the Docker text path).
+        if task.agent_type == AgentType.CODE_ENGINEER:
+            return self._execute_code_task(task)
+
         # Route ingest tasks to FileIngestAction before agent
         if is_ingest_task(task.description):
             return self._execute_ingest(task)
@@ -216,16 +241,74 @@ class Orchestrator:
         # Build context for the task
         context = self.context_manager.format_for_agent(task)
 
+        diag_dir: Path | None = None
+        if self.settings.context_pipeline_diagnostic_enabled:
+            if self._diagnostic_run_id is None:
+                self._diagnostic_run_id = new_diagnostic_run_id()
+            run_root = (
+                self.settings.output_dir
+                / "diagnostics"
+                / "context-pipeline"
+                / self._diagnostic_run_id
+            )
+            run_root.mkdir(parents=True, exist_ok=True)
+            idx = self._diagnostic_task_seq
+            self._diagnostic_task_seq += 1
+            diag_dir, _ = persist_task_diagnostic_bundle(
+                run_root, idx, task, context, self.settings
+            )
+            cap = self.settings.diagnostic_debug_context_max_chars
+            snippet = (
+                context
+                if len(context) <= cap
+                else context[:cap] + "\n[truncated]"
+            )
+            logger.debug(
+                "Formatted context for task %s (%d chars):\n%s",
+                task.task_id,
+                len(context),
+                snippet,
+            )
+
         # Resolve the correct worker for this agent's model class
         worker = self._get_worker(task.agent_type)
 
         # Execute via router (local or Docker container)
         result = self.task_router.execute(task, context, worker=worker)
 
+        if diag_dir is not None:
+            write_task_result_artifacts(diag_dir, result)
+
         if result.success:
             self._capture_task_result(task, result)
             self._create_roam_wrapper(task, result)
             self._verify_citations(task, result)
+
+        return result
+
+    def _execute_code_task(self, task: ParsedTask) -> TaskResult:
+        """Execute a code-engineer task via the Pi executor.
+
+        Builds a briefing from the context manager, runs the executor (a stub in
+        Phase 1), and captures the result to memory on success.
+        """
+        if self._pi_executor is None:
+            msg = (
+                "code-engineer task skipped: no code projects configured. "
+                "Add repositories under 'code_projects' in config.yaml."
+            )
+            logger.warning(msg)
+            return TaskResult(task=task, success=False, error_message=msg)
+
+        briefing = self.context_manager.format_for_agent(task)
+        result = self._pi_executor.execute_task(
+            task,
+            briefing=briefing,
+            mode="implement",
+        )
+
+        if result.success:
+            self._capture_task_result(task, result)
 
         return result
 

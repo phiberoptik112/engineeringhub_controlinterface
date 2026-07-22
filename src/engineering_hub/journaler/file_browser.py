@@ -1,4 +1,4 @@
-"""Interactive curses-based browsers for `/load_browse`, `/edit_browse`, and `/agent_browse`.
+"""Interactive curses-based browsers for `/load_browse`, `/edit_browse`, `/agent_browse`, and `/model_browse`.
 
 Launches fullscreen TUIs that let the user navigate the org-roam
 directory tree or agent skills with arrow keys, select items, and
@@ -8,15 +8,18 @@ confirm with Enter.
 from __future__ import annotations
 
 import curses
+import os
 import textwrap
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Callable
 
 if TYPE_CHECKING:
     from engineering_hub.journaler.delegator import SkillDef
 
 _FAST_SCROLL_LINES = 5
+_SEARCH_RESULT_LIMIT = 200
 
 
 @dataclass
@@ -27,6 +30,7 @@ class BrowseEntry:
     path: Path
     is_dir: bool
     size: int = 0
+    created_at: float | None = None
     selected: bool = False
 
 
@@ -58,7 +62,7 @@ def browse_org_roam(
         return []
 
     try:
-        return curses.wrapper(_browse_inner, root, extensions, False)
+        return curses.wrapper(_browse_inner, root, extensions, False, Path.home())
     except Exception:
         return []
 
@@ -94,6 +98,20 @@ def browse_skills(skills: list[SkillDef]) -> SkillDef | None:
         return None
 
 
+def browse_models(catalog: list) -> object | None:
+    """Open an interactive MLX model picker (used by ``/model_browse``).
+
+    Returns the selected :class:`~engineering_hub.journaler.model_catalog.ModelCatalogEntry`,
+    or ``None`` on cancel.
+    """
+    if not catalog:
+        return None
+    try:
+        return curses.wrapper(_browse_models_inner, catalog)
+    except Exception:
+        return None
+
+
 def browse_commands(commands: list[CommandEntry]) -> str | None:
     """Open the command palette overlay.
 
@@ -121,6 +139,16 @@ def _format_size(size: int) -> str:
     return f"{size / (1024 * 1024):.1f}M"
 
 
+def _format_created_at(created_at: float | None) -> str:
+    if created_at is None:
+        return "-"
+    return datetime.fromtimestamp(created_at).strftime("%Y-%m-%d")
+
+
+def _created_at_from_stat(stat_result: os.stat_result) -> float:
+    return float(getattr(stat_result, "st_birthtime", stat_result.st_ctime))
+
+
 def _display_path(path: Path, root: Path) -> str:
     """Shortened display path relative to root, using ~ prefix."""
     try:
@@ -128,6 +156,94 @@ def _display_path(path: Path, root: Path) -> str:
         return f"~/{rel}" if str(rel) != "." else "~"
     except ValueError:
         return str(path)
+
+
+def _file_entry(path: Path, name: str | None = None) -> BrowseEntry:
+    try:
+        stat_result = path.stat()
+        size = stat_result.st_size
+        created_at = _created_at_from_stat(stat_result)
+    except OSError:
+        size = 0
+        created_at = None
+    return BrowseEntry(
+        name=name or path.name,
+        path=path,
+        is_dir=False,
+        size=size,
+        created_at=created_at,
+    )
+
+
+def _directory_entry(path: Path, name: str | None = None) -> BrowseEntry:
+    try:
+        created_at = _created_at_from_stat(path.stat())
+    except OSError:
+        created_at = None
+    return BrowseEntry(
+        name=name or f"{path.name}/",
+        path=path,
+        is_dir=True,
+        created_at=created_at,
+    )
+
+
+def _matches_search(query: str, path: Path, search_root: Path) -> bool:
+    terms = [term for term in query.lower().split() if term]
+    if not terms:
+        return False
+    try:
+        label = str(path.relative_to(search_root))
+    except ValueError:
+        label = str(path)
+    haystack = f"{path.name} {label}".lower()
+    return all(term in haystack for term in terms)
+
+
+def _search_loadable_files(
+    search_root: Path,
+    query: str,
+    extensions: frozenset[str],
+    limit: int = _SEARCH_RESULT_LIMIT,
+) -> list[BrowseEntry]:
+    """Search *search_root* for supported files whose name/path matches *query*."""
+    search_root = search_root.expanduser().resolve()
+    if not query.strip() or not search_root.is_dir() or limit <= 0:
+        return []
+
+    results: list[BrowseEntry] = []
+    stack = [search_root]
+    while stack and len(results) < limit:
+        current = stack.pop()
+        try:
+            with os.scandir(current) as iterator:
+                children = sorted(list(iterator), key=lambda entry: entry.name.lower())
+        except OSError:
+            continue
+
+        dirs: list[Path] = []
+        for child in children:
+            child_path = Path(child.path)
+            try:
+                if child.is_dir(follow_symlinks=False):
+                    dirs.append(child_path)
+                elif child.is_file(follow_symlinks=False):
+                    if extensions and child_path.suffix.lower() not in extensions:
+                        continue
+                    if _matches_search(query, child_path, search_root):
+                        try:
+                            display_name = str(child_path.relative_to(search_root))
+                        except ValueError:
+                            display_name = str(child_path)
+                        results.append(_file_entry(child_path, display_name))
+                        if len(results) >= limit:
+                            break
+            except OSError:
+                continue
+
+        stack.extend(reversed(dirs))
+
+    return results
 
 
 def _scan_directory(
@@ -139,31 +255,24 @@ def _scan_directory(
     entries: list[BrowseEntry] = []
 
     if path.resolve() != root.resolve():
-        entries.append(BrowseEntry(name="../", path=path.parent, is_dir=True))
+        entries.append(_directory_entry(path.parent, "../"))
 
     try:
         children = sorted(path.iterdir(), key=lambda p: p.name.lower())
-    except PermissionError:
+    except OSError:
         return entries
 
     dirs = []
     files = []
     for child in children:
-        if child.name.startswith("."):
+        try:
+            if child.is_dir():
+                dirs.append(_directory_entry(child))
+            elif child.is_file():
+                if not extensions or child.suffix.lower() in extensions:
+                    files.append(_file_entry(child))
+        except OSError:
             continue
-        if child.is_dir():
-            dirs.append(
-                BrowseEntry(name=child.name + "/", path=child, is_dir=True)
-            )
-        elif child.is_file():
-            if not extensions or child.suffix.lower() in extensions:
-                try:
-                    size = child.stat().st_size
-                except OSError:
-                    size = 0
-                files.append(
-                    BrowseEntry(name=child.name, path=child, is_dir=False, size=size)
-                )
 
     entries.extend(dirs)
     entries.extend(files)
@@ -201,6 +310,7 @@ def _browse_inner(
     root: Path,
     extensions: frozenset[str],
     single_select: bool,
+    search_root: Path | None = None,
 ) -> list[Path]:
     _init_colors()
     curses.curs_set(0)
@@ -211,17 +321,28 @@ def _browse_inner(
     scroll_offset = 0
     entries = _scan_directory(current_dir, root, extensions)
     selected: set[Path] = set()
+    search_text = ""
+    search_active = False
+    search_results_active = False
+    status_message = ""
 
     while True:
         stdscr.erase()
         max_y, max_x = stdscr.getmaxyx()
 
-        header_lines = 2
+        search_enabled = not single_select and search_root is not None
+        header_lines = 3 if search_enabled else 2
         footer_lines = 3
         list_height = max(1, max_y - header_lines - footer_lines)
 
         # -- Header -----------------------------------------------------------
-        header_text = f" Browse: {_display_path(current_dir, root)}"
+        if search_results_active:
+            header_text = (
+                f" Search: ~/{search_text} "
+                f"({len(entries)} result{'s' if len(entries) != 1 else ''})"
+            )
+        else:
+            header_text = f" Browse: {_display_path(current_dir, root)}"
         stdscr.attron(curses.color_pair(_CP_HEADER) | curses.A_BOLD)
         stdscr.addnstr(0, 0, "─" * max_x, max_x)
         stdscr.addnstr(0, 0, header_text, max_x - 1)
@@ -235,12 +356,21 @@ def _browse_inner(
                 stdscr.addnstr(0, col, sel_text, max_x - col - 1)
                 stdscr.attroff(curses.color_pair(_CP_SELECTED) | curses.A_BOLD)
 
-        stdscr.addnstr(1, 0, "─" * max_x, max_x)
+        if search_enabled:
+            prompt = "/" if search_active else "press / to search home"
+            search_line = f" Search: {prompt}{search_text if search_active else ''}"
+            if search_results_active and not search_active:
+                search_line += "  (Left returns to browser)"
+            stdscr.addnstr(1, 0, search_line[: max_x - 1], max_x - 1)
+            stdscr.addnstr(2, 0, "─" * max_x, max_x)
+        else:
+            stdscr.addnstr(1, 0, "─" * max_x, max_x)
 
         # -- Clamp cursor and scroll -----------------------------------------
         if not entries:
             stdscr.attron(curses.A_DIM)
-            stdscr.addnstr(header_lines, 2, "(empty directory)", max_x - 3)
+            empty_text = "(no matching files)" if search_results_active else "(empty directory)"
+            stdscr.addnstr(header_lines, 2, empty_text, max_x - 3)
             stdscr.attroff(curses.A_DIM)
         else:
             cursor = max(0, min(cursor, len(entries) - 1))
@@ -266,18 +396,18 @@ def _browse_inner(
                 sel_mark = " "
                 if not single_select:
                     sel_mark = "*" if is_sel else " "
-                size_str = ""
-                if not entry.is_dir:
-                    size_str = f"  [{_format_size(entry.size)}]"
+                size_str = "-" if entry.is_dir else _format_size(entry.size)
+                created_str = _format_created_at(entry.created_at)
+                meta_str = f" {size_str:>8} {created_str:>10}"
 
-                name_budget = max_x - 6 - len(size_str)
+                name_budget = max_x - 6 - len(meta_str)
                 display_name = entry.name
                 if len(display_name) > name_budget > 3:
                     display_name = display_name[: name_budget - 1] + "…"
 
                 line = f" {marker} {sel_mark} {display_name}"
-                pad = max(0, max_x - len(line) - len(size_str) - 1)
-                line += " " * pad + size_str
+                pad = max(0, max_x - len(line) - len(meta_str) - 1)
+                line += " " * pad + meta_str
 
                 if is_cursor:
                     attr = curses.color_pair(_CP_CURSOR) | curses.A_BOLD
@@ -320,8 +450,15 @@ def _browse_inner(
             else:
                 controls = (
                     " ↑↓ navigate  Shift+↑↓ fast  Enter open/load"
-                    "  Space select  ← back  Esc cancel"
+                    "  Space select  / search  ← back  Esc cancel"
                 )
+                if search_active:
+                    controls = " type search  Backspace erase  Enter search  Esc close search"
+                elif search_results_active:
+                    controls = (
+                        " ↑↓ navigate results  Space select  Enter load"
+                        "  ← browser  / search  Esc cancel"
+                    )
             try:
                 stdscr.addnstr(footer_y + 1, 0, controls, max_x - 1)
             except curses.error:
@@ -332,12 +469,38 @@ def _browse_inner(
                     stdscr.addnstr(footer_y + 2, 0, confirm_msg, max_x - 1)
                 except curses.error:
                     pass
+            elif status_message:
+                try:
+                    stdscr.addnstr(footer_y + 2, 0, status_message, max_x - 1)
+                except curses.error:
+                    pass
             stdscr.attroff(curses.color_pair(_CP_FOOTER))
 
         stdscr.refresh()
 
         # -- Input handling ---------------------------------------------------
         key = stdscr.getch()
+
+        if search_active:
+            if key == 27:
+                search_active = False
+            elif key in (curses.KEY_ENTER, 10, 13):
+                query = search_text.strip()
+                if query and search_root is not None:
+                    entries = _search_loadable_files(search_root, query, extensions)
+                    search_results_active = True
+                    status_message = (
+                        f"Found {len(entries)} loadable file"
+                        f"{'s' if len(entries) != 1 else ''} under {search_root}"
+                    )
+                    cursor = 0
+                    scroll_offset = 0
+                search_active = False
+            elif key in (curses.KEY_BACKSPACE, 127, 8):
+                search_text = search_text[:-1]
+            elif 32 <= key <= 126:
+                search_text += chr(key)
+            continue
 
         if key in (27, ord("q")):  # Esc or q → cancel
             return []
@@ -358,14 +521,20 @@ def _browse_inner(
                 cursor = min(len(entries) - 1, cursor + _FAST_SCROLL_LINES)
 
         elif key == curses.KEY_LEFT or key == curses.KEY_BACKSPACE or key == 127:
-            if current_dir.resolve() != root.resolve():
+            if search_results_active:
+                entries = _scan_directory(current_dir, root, extensions)
+                search_results_active = False
+                status_message = ""
+                cursor = 0
+                scroll_offset = 0
+            elif current_dir.resolve() != root.resolve():
                 current_dir = current_dir.parent
                 entries = _scan_directory(current_dir, root, extensions)
                 cursor = 0
                 scroll_offset = 0
 
         elif key == curses.KEY_RIGHT:
-            if entries and entries[cursor].is_dir:
+            if entries and entries[cursor].is_dir and not search_results_active:
                 target = entries[cursor].path.resolve()
                 if target.is_relative_to(root) or target == root:
                     current_dir = target
@@ -376,6 +545,11 @@ def _browse_inner(
                 entries = _scan_directory(current_dir, root, extensions)
                 cursor = 0
                 scroll_offset = 0
+
+        elif key == ord("/") and not single_select and search_root is not None:
+            search_text = ""
+            search_active = True
+            status_message = f"Searching under {search_root}"
 
         elif key == ord(" ") and not single_select:
             if entries and not entries[cursor].is_dir:
@@ -394,6 +568,8 @@ def _browse_inner(
                 continue
             entry = entries[cursor]
             if entry.is_dir:
+                if search_results_active:
+                    continue
                 target = entry.path.resolve()
                 if not target.is_relative_to(root):
                     target = root
@@ -590,6 +766,156 @@ def _browse_skills_inner(
 
         elif key == curses.KEY_END:
             cursor = len(skills) - 1
+
+
+# ---------------------------------------------------------------------------
+# Model picker (used by /model_browse)
+# ---------------------------------------------------------------------------
+
+
+def _browse_models_inner(
+    stdscr: curses.window,
+    catalog: list,
+) -> object | None:
+    from engineering_hub.journaler.model_catalog import format_catalog_entry_line
+
+    _init_colors()
+    curses.curs_set(0)
+    stdscr.keypad(True)
+
+    cursor = 0
+    scroll_offset = 0
+    filter_text = ""
+    filter_mode = False
+
+    while True:
+        stdscr.erase()
+        max_y, max_x = stdscr.getmaxyx()
+
+        query = filter_text.lower()
+        if query:
+            visible = [
+                (i, e)
+                for i, e in enumerate(catalog)
+                if query in e.label.lower()
+                or query in e.load_value.lower()
+                or (e.profile_name and query in e.profile_name.lower())
+            ]
+        else:
+            visible = list(enumerate(catalog))
+
+        header_lines = 2
+        footer_lines = 2
+        list_height = max(1, max_y - header_lines - footer_lines)
+
+        header_text = " Browse: MLX Models"
+        if filter_text:
+            header_text += f"  filter: {filter_text}"
+        stdscr.attron(curses.color_pair(_CP_HEADER) | curses.A_BOLD)
+        stdscr.addnstr(0, 0, "─" * max_x, max_x)
+        stdscr.addnstr(0, 0, header_text, max_x - 1)
+        stdscr.attroff(curses.color_pair(_CP_HEADER) | curses.A_BOLD)
+        stdscr.addnstr(1, 0, "─" * max_x, max_x)
+
+        if not visible:
+            try:
+                stdscr.addnstr(header_lines, 0, "  (no matching models)", max_x - 1, curses.A_DIM)
+            except curses.error:
+                pass
+        else:
+            cursor = max(0, min(cursor, len(visible) - 1))
+            if cursor < scroll_offset:
+                scroll_offset = cursor
+            if cursor >= scroll_offset + list_height:
+                scroll_offset = cursor - list_height + 1
+            scroll_offset = max(0, scroll_offset)
+
+            for i in range(list_height):
+                vi = scroll_offset + i
+                if vi >= len(visible):
+                    break
+                _, entry = visible[vi]
+                row = header_lines + i
+                if row >= max_y - footer_lines:
+                    break
+                is_active = vi == cursor
+                line = format_catalog_entry_line(entry, width=max(20, max_x - 6))
+                if is_active:
+                    marker = f" > {line}"
+                    attr = curses.color_pair(_CP_CURSOR) | curses.A_BOLD
+                else:
+                    marker = f"   {line}"
+                    attr = curses.color_pair(_CP_FILE)
+                try:
+                    stdscr.addnstr(row, 0, marker.ljust(max_x), max_x - 1, attr)
+                except curses.error:
+                    pass
+
+        footer_y = max_y - footer_lines
+        if footer_y > header_lines:
+            try:
+                stdscr.addnstr(footer_y, 0, "─" * max_x, max_x)
+            except curses.error:
+                pass
+            stdscr.attron(curses.color_pair(_CP_FOOTER))
+            controls = " ↑↓ nav  / filter  Enter load  Esc cancel"
+            try:
+                stdscr.addnstr(footer_y + 1, 0, controls, max_x - 1)
+            except curses.error:
+                pass
+            stdscr.attroff(curses.color_pair(_CP_FOOTER))
+
+        stdscr.refresh()
+
+        if filter_mode:
+            curses.echo()
+            curses.curs_set(1)
+            try:
+                stdscr.addnstr(header_lines, 0, " filter: ", max_x - 1)
+                stdscr.refresh()
+                filter_text = ""
+                win = curses.newwin(1, max_x - 10, header_lines, 9)
+                curses.curs_set(1)
+                raw = win.getstr().decode("utf-8", errors="replace").strip()
+                filter_text = raw
+            except Exception:
+                pass
+            finally:
+                curses.noecho()
+                curses.curs_set(0)
+            filter_mode = False
+            cursor = 0
+            scroll_offset = 0
+            continue
+
+        key = stdscr.getch()
+
+        if key in (27, ord("q")):
+            return None
+
+        if key == ord("/"):
+            filter_mode = True
+            continue
+
+        if not visible:
+            continue
+
+        if key == curses.KEY_UP or key == ord("k"):
+            if cursor > 0:
+                cursor -= 1
+        elif key == curses.KEY_DOWN or key == ord("j"):
+            if cursor < len(visible) - 1:
+                cursor += 1
+        elif key == curses.KEY_SR:
+            cursor = max(0, cursor - _FAST_SCROLL_LINES)
+        elif key == curses.KEY_SF:
+            cursor = min(len(visible) - 1, cursor + _FAST_SCROLL_LINES)
+        elif key in (curses.KEY_ENTER, 10, 13):
+            return visible[cursor][1]
+        elif key == curses.KEY_HOME:
+            cursor = 0
+        elif key == curses.KEY_END:
+            cursor = len(visible) - 1
 
 
 # ---------------------------------------------------------------------------
@@ -832,6 +1158,156 @@ def _browse_commands_inner(
 
 
 # ---------------------------------------------------------------------------
+# Model picker (used by /model_browse)
+# ---------------------------------------------------------------------------
+
+
+def _browse_models_inner(
+    stdscr: curses.window,
+    catalog: list,
+) -> object | None:
+    from engineering_hub.journaler.model_catalog import format_catalog_entry_line
+
+    _init_colors()
+    curses.curs_set(0)
+    stdscr.keypad(True)
+
+    cursor = 0
+    scroll_offset = 0
+    filter_text = ""
+    filter_mode = False
+
+    while True:
+        stdscr.erase()
+        max_y, max_x = stdscr.getmaxyx()
+
+        query = filter_text.lower()
+        if query:
+            visible = [
+                (i, e)
+                for i, e in enumerate(catalog)
+                if query in e.label.lower()
+                or query in e.load_value.lower()
+                or (e.profile_name and query in e.profile_name.lower())
+            ]
+        else:
+            visible = list(enumerate(catalog))
+
+        header_lines = 2
+        footer_lines = 2
+        list_height = max(1, max_y - header_lines - footer_lines)
+
+        header_text = " Browse: MLX Models"
+        if filter_text:
+            header_text += f"  filter: {filter_text}"
+        stdscr.attron(curses.color_pair(_CP_HEADER) | curses.A_BOLD)
+        stdscr.addnstr(0, 0, "─" * max_x, max_x)
+        stdscr.addnstr(0, 0, header_text, max_x - 1)
+        stdscr.attroff(curses.color_pair(_CP_HEADER) | curses.A_BOLD)
+        stdscr.addnstr(1, 0, "─" * max_x, max_x)
+
+        if not visible:
+            try:
+                stdscr.addnstr(header_lines, 0, "  (no matching models)", max_x - 1, curses.A_DIM)
+            except curses.error:
+                pass
+        else:
+            cursor = max(0, min(cursor, len(visible) - 1))
+            if cursor < scroll_offset:
+                scroll_offset = cursor
+            if cursor >= scroll_offset + list_height:
+                scroll_offset = cursor - list_height + 1
+            scroll_offset = max(0, scroll_offset)
+
+            for i in range(list_height):
+                vi = scroll_offset + i
+                if vi >= len(visible):
+                    break
+                _, entry = visible[vi]
+                row = header_lines + i
+                if row >= max_y - footer_lines:
+                    break
+                is_active = vi == cursor
+                line = format_catalog_entry_line(entry, width=max(20, max_x - 6))
+                if is_active:
+                    marker = f" > {line}"
+                    attr = curses.color_pair(_CP_CURSOR) | curses.A_BOLD
+                else:
+                    marker = f"   {line}"
+                    attr = curses.color_pair(_CP_FILE)
+                try:
+                    stdscr.addnstr(row, 0, marker.ljust(max_x), max_x - 1, attr)
+                except curses.error:
+                    pass
+
+        footer_y = max_y - footer_lines
+        if footer_y > header_lines:
+            try:
+                stdscr.addnstr(footer_y, 0, "─" * max_x, max_x)
+            except curses.error:
+                pass
+            stdscr.attron(curses.color_pair(_CP_FOOTER))
+            controls = " ↑↓ nav  / filter  Enter load  Esc cancel"
+            try:
+                stdscr.addnstr(footer_y + 1, 0, controls, max_x - 1)
+            except curses.error:
+                pass
+            stdscr.attroff(curses.color_pair(_CP_FOOTER))
+
+        stdscr.refresh()
+
+        if filter_mode:
+            curses.echo()
+            curses.curs_set(1)
+            try:
+                stdscr.addnstr(header_lines, 0, " filter: ", max_x - 1)
+                stdscr.refresh()
+                filter_text = ""
+                win = curses.newwin(1, max_x - 10, header_lines, 9)
+                curses.curs_set(1)
+                raw = win.getstr().decode("utf-8", errors="replace").strip()
+                filter_text = raw
+            except Exception:
+                pass
+            finally:
+                curses.noecho()
+                curses.curs_set(0)
+            filter_mode = False
+            cursor = 0
+            scroll_offset = 0
+            continue
+
+        key = stdscr.getch()
+
+        if key in (27, ord("q")):
+            return None
+
+        if key == ord("/"):
+            filter_mode = True
+            continue
+
+        if not visible:
+            continue
+
+        if key == curses.KEY_UP or key == ord("k"):
+            if cursor > 0:
+                cursor -= 1
+        elif key == curses.KEY_DOWN or key == ord("j"):
+            if cursor < len(visible) - 1:
+                cursor += 1
+        elif key == curses.KEY_SR:
+            cursor = max(0, cursor - _FAST_SCROLL_LINES)
+        elif key == curses.KEY_SF:
+            cursor = min(len(visible) - 1, cursor + _FAST_SCROLL_LINES)
+        elif key in (curses.KEY_ENTER, 10, 13):
+            return visible[cursor][1]
+        elif key == curses.KEY_HOME:
+            cursor = 0
+        elif key == curses.KEY_END:
+            cursor = len(visible) - 1
+
+
+# ---------------------------------------------------------------------------
 # Capture template browser (used by /capture_browse)
 # ---------------------------------------------------------------------------
 
@@ -1038,3 +1514,187 @@ def _browse_captures_inner(
             cursor = 0
         elif key == curses.KEY_END:
             cursor = len(templates) - 1
+
+
+# ---------------------------------------------------------------------------
+# Conversation picker (used by /convo)
+# ---------------------------------------------------------------------------
+
+_NEW_CONVERSATION = "__new__"
+
+
+def _relative_time_short(iso_ts: str) -> str:
+    try:
+        ts = datetime.fromisoformat(iso_ts.replace("Z", "+00:00"))
+    except ValueError:
+        return iso_ts[:10] if iso_ts else ""
+    delta = datetime.now() - ts.replace(tzinfo=None)
+    secs = int(delta.total_seconds())
+    if secs < 3600:
+        return f"{max(1, secs // 60)}m ago"
+    if secs < 86400:
+        return f"{secs // 3600}h ago"
+    if secs < 172800:
+        return "yesterday"
+    return f"{secs // 86400}d ago"
+
+
+def _group_conversations(
+    conversations: list,
+    resolve_project: Callable[[int], str] | None,
+) -> list[tuple[str, list]]:
+    """Return (group_label, convs) sorted by updated_at within group."""
+    from engineering_hub.journaler.conversation_store import Conversation
+
+    by_project: dict[str, list[Conversation]] = {}
+    by_topic: dict[str, list[Conversation]] = {}
+    ungrouped: list[Conversation] = []
+
+    for conv in conversations:
+        if not isinstance(conv, Conversation):
+            continue
+        if conv.project_id is not None:
+            label = f"Project {conv.project_id}"
+            if resolve_project is not None:
+                try:
+                    label = resolve_project(conv.project_id)
+                except Exception:
+                    pass
+            by_project.setdefault(label, []).append(conv)
+        elif conv.topic:
+            by_topic.setdefault(f"Topic: {conv.topic}", []).append(conv)
+        else:
+            ungrouped.append(conv)
+
+    groups: list[tuple[str, list]] = []
+    for label in sorted(by_project.keys()):
+        convs = sorted(by_project[label], key=lambda c: c.updated_at, reverse=True)
+        groups.append((label, convs))
+    for label in sorted(by_topic.keys()):
+        convs = sorted(by_topic[label], key=lambda c: c.updated_at, reverse=True)
+        groups.append((label, convs))
+    if ungrouped:
+        convs = sorted(ungrouped, key=lambda c: c.updated_at, reverse=True)
+        groups.append(("Ungrouped", convs))
+    return groups
+
+
+def browse_conversations(
+    conversations: list,
+    resolve_project: Callable[[int], str] | None = None,
+) -> object | None:
+    """Open conversation picker. Returns Conversation, NEW sentinel str, or None."""
+    from engineering_hub.journaler.conversation_store import Conversation
+
+    rows: list[tuple[str, Conversation | str | None, bool]] = []
+    rows.append(("+ New conversation", _NEW_CONVERSATION, False))
+    for group_label, convs in _group_conversations(conversations, resolve_project):
+        rows.append((group_label, None, True))
+        for conv in convs:
+            rel = _relative_time_short(conv.updated_at)
+            line = f"  {conv.title}  {conv.turn_count} turns  {rel}"
+            rows.append((line, conv, False))
+
+    try:
+        return curses.wrapper(_browse_conversations_inner, rows)
+    except Exception:
+        return None
+
+
+def _browse_conversations_inner(
+    stdscr: curses.window,
+    rows: list[tuple[str, object | None, bool]],
+) -> object | None:
+    from engineering_hub.journaler.conversation_store import Conversation
+
+    _init_colors()
+    curses.curs_set(0)
+    stdscr.keypad(True)
+
+    selectable = [i for i, (_, entry, is_header) in enumerate(rows) if not is_header]
+    cursor = 0
+    scroll_offset = 0
+
+    while True:
+        stdscr.erase()
+        max_y, max_x = stdscr.getmaxyx()
+        header_lines = 2
+        footer_lines = 2
+        list_height = max(1, max_y - header_lines - footer_lines)
+
+        stdscr.attron(curses.color_pair(_CP_HEADER) | curses.A_BOLD)
+        stdscr.addnstr(0, 0, " Browse: Conversations", max_x - 1)
+        stdscr.attroff(curses.color_pair(_CP_HEADER) | curses.A_BOLD)
+        stdscr.addnstr(1, 0, "─" * max_x, max_x)
+
+        if not selectable:
+            stdscr.addnstr(header_lines + 1, 2, "(no conversations)", max_x - 3)
+        else:
+            cursor = max(0, min(cursor, len(selectable) - 1))
+            target_row = selectable[cursor]
+            if target_row < scroll_offset:
+                scroll_offset = target_row
+            if target_row >= scroll_offset + list_height:
+                scroll_offset = target_row - list_height + 1
+
+            for i in range(list_height):
+                vr = scroll_offset + i
+                if vr >= len(rows):
+                    break
+                text, entry, is_header = rows[vr]
+                row_y = header_lines + i
+                if row_y >= max_y - footer_lines:
+                    break
+                is_active = vr == selectable[cursor]
+                if is_header:
+                    attr = curses.color_pair(_CP_CATEGORY) | curses.A_BOLD | curses.A_DIM
+                    line = f" ▸ {text.lstrip()}"
+                elif is_active:
+                    attr = curses.color_pair(_CP_CURSOR) | curses.A_BOLD
+                    line = f" >{text}"
+                else:
+                    attr = curses.color_pair(_CP_FILE)
+                    line = text
+                try:
+                    stdscr.addnstr(row_y, 0, line.ljust(max_x), max_x - 1, attr)
+                except curses.error:
+                    pass
+
+        footer_y = max_y - footer_lines
+        if footer_y > header_lines:
+            try:
+                stdscr.addnstr(footer_y, 0, "─" * max_x, max_x)
+                stdscr.addnstr(
+                    footer_y + 1,
+                    0,
+                    " ↑↓ navigate  Enter select  Esc cancel",
+                    max_x - 1,
+                    curses.color_pair(_CP_FOOTER),
+                )
+            except curses.error:
+                pass
+        stdscr.refresh()
+
+        key = stdscr.getch()
+        if key in (27, ord("q")):
+            return None
+        if key == curses.KEY_UP or key == ord("k"):
+            if cursor > 0:
+                cursor -= 1
+        elif key == curses.KEY_DOWN or key == ord("j"):
+            if cursor < len(selectable) - 1:
+                cursor += 1
+        elif key == curses.KEY_SR:
+            cursor = max(0, cursor - _FAST_SCROLL_LINES)
+        elif key == curses.KEY_SF:
+            cursor = min(len(selectable) - 1, cursor + _FAST_SCROLL_LINES)
+        elif key in (curses.KEY_ENTER, 10, 13):
+            _, entry, _ = rows[selectable[cursor]]
+            if entry == _NEW_CONVERSATION:
+                return _NEW_CONVERSATION
+            if isinstance(entry, Conversation):
+                return entry
+        elif key == curses.KEY_HOME:
+            cursor = 0
+        elif key == curses.KEY_END:
+            cursor = max(0, len(selectable) - 1)

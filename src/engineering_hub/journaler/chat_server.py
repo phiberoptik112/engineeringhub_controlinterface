@@ -17,6 +17,17 @@ Slash commands (parsed before reaching the LLM):
     Falls back to writing to the journal if no delegator is configured.
     /skills
         List available agent delegation skills.
+    /history [--agent <type>] [--backend mlx|claude] <query>
+        Retrieve prior Journaler chat excerpts, optionally dispatching an agent
+        to review the retrieved transcript context.
+    /pipeline draft-section --section "<section>" [--project <id>] [--backend mlx|claude] [--loop-limit <n>]
+        Run the multi-stage report drafting pipeline:
+        DataGatherer → technical-writer → standards-checker (loop) → technical-reviewer → latex-writer.
+        All numeric data must be pre-computed; the pipeline drafts prose only.
+    /timesheet <hours> project "<project>" :: <description>
+        Log hours to today's journal under * Timesheet, grouped by project.
+    /timesheet export --month YYYY-MM --project "<project>" [--project-id <id>]
+        Export a final monthly timesheet org file from the configured template.
 """
 
 from __future__ import annotations
@@ -24,6 +35,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import shlex
 import threading
 import time
 from datetime import datetime
@@ -31,13 +43,20 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from engineering_hub.journaler.chat_router import route_natural_language_task
+from engineering_hub.journaler.model_profiles import journaler_slash_model_command
+from engineering_hub.journaler.org_writer import add_todo_to_journal
+from engineering_hub.journaler.session_retrieval import (
+    format_past_session_block,
+    retrieve_past_sessions,
+)
+from engineering_hub.journaler.timesheet_slash import handle_timesheet_slash_command
+
 if TYPE_CHECKING:
     from engineering_hub.journaler.context import JournalContext
     from engineering_hub.journaler.delegator import AgentDelegator
     from engineering_hub.journaler.engine import ConversationEngine
     from engineering_hub.journaler.model_profiles import JournalerChatModelContext
-
-from engineering_hub.journaler.model_profiles import journaler_slash_model_command
 
 logger = logging.getLogger(__name__)
 
@@ -55,6 +74,17 @@ _AGENT_CMD_RE = re.compile(
 )
 _PROJECT_FLAG_RE = re.compile(r"--project\s+(\S+)", re.IGNORECASE)
 _BACKEND_FLAG_RE = re.compile(r"--backend\s+(mlx|claude)", re.IGNORECASE)
+_WEB_FLAG_RE = re.compile(r"--web\b", re.IGNORECASE)
+_NO_WEB_FLAG_RE = re.compile(r"--no-web\b", re.IGNORECASE)
+_DISPATCH_CONFIRM_RE = re.compile(
+    r"\b(yes|yep|please|go ahead|run it|dispatch|do it|execute|start)\b",
+    re.IGNORECASE,
+)
+
+# Regex to parse: /pipeline draft-section [flags]
+_PIPELINE_CMD_RE = re.compile(r"^/pipeline\s+draft-section\b", re.IGNORECASE)
+_SECTION_FLAG_RE = re.compile(r'--section\s+"([^"]+)"|--section\s+(\S+)', re.IGNORECASE)
+_LOOP_LIMIT_FLAG_RE = re.compile(r"--loop-limit\s+(\d+)", re.IGNORECASE)
 
 
 class ChatServer:
@@ -69,6 +99,8 @@ class ChatServer:
         start_time: datetime | None = None,
         delegator: AgentDelegator | None = None,
         model_context: JournalerChatModelContext | None = None,
+        pending_tasks_file: Path | None = None,
+        task_integrator: object | None = None,
     ) -> None:
         self.engine = engine
         self.context = context
@@ -77,6 +109,12 @@ class ChatServer:
         self.start_time = start_time or datetime.now()
         self.delegator = delegator
         self.model_context = model_context
+        self.task_integrator = task_integrator
+        self.pending_tasks_file = (
+            pending_tasks_file.expanduser().resolve()
+            if pending_tasks_file is not None
+            else (context.workspace_dir / ".journaler" / "pending-tasks.org").resolve()
+        )
         self._server: ThreadingHTTPServer | None = None
         self._thread: threading.Thread | None = None
 
@@ -88,6 +126,8 @@ class ChatServer:
             self.start_time,
             self.delegator,
             self.model_context,
+            self.pending_tasks_file,
+            self.task_integrator,
         )
         self._server = ThreadingHTTPServer((self.host, self.port), handler)
         self._thread = threading.Thread(
@@ -110,8 +150,16 @@ def _make_handler(
     start_time: datetime,
     delegator: AgentDelegator | None = None,
     model_context: JournalerChatModelContext | None = None,
+    pending_tasks_file: Path | None = None,
+    task_integrator: object | None = None,
 ) -> type[BaseHTTPRequestHandler]:
     """Create a request handler class with access to the engine and context."""
+
+    resolved_pending = (
+        pending_tasks_file.expanduser().resolve()
+        if pending_tasks_file is not None
+        else (context.workspace_dir / ".journaler" / "pending-tasks.org").resolve()
+    )
 
     class Handler(BaseHTTPRequestHandler):
         def do_POST(self) -> None:
@@ -164,29 +212,132 @@ def _make_handler(
                     response = _handle_agent_command(
                         message, delegator, context, engine=engine
                     )
+                elif mlow.startswith("/pipeline "):
+                    response = _handle_pipeline_command(
+                        message, delegator, context, engine=engine
+                    )
                 elif mlow == "/skills":
                     response = _handle_skills_command(delegator)
+                elif mlow.startswith("/blender"):
+                    response = _handle_blender_command(message)
+                elif mlow.startswith("/horn"):
+                    response = _handle_horn_command(message)
+                elif mlow.startswith("/integrate"):
+                    if task_integrator is None:
+                        response = (
+                            "Task-Integrator is not available on this server instance."
+                        )
+                    elif mlow.strip() == "/integrate status":
+                        response = task_integrator.status_summary()
+                    else:
+                        result = task_integrator.run_cycle()
+                        response = result.summary()
+                elif mlow.startswith("/history"):
+                    response = _handle_history_command(
+                        message, delegator, context, engine=engine
+                    )
+                elif mlow.startswith("/tasks") or mlow.startswith("/queue"):
+                    from engineering_hub.journaler.task_slash import (
+                        handle_tasks_slash_command,
+                    )
+
+                    response = handle_tasks_slash_command(
+                        message, engine, resolved_pending
+                    )
+                elif mlow.startswith("/timesheet"):
+                    export_template = None
+                    if model_context is not None and hasattr(
+                        model_context, "settings"
+                    ) and hasattr(
+                        model_context.settings, "resolved_timesheet_export_template"
+                    ):
+                        export_template = (
+                            model_context.settings.resolved_timesheet_export_template
+                        )
+                    response = handle_timesheet_slash_command(
+                        message,
+                        context.journal_dir,
+                        export_template=export_template,
+                    )
+                elif mlow.startswith("/convo"):
+                    from engineering_hub.journaler.convo_slash import handle_convo_command
+
+                    conv_cfg = None
+                    if model_context is not None and hasattr(
+                        model_context.settings, "journaler_conversations_default_project"
+                    ):
+                        from engineering_hub.journaler.conversations_config import (
+                            conversations_config_from_settings,
+                        )
+
+                        conv_cfg = conversations_config_from_settings(model_context.settings)
+                    response = handle_convo_command(
+                        message,
+                        engine,
+                        default_project=conv_cfg.default_project if conv_cfg else None,
+                    ) or "Unknown /convo command."
                 else:
+                    settings_obj = (
+                        model_context.settings if model_context is not None else None
+                    )
+                    mode = (
+                        (settings_obj.journaler_default_task_mode or "immediate")
+                        if settings_obj is not None
+                        else "immediate"
+                    ).lower()
+
+                    if engine.focus_is_active():
+                        routed = None
+                    else:
+                        routed = route_natural_language_task(
+                            message,
+                            engine=engine,
+                            delegator=delegator,
+                            mode=mode,
+                            pending_tasks_file=resolved_pending,
+                            run_agent_command=lambda cmd: _handle_agent_command(
+                                cmd, delegator, context, engine=engine
+                            ),
+                        )
+                    if routed is not None:
+                        elapsed = time.monotonic() - t0
+                        body = {
+                            "response": routed.response,
+                            "elapsed_seconds": round(elapsed, 2),
+                        }
+                        if routed.agent_result is not None:
+                            body["agent_result"] = routed.agent_result
+                        if routed.dispatched:
+                            body["dispatched"] = True
+                        self._send_json(body)
+                        return
+
                     raw_response = engine.chat(message)
                     response, dispatch_cmd = _extract_dispatch(raw_response)
                     if dispatch_cmd:
-                        # Auto-execute the proposed agent dispatch: the HTTP
-                        # client's user already confirmed intent in their message.
-                        logger.info(
-                            "Auto-executing DISPATCH sentinel from LLM: %s",
-                            dispatch_cmd[:80],
-                        )
-                        agent_result = _handle_agent_command(
-                            dispatch_cmd, delegator, context, engine=engine
-                        )
-                        engine.inject_turn(
-                            user=dispatch_cmd, assistant=agent_result
-                        )
                         elapsed = time.monotonic() - t0
+                        if _message_confirms_dispatch(message):
+                            logger.info(
+                                "Executing confirmed DISPATCH sentinel from LLM: %s",
+                                dispatch_cmd[:80],
+                            )
+                            agent_result = _handle_agent_command(
+                                dispatch_cmd, delegator, context, engine=engine
+                            )
+                            engine.inject_turn(
+                                user=dispatch_cmd, assistant=agent_result
+                            )
+                            self._send_json({
+                                "response": response,
+                                "agent_result": agent_result,
+                                "dispatched": True,
+                                "elapsed_seconds": round(elapsed, 2),
+                            })
+                            return
                         self._send_json({
                             "response": response,
-                            "agent_result": agent_result,
-                            "dispatched": True,
+                            "proposed_dispatch": dispatch_cmd,
+                            "dispatched": False,
                             "elapsed_seconds": round(elapsed, 2),
                         })
                         return
@@ -309,6 +460,11 @@ def _extract_dispatch(response: str) -> tuple[str, str | None]:
     return clean, dispatch_cmd
 
 
+def _message_confirms_dispatch(message: str) -> bool:
+    """Return True when the latest user message explicitly confirms execution."""
+    return bool(_DISPATCH_CONFIRM_RE.search(message))
+
+
 def _handle_agent_command(
     message: str,
     delegator: AgentDelegator | None,
@@ -317,12 +473,13 @@ def _handle_agent_command(
 ) -> str:
     """Parse and execute a /agent command.
 
-    Syntax: /agent <type> <description> [--project <id>] [--backend mlx|claude]
+    Syntax: /agent <type> <description> [--project <id>] [--backend mlx|claude] [--web|--no-web]
     """
     m = _AGENT_CMD_RE.match(message)
     if not m:
         return (
-            "Usage: `/agent <type> <description> [--project <id>] [--backend mlx|claude]`\n\n"
+            "Usage: `/agent <type> <description> [--project <id>] "
+            "[--backend mlx|claude] [--web|--no-web]`\n\n"
             "Types: research, technical-writer, standards-checker, technical-reviewer, "
             "weekly-reviewer"
         )
@@ -347,6 +504,16 @@ def _handle_agent_command(
         backend = bm.group(1).lower()
         raw_description = _BACKEND_FLAG_RE.sub("", raw_description).strip()
 
+    web_search_enabled: bool | None = None
+    web_search_required = False
+    if _NO_WEB_FLAG_RE.search(raw_description):
+        web_search_enabled = False
+        raw_description = _NO_WEB_FLAG_RE.sub("", raw_description).strip()
+    if _WEB_FLAG_RE.search(raw_description):
+        web_search_enabled = True
+        web_search_required = True
+        raw_description = _WEB_FLAG_RE.sub("", raw_description).strip()
+
     description = raw_description.strip(" -")
 
     if not description:
@@ -355,7 +522,6 @@ def _handle_agent_command(
     if delegator is None:
         # Fall back to journal write when no delegator is configured
         journal_dir = context.journal_dir
-        from engineering_hub.journaler.org_writer import add_todo_to_journal
 
         item = f"@{agent_type}: {description}"
         if project_id is not None:
@@ -370,8 +536,32 @@ def _handle_agent_command(
         return f"Could not queue task: {msg_text}"
 
     journaler_context = ""
+    anthropic_web_search = False
     if engine is not None:
-        journaler_context = engine.build_delegate_context(description)
+        context_result = engine.build_delegate_context_result(
+            description,
+            web_search_enabled=web_search_enabled,
+            web_search_required=web_search_required,
+        )
+        journaler_context = context_result.context
+        if (
+            context_result.web_search_attempted
+            and not context_result.web_search_succeeded
+            and engine.web_search_anthropic_backup_enabled
+            and delegator.will_use_anthropic_backend(backend)
+        ):
+            anthropic_web_search = True
+        elif (
+            web_search_required
+            and context_result.web_search_attempted
+            and not context_result.web_search_succeeded
+        ):
+            return (
+                "Web search was requested with `--web`, but local SearXNG retrieval "
+                f"failed: {context_result.web_search_error or 'unknown error'}"
+            )
+    elif web_search_required:
+        return "Web search was requested with `--web`, but no conversation engine is available."
 
     return delegator.delegate(
         agent_type=agent_type,
@@ -379,6 +569,109 @@ def _handle_agent_command(
         project_id=project_id,
         backend=backend,
         journaler_context=journaler_context,
+        anthropic_web_search=anthropic_web_search,
+        anthropic_web_search_tool_version=(
+            engine.web_search_anthropic_tool_version
+            if engine is not None
+            else "web_search_20250305"
+        ),
+        anthropic_web_search_max_uses=(
+            engine.web_search_anthropic_max_uses if engine is not None else 3
+        ),
+    )
+
+
+def _handle_history_command(
+    message: str,
+    delegator: AgentDelegator | None,
+    context: JournalContext,
+    engine: ConversationEngine | None = None,
+) -> str:
+    """Retrieve prior Journaler chat excerpts, optionally reviewing via an agent.
+
+    Syntax:
+        /history [--agent <type>] [--backend mlx|claude] <query>
+    """
+    try:
+        tokens = shlex.split(message)
+    except ValueError as exc:
+        return f"Could not parse `/history` command: {exc}"
+
+    if not tokens or tokens[0].lower() != "/history":
+        return "Usage: `/history [--agent <type>] [--backend mlx|claude] <query>`"
+
+    agent_type: str | None = None
+    backend = "auto"
+    query_parts: list[str] = []
+    i = 1
+    while i < len(tokens):
+        token = tokens[i]
+        if token == "--agent":
+            i += 1
+            if i >= len(tokens):
+                return "`--agent` requires an agent type."
+            agent_type = tokens[i]
+        elif token == "--backend":
+            i += 1
+            if i >= len(tokens):
+                return "`--backend` requires `mlx` or `claude`."
+            backend = tokens[i].lower()
+            if backend not in {"mlx", "claude", "auto"}:
+                return "`--backend` must be `mlx`, `claude`, or `auto`."
+        else:
+            query_parts.append(token)
+        i += 1
+
+    query = " ".join(query_parts).strip()
+    if not query:
+        return "Usage: `/history [--agent <type>] [--backend mlx|claude] <query>`"
+
+    hits = retrieve_past_sessions(
+        query,
+        state_dir=context.state_dir,
+        max_results=(
+            engine._pressure_config.past_session_search_k if engine is not None else 5
+        ),
+        excerpt_chars=(
+            engine._pressure_config.past_session_excerpt_chars
+            if engine is not None
+            else 1200
+        ),
+        store=engine.conversation_store if engine is not None else None,
+    )
+    block = format_past_session_block(hits)
+    if not block:
+        return (
+            "No matching prior Journaler chat excerpts found in "
+            "`conversation.jsonl` or `daily_summaries/`."
+        )
+
+    if agent_type is None:
+        return (
+            f"{block}\n\n"
+            "To have an agent review these excerpts, run "
+            "`/history --agent panning-for-gold <query>` or choose another "
+            "agent with `--agent <type>`."
+        )
+
+    if delegator is None:
+        return (
+            "Agent delegation is not configured, so I can retrieve history but "
+            "cannot dispatch an agent review.\n\n"
+            f"{block}"
+        )
+
+    delegate_context = block
+    if engine is not None:
+        base_context = engine.build_delegate_context(query)
+        if base_context:
+            delegate_context = f"{base_context}\n\n{block}"
+
+    return delegator.delegate(
+        agent_type=agent_type,
+        description=f"Review retrieved Journaler chat history for: {query}",
+        backend=backend,
+        journaler_context=delegate_context,
     )
 
 
@@ -391,3 +684,130 @@ def _handle_skills_command(delegator: AgentDelegator | None) -> str:
             "then set `journaler.agent_backend` in your config."
         )
     return delegator.skills_summary()
+
+
+def _handle_blender_command(message: str) -> str:
+    """Handle ``/blender status`` connectivity checks."""
+    from engineering_hub.blender import service as blender_service
+
+    parts = message.split()
+    sub = parts[1].lower() if len(parts) > 1 else "status"
+    if sub != "status":
+        return "Usage: /blender status"
+    return blender_service.format_status_message()
+
+
+def _handle_horn_command(message: str) -> str:
+    """Handle ``/horn [sweep|defaults]`` parametric horn sweeps."""
+    from engineering_hub.horn_iterator import service as horn_service
+
+    return horn_service.handle_slash_command(message)
+
+
+def _handle_pipeline_command(
+    message: str,
+    delegator: AgentDelegator | None,
+    context: JournalContext,
+    engine: ConversationEngine | None = None,
+) -> str:
+    """Parse and execute a /pipeline draft-section command.
+
+    Syntax::
+
+        /pipeline draft-section --section "<section>" [--project <id>]
+                                 [--backend mlx|claude] [--loop-limit <n>]
+
+    Gathers pre-processed result files from the project staging directory,
+    then runs the multi-stage drafting pipeline:
+    technical-writer → standards-checker (loop) → technical-reviewer → latex-writer.
+
+    Falls back to queueing a journal TODO when no delegator is configured.
+    """
+    if not _PIPELINE_CMD_RE.match(message):
+        return (
+            "Usage: `/pipeline draft-section --section \"<section>\" "
+            "[--project <id>] [--backend mlx|claude] [--loop-limit <n>]`\n\n"
+            "Example: `/pipeline draft-section --section \"6.0 Noise Impacts\" --project 42`"
+        )
+
+    # --- Extract --section flag ---
+    sm = _SECTION_FLAG_RE.search(message)
+    section = (sm.group(1) or sm.group(2) or "").strip() if sm else ""
+    if not section:
+        return (
+            "Please supply a section name via `--section \"<section>\"`.\n\n"
+            "Example: `/pipeline draft-section --section \"6.0 Noise Impacts\" --project 42`"
+        )
+
+    # --- Extract optional flags ---
+    project_id: int | str | None = None
+    pm = _PROJECT_FLAG_RE.search(message)
+    if pm:
+        raw_id = pm.group(1)
+        try:
+            project_id = int(raw_id)
+        except ValueError:
+            project_id = raw_id
+
+    backend = "auto"
+    bm = _BACKEND_FLAG_RE.search(message)
+    if bm:
+        backend = bm.group(1).lower()
+
+    loop_limit: int | None = None
+    lm = _LOOP_LIMIT_FLAG_RE.search(message)
+    if lm:
+        loop_limit = int(lm.group(1))
+
+    # --- No delegator: queue to journal ---
+    if delegator is None:
+        journal_dir = context.journal_dir
+        from engineering_hub.journaler.org_writer import add_todo_to_journal
+
+        item = f"@pipeline: draft-section '{section}'"
+        if project_id is not None:
+            item += f" [[django://project/{project_id}]]"
+        ok, msg_text = add_todo_to_journal(journal_dir, item)
+        if ok:
+            return (
+                f"No live agent backend configured — pipeline task queued for overnight dispatch:\n"
+                f"`- [ ] {item}`\n\n"
+                f"The Orchestrator will pick it up on the next scan."
+            )
+        return f"Could not queue pipeline task: {msg_text}"
+
+    # --- Run the pipeline ---
+    from engineering_hub.context.data_gatherer import DataGatherer
+    from engineering_hub.orchestration.pipeline import AgentPipeline
+
+    output_dir = context.workspace_dir / "outputs"
+    gatherer = DataGatherer(output_dir=output_dir)
+
+    pid_for_gather = project_id if project_id is not None else "unknown"
+    bundle = gatherer.gather(project_id=pid_for_gather, section_hint=section)
+
+    if bundle.is_empty:
+        logger.warning(
+            "Pipeline: no data files found for project %s — proceeding with empty bundle.",
+            pid_for_gather,
+        )
+
+    pipeline = AgentPipeline(output_dir=output_dir / "pipeline")
+
+    try:
+        result = pipeline.run(
+            section=section,
+            data_bundle=bundle,
+            delegator=delegator,
+            project_id=project_id,
+            backend=backend,
+            loop_limit=loop_limit,
+        )
+    except Exception as exc:
+        logger.error("Pipeline execution error: %s", exc)
+        return f"Pipeline failed with an unexpected error: {exc}"
+
+    summary = result.format_summary()
+    if engine is not None:
+        engine.inject_turn(message, summary)
+    return summary

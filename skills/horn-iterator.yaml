@@ -1,0 +1,50 @@
+name: horn-iterator
+display_name: Horn Iterator
+agent_type: horn-iterator
+
+domain: acoustic-engineering
+domain_triggers:
+  - horn
+  - waveguide
+  - flare
+  - exponential horn
+  - directivity
+  - coverage angle
+  - cutoff frequency
+  - mouth area
+  - parametric sweep
+  - lvt
+  - spl
+
+description: |
+  Parametric exponential-horn design screener for the LVT alert system. Sweeps
+  flare length and mouth width/height, computes cutoff frequency, mouth area,
+  coverage/FOV, and low-frequency rolloff, then validates each candidate against
+  the LVT constraints (250 Hz-12 kHz, 100-105 dB @ 1 m, 130-180 deg FOV,
+  150x80x160 mm envelope). Computes locally; no external API required.
+
+when_to_use:
+  - User wants to sweep horn length/width/height and rank designs
+  - User asks how a specific horn geometry performs against LVT targets
+  - User wants cutoff, mouth area, coverage, or LF rolloff estimates
+  - User wants a CSV/org table of horn candidates to review
+
+invocation_examples:
+  - "/agent horn-iterator --backend claude sweep the horn design space and rank the best LVT candidates"
+  - "/agent horn --backend claude evaluate a 130mm exponential length with a 120x80mm mouth"
+  - "/agent horn-sweep --backend claude which designs hit 130 deg coverage without exceeding the envelope?"
+  - "/agent waveguide --backend claude export the full sweep as org for my journal"
+
+parameters:
+  description:
+    description: The horn design question — sweep, single-design eval, or export
+    required: true
+
+output:
+  format: markdown
+  structure:
+    - Design space
+    - Results
+    - Recommendation
+    - Next steps
+  output_dir: horn_iterator

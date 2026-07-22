@@ -1,0 +1,62 @@
+name: career-coach
+display_name: Career Coach
+agent_type: career-coach
+
+domain: career
+domain_triggers:
+  - resume
+  - cv
+  - job offer
+  - job search
+  - interview
+  - salary negotiation
+  - comp negotiation
+  - career change
+  - promotion
+  - linkedin
+  - recruiter
+  - cover letter
+  - job description
+  - offer letter
+  - professional development
+  - performance review
+  - job application
+  - career path
+  - career advice
+
+description: |
+  Provides structured career guidance: resume review and targeted editing, job search strategy,
+  offer evaluation, salary and compensation negotiation tactics, interview preparation, and
+  professional development planning. Adapts to technical, consulting, and hybrid roles.
+  Produces decision frameworks, rewrite drafts, and negotiation scripts — never fabricates
+  company-specific salary data; uses provided context or acknowledged benchmarks only.
+
+when_to_use:
+  - User asks for resume or CV review, edits, or tailoring to a specific role
+  - User has received a job offer and wants help evaluating or negotiating it
+  - User is preparing for an interview (technical or behavioral)
+  - User is weighing a career change or promotion decision
+  - User wants salary benchmarking advice or a negotiation script
+  - User needs a cover letter drafted or refined
+  - User is building a professional development plan or preparing a performance review
+
+invocation_examples:
+  - "/agent career-coach review my resume for a senior acoustics consultant role"
+  - "/agent career what are the right counter-offer points for this offer letter?"
+  - "/agent coach help me prepare for a behavioral interview at a large AEC firm"
+  - "/agent career-coach draft a cover letter for the senior engineer position at Arup"
+  - "/agent career build a 6-month professional development plan for moving into technical leadership"
+
+parameters:
+  description:
+    description: The career task — what document, decision, or situation to address
+    required: true
+
+output:
+  format: markdown
+  structure:
+    - Summary of situation / ask
+    - Analysis or rewrite (varies by task)
+    - Key recommendations or talking points
+    - Next steps
+  output_dir: career

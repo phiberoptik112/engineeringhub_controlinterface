@@ -14,6 +14,12 @@ from engineering_hub.agents.tools import ToolContext, resolve_tools
 from engineering_hub.core.constants import AgentType
 from engineering_hub.core.exceptions import AgentExecutionError, LLMBackendError
 from engineering_hub.core.models import ParsedTask, TaskResult
+from engineering_hub.diagnostics.prompt_addendum import DIAGNOSTIC_CONTEXT_AUDIT_ADDENDUM
+from engineering_hub.zettelkasten.linking import suggest_links
+from engineering_hub.zettelkasten.proposals import write_proposal_batch
+from engineering_hub.zettelkasten.response_parser import parse_curator_response
+from engineering_hub.zettelkasten.models import ProposalBatch
+from engineering_hub.zettelkasten.state import ZettelkastenState, new_batch_id
 
 logger = logging.getLogger(__name__)
 
@@ -33,10 +39,15 @@ class AgentWorker:
         templates_dir: Path | None = None,
         corpus_service: Any | None = None,
         memory_service: Any | None = None,
+        diagnostic_context_audit: bool = False,
+        proposal_dir: Path | None = None,
+        zettel_state_path: Path | None = None,
+        org_journal_dir: Path | None = None,
     ) -> None:
         self._backend = backend
         self.max_tokens = max_tokens
         self.output_dir = output_dir or Path("outputs")
+        self.diagnostic_context_audit = diagnostic_context_audit
 
         self._prompt_loader = PromptLoader(prompts_dir or Path("prompts"))
         self._registry = AgentRegistry()
@@ -46,6 +57,9 @@ class AgentWorker:
         )
         self._corpus_service = corpus_service
         self._memory_service = memory_service
+        self._proposal_dir = proposal_dir
+        self._zettel_state_path = zettel_state_path
+        self._org_journal_dir = org_journal_dir
 
     @classmethod
     def from_anthropic(
@@ -59,6 +73,9 @@ class AgentWorker:
         templates_dir: Path | None = None,
         corpus_service: Any | None = None,
         memory_service: Any | None = None,
+        proposal_dir: Path | None = None,
+        zettel_state_path: Path | None = None,
+        org_journal_dir: Path | None = None,
     ) -> "AgentWorker":
         """Convenience constructor that creates an AnthropicBackend internally."""
         backend = AnthropicBackend(api_key=api_key, model=model)
@@ -71,6 +88,10 @@ class AgentWorker:
             templates_dir=templates_dir,
             corpus_service=corpus_service,
             memory_service=memory_service,
+            diagnostic_context_audit=False,
+            proposal_dir=proposal_dir,
+            zettel_state_path=zettel_state_path,
+            org_journal_dir=org_journal_dir,
         )
 
     def execute(self, task: ParsedTask, context: str) -> TaskResult:
@@ -83,6 +104,18 @@ class AgentWorker:
         Returns:
             TaskResult with success status and outputs
         """
+        return self.execute_with_options(task, context)
+
+    def execute_with_options(
+        self,
+        task: ParsedTask,
+        context: str,
+        *,
+        anthropic_web_search: bool = False,
+        anthropic_web_search_tool_version: str = "web_search_20250305",
+        anthropic_web_search_max_uses: int = 3,
+    ) -> TaskResult:
+        """Execute a task with optional backend-specific execution options."""
         agent_type = task.agent_type
 
         if not self._registry.is_enabled(agent_type):
@@ -107,6 +140,11 @@ class AgentWorker:
                     system_prompt, task.description
                 )
 
+            if self.diagnostic_context_audit:
+                system_prompt = (
+                    system_prompt.rstrip() + "\n\n" + DIAGNOSTIC_CONTEXT_AUDIT_ADDENDUM
+                )
+
             user_message = self._build_user_message(
                 task, context, override_description=cleaned_description
             )
@@ -119,7 +157,17 @@ class AgentWorker:
                 and config.tools
                 and hasattr(self._backend, "complete_with_tools")
             )
-            if use_tools:
+            if anthropic_web_search and isinstance(self._backend, AnthropicBackend):
+                logger.info("Using Anthropic server-side web search fallback for agent task")
+                max_tok = config.max_tokens if config else self.max_tokens
+                response = self._backend.complete_with_web_search(
+                    system_prompt,
+                    user_message,
+                    max_tok,
+                    tool_version=anthropic_web_search_tool_version,
+                    max_uses=anthropic_web_search_max_uses,
+                )
+            elif use_tools:
                 response = self._execute_with_tools(
                     task=task,
                     system_prompt=system_prompt,
@@ -159,8 +207,15 @@ class AgentWorker:
                 "Backend does not support tool calling, falling back to single-shot: %s", e
             )
             max_tok = config.max_tokens if config else self.max_tokens
+            no_tool_note = (
+                "\n\n[Note: Tool calling is not available in this backend. "
+                "Do not attempt to call tools or emit tool call syntax. "
+                "Provide your best answer using only the context and knowledge "
+                "already provided.]\n"
+            )
+            augmented_system = system_prompt + no_tool_note
             try:
-                response = self._backend.complete(system_prompt, user_message, max_tok)
+                response = self._backend.complete(augmented_system, user_message, max_tok)
                 output_path = self._write_output(task, response)
                 return TaskResult(
                     task=task,
@@ -475,23 +530,27 @@ class AgentWorker:
             )
             return response
 
-        if ext == ".md":
+        if ext in (".md", ".org"):
             # Strip a single outer code fence (matches postprocess_model_org behaviour)
             stripped = response.strip()
             if stripped.startswith("```") and stripped.endswith("```"):
                 inner = stripped[3:]
                 if "\n" in inner:
-                    # Drop the opening language tag line (e.g. "markdown\n")
+                    # Drop the opening language tag line (e.g. "markdown\n", "org\n")
                     inner = inner.split("\n", 1)[1]
                 if inner.endswith("```"):
                     inner = inner[: -len("```")]
-                logger.debug("Stripped outer markdown fence from .md agent output.")
+                logger.debug("Stripped outer code fence from %s agent output.", ext)
                 return inner.strip()
 
         return response
 
     def _write_output(self, task: ParsedTask, response: str) -> Path:
         """Write agent response to output file."""
+        # Zettelkasten curator: route through the proposals pipeline when configured.
+        if task.agent_type == AgentType.ZETTELKASTEN_CURATOR and self._proposal_dir:
+            return self._write_zettel_proposal(task, response)
+
         if task.deliverable:
             output_path = self.output_dir / task.deliverable.lstrip("/")
         else:
@@ -504,9 +563,12 @@ class AgentWorker:
                 AgentType.TECHNICAL_REVIEWER: "reviews",
                 AgentType.LATEX_WRITER: "latex",
                 AgentType.PANNING_FOR_GOLD: "panning",
+                AgentType.ZETTELKASTEN_CURATOR: "zettelkasten",
+                AgentType.TIMESHEET_REVIEWER: "timesheets",
             }
             agent_extensions = {
                 AgentType.LATEX_WRITER: ".tex",
+                AgentType.ZETTELKASTEN_CURATOR: ".org",
             }
             agent_dir = agent_dirs.get(task.agent_type, "outputs")
             ext = agent_extensions.get(task.agent_type, ".md")
@@ -532,6 +594,74 @@ class AgentWorker:
         logger.debug(f"Wrote output to {output_path}")
 
         return output_path
+
+    def _write_zettel_proposal(self, task: ParsedTask, response: str) -> Path:
+        """Parse an LLM curator response and write it through the proposals pipeline.
+
+        Produces a JSON sidecar and an org review buffer via write_proposal_batch().
+        Falls back to the plain .org dump if parsing yields no notes.
+        """
+        assert self._proposal_dir is not None
+
+        notes = parse_curator_response(
+            response,
+            task_description=task.description,
+            org_journal_dir=self._org_journal_dir,
+        )
+
+        if not notes:
+            logger.warning(
+                "Zettelkasten curator response yielded no parseable notes — "
+                "falling back to plain .org dump."
+            )
+            fallback_dir = self._proposal_dir
+            fallback_dir.mkdir(parents=True, exist_ok=True)
+            slug = "".join(
+                c if c.isalnum() or c == "-" else "-"
+                for c in task.description[:30].lower()
+            )
+            slug = "-".join(filter(None, slug.split("-")))
+            fallback_path = fallback_dir / f"{new_batch_id()}-{slug}-raw.org"
+            fallback_path.write_text(
+                self._postprocess_output(response, ".org"), encoding="utf-8"
+            )
+            return fallback_path
+
+        # Enrich each note with semantic link suggestions from the memory store.
+        for note in notes:
+            if not note.links and self._memory_service is not None:
+                note.links = suggest_links(
+                    note.body,
+                    self._memory_service,
+                    top_k=5,
+                    threshold=0.75,
+                )
+
+        state: ZettelkastenState | None = None
+        if self._zettel_state_path is not None:
+            state = ZettelkastenState.load(self._zettel_state_path)
+
+        batch = ProposalBatch(
+            batch_id=new_batch_id(),
+            created_at=datetime.now().isoformat(timespec="seconds"),
+            notes=notes,
+            source_count=len(notes),
+        )
+
+        _json_path, org_path = write_proposal_batch(
+            batch, self._proposal_dir, state=state
+        )
+
+        if state is not None and self._zettel_state_path is not None:
+            state.save(self._zettel_state_path)
+
+        logger.info(
+            "Zettelkasten proposal batch %s written: %d note(s) → %s",
+            batch.batch_id,
+            len(notes),
+            org_path,
+        )
+        return org_path
 
     def _validate_latex_output(self, tex_path: Path) -> str:
         """Run pdflatex on *tex_path* and return a one-line validation summary.
