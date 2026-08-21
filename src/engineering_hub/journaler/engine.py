@@ -1055,13 +1055,13 @@ class ConversationEngine:
 
     def replace_backend(
         self,
-        backend: ConversationalMLXBackend,
+        backend: Any,
         *,
         model_context_window: int | None = None,
         max_tokens: int | None = None,
         max_thinking_tokens: int | None = None,
     ) -> None:
-        """Swap the MLX backend (e.g. after ``/model``) while keeping conversation history."""
+        """Swap the LM backend (e.g. after ``/model``) while keeping conversation history."""
         self._backend = backend
         if max_thinking_tokens is not None:
             self._max_thinking_tokens = max(0, max_thinking_tokens)

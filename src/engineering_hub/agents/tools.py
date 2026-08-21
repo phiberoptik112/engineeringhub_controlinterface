@@ -462,8 +462,8 @@ def handle_rental_add_journal_task(args: dict[str, Any], ctx: ToolContext) -> st
 BLENDER_HEALTH_TOOL = {
     "name": "blender_health",
     "description": (
-        "Check connectivity to the Blender MCP addon (HTTP endpoint). "
-        "Use before scene work to confirm Blender is running and tools are available."
+        "Check connectivity to the Blender Lab MCP TCP bridge. "
+        "Use before scene work to confirm Blender is running and Lab MCP is listening."
     ),
     "input_schema": {"type": "object", "properties": {}, "required": []},
 }
@@ -476,15 +476,15 @@ def handle_blender_health(args: dict[str, Any], ctx: ToolContext) -> str:
 BLENDER_LIST_TOOLS_TOOL = {
     "name": "blender_list_tools",
     "description": (
-        "List remote Blender MCP tools available after allowlist/denylist filters. "
-        "Use to discover the correct tool_name before blender_call_tool."
+        "Return the fixed Hub catalog for Lab MCP (health, list_tools, execute). "
+        "Lab has no remote dcc-mcp tool list — use blender_execute with bpy code."
     ),
     "input_schema": {
         "type": "object",
         "properties": {
             "refresh": {
                 "type": "boolean",
-                "description": "Bypass cache and fetch fresh tool list (default false)",
+                "description": "Ignored for Lab MCP (catalog is local)",
             },
         },
         "required": [],
@@ -498,36 +498,42 @@ def handle_blender_list_tools(args: dict[str, Any], ctx: ToolContext) -> str:
     )
 
 
-BLENDER_CALL_TOOL = {
-    "name": "blender_call_tool",
+BLENDER_EXECUTE_TOOL = {
+    "name": "blender_execute",
     "description": (
-        "Invoke a remote Blender MCP tool by name with a JSON arguments object. "
-        "Prefer inspection tools (scene summary, list objects) before mutating the scene. "
-        "Destructive tools may be blocked by config denylist."
+        "Execute Python inside the live Blender session via Lab MCP. "
+        "Your code must assign a JSON-serializable dict to `result`. "
+        "Inspect the scene before mutating; never delete or clear without user consent."
     ),
     "input_schema": {
         "type": "object",
         "properties": {
-            "tool_name": {
+            "code": {
                 "type": "string",
-                "description": "Remote MCP tool name (see blender_list_tools)",
+                "description": (
+                    "Python source run inside Blender. Example: "
+                    "import bpy; result = {'names': [o.name for o in bpy.data.objects]}"
+                ),
             },
-            "arguments": {
-                "type": "object",
-                "description": "Tool arguments object (may be empty)",
+            "strict_json": {
+                "type": "boolean",
+                "description": (
+                    "When true (default), `result` must be JSON-serializable. "
+                    "Set false only for exploratory code that may need repr fallbacks."
+                ),
             },
         },
-        "required": ["tool_name"],
+        "required": ["code"],
     },
 }
 
 
-def handle_blender_call_tool(args: dict[str, Any], ctx: ToolContext) -> str:
-    tool_name = str(args.get("tool_name", "")).strip()
-    arguments = args.get("arguments") or {}
-    if not isinstance(arguments, dict):
-        return json.dumps({"success": False, "error": "arguments must be an object"})
-    return json.dumps(blender_service.call_tool(tool_name, arguments))
+def handle_blender_execute(args: dict[str, Any], ctx: ToolContext) -> str:
+    code = str(args.get("code", ""))
+    strict_json = args.get("strict_json", True)
+    if not isinstance(strict_json, bool):
+        strict_json = True
+    return json.dumps(blender_service.execute(code, strict_json=strict_json))
 
 
 # ---------------------------------------------------------------------------
@@ -717,9 +723,9 @@ TOOL_REGISTRY: dict[str, ToolDefinition] = {
         schema=BLENDER_LIST_TOOLS_TOOL,
         handler=handle_blender_list_tools,
     ),
-    "blender_call_tool": ToolDefinition(
-        schema=BLENDER_CALL_TOOL,
-        handler=handle_blender_call_tool,
+    "blender_execute": ToolDefinition(
+        schema=BLENDER_EXECUTE_TOOL,
+        handler=handle_blender_execute,
     ),
     "horn_get_defaults": ToolDefinition(
         schema=HORN_GET_DEFAULTS_TOOL,

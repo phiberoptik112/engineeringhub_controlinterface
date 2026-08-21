@@ -159,7 +159,7 @@ DEFAULT_AGENT_CONFIGS = {
         tools=[
             "blender_health",
             "blender_list_tools",
-            "blender_call_tool",
+            "blender_execute",
             "search_memory",
         ],
         max_tokens=6000,

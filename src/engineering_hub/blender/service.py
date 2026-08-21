@@ -1,36 +1,80 @@
-"""Blender MCP client — health checks, tool listing, and proxied tool calls.
+"""Blender Lab MCP client — health checks, tool catalog, and bpy execute.
 
-Talks to a running Blender MCP server (default ``http://127.0.0.1:8765/mcp``)
-via the fastmcp ``Client``. Optional allowlist/denylist filters tool names
-before invocation. All public functions fail gracefully when Blender is offline
-or integration is disabled in config.
+Talks to the official Blender Lab MCP add-on (default ``127.0.0.1:9876``)
+over TCP with null-byte-delimited JSON. Lab has no remote tool catalog;
+agents run ``bpy`` via :func:`execute`. All public functions fail gracefully
+when Blender is offline or integration is disabled in config.
 """
 
 from __future__ import annotations
 
-import asyncio
-import concurrent.futures
 import logging
-import time
-from dataclasses import dataclass
 from typing import Any
 
-from fastmcp import Client
-from fastmcp.client.transports import StreamableHttpTransport
-
+from engineering_hub.blender.lab_client import LabMCPError, execute as lab_execute
 from engineering_hub.config.loader import find_config_file
 from engineering_hub.config.settings import Settings
 
 logger = logging.getLogger(__name__)
 
+_HEALTH_PING_CODE = (
+    "import bpy\n"
+    'result = {"ok": True, "version": bpy.app.version_string}\n'
+)
 
-@dataclass
-class _ToolCache:
-    fetched_at: float
-    tools: list[dict[str, Any]]
-
-
-_tool_cache: _ToolCache | None = None
+# Fixed Hub-side catalog (Lab has no remote list_tools).
+_LOCAL_TOOL_CATALOG: list[dict[str, Any]] = [
+    {
+        "name": "blender_health",
+        "description": (
+            "Ping the Lab MCP TCP bridge and return Blender version when connected."
+        ),
+        "inputSchema": {"type": "object", "properties": {}, "required": []},
+    },
+    {
+        "name": "blender_list_tools",
+        "description": (
+            "Return this fixed Hub catalog describing Lab MCP execute usage. "
+            "There is no remote dcc-mcp tool list."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "refresh": {
+                    "type": "boolean",
+                    "description": "Ignored for Lab MCP (catalog is local).",
+                },
+            },
+            "required": [],
+        },
+    },
+    {
+        "name": "blender_execute",
+        "description": (
+            "Execute Python inside the live Blender session via Lab MCP. "
+            "Assign a JSON-serializable dict to `result`. Example:\n"
+            "  import bpy\n"
+            "  result = {'objects': [o.name for o in bpy.data.objects]}\n"
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "code": {
+                    "type": "string",
+                    "description": "Python source executed in Blender (sets `result`)",
+                },
+                "strict_json": {
+                    "type": "boolean",
+                    "description": (
+                        "When true (default), `result` must be JSON-serializable. "
+                        "Set false only for exploratory LLM-generated code."
+                    ),
+                },
+            },
+            "required": ["code"],
+        },
+    },
+]
 
 
 def _load_settings() -> Settings:
@@ -38,243 +82,64 @@ def _load_settings() -> Settings:
     return Settings.from_yaml(config_path) if config_path else Settings()
 
 
-def resolve_blender_mcp_url(settings: Settings | None = None) -> str:
-    """Return the configured Blender MCP endpoint URL."""
+def resolve_blender_endpoint(settings: Settings | None = None) -> str:
+    """Return ``host:port`` for the configured Lab MCP bridge."""
     settings = settings or _load_settings()
-    return settings.blender_mcp_url
+    return f"{settings.blender_host}:{settings.blender_port}"
 
 
-def filter_tool_names(names: list[str], settings: Settings) -> list[str]:
-    """Apply configured allowlist/denylist to remote tool names."""
-    denylist = settings.blender_tool_denylist or []
-    allowlist = settings.blender_tool_allowlist
-    filtered: list[str] = []
-    for name in names:
-        if denylist and name in denylist:
-            continue
-        if allowlist is not None and name not in allowlist:
-            continue
-        filtered.append(name)
-    return filtered
-
-
-def _auth_headers(settings: Settings) -> dict[str, str]:
-    token = (settings.blender_auth_token or "").strip()
-    if token:
-        return {"Authorization": f"Bearer {token}"}
-    return {}
-
-
-def _build_client(settings: Settings) -> Client:
-    url = resolve_blender_mcp_url(settings)
-    timeout = settings.blender_connect_timeout_s
-    headers = _auth_headers(settings)
-    if headers:
-        transport = StreamableHttpTransport(url, headers=headers)
-        return Client(transport, timeout=timeout)
-    return Client(url, timeout=timeout)
-
-
-def _run_async(coro):
-    """Run an async coroutine from synchronous agent tool handlers."""
-    try:
-        asyncio.get_running_loop()
-    except RuntimeError:
-        return asyncio.run(coro)
-
-    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-        return pool.submit(asyncio.run, coro).result()
-
-
-def _tool_allowed(name: str, settings: Settings) -> bool:
-    return name in filter_tool_names([name], settings)
-
-
-def _serialize_tool(tool: Any) -> dict[str, Any]:
-    name = getattr(tool, "name", None)
-    if isinstance(name, str) and name:
-        description = getattr(tool, "description", "") or ""
-        schema = getattr(tool, "inputSchema", None) or getattr(tool, "input_schema", {})
-        return {
-            "name": name,
-            "description": description if isinstance(description, str) else str(description),
-            "inputSchema": schema if isinstance(schema, dict) else {},
-        }
-
-    if hasattr(tool, "model_dump"):
-        try:
-            data = tool.model_dump(mode="json")
-        except TypeError:
-            data = None
-        if isinstance(data, dict) and isinstance(data.get("name"), str) and data["name"]:
-            return {
-                "name": data["name"],
-                "description": data.get("description") or "",
-                "inputSchema": data.get("inputSchema", {}),
-            }
-    return {
-        "name": str(getattr(tool, "name", "")),
-        "description": getattr(tool, "description", "") or "",
-        "inputSchema": getattr(tool, "inputSchema", {}),
-    }
-
-
-def _extract_text(result: Any) -> str:
-    if hasattr(result, "model_dump"):
-        data = result.model_dump(mode="json")
-    else:
-        data = _serialize_call_result(result)
-
-    parts: list[str] = []
-    for block in data.get("content", []):
-        if isinstance(block, dict):
-            text = block.get("text")
-            if text:
-                parts.append(str(text))
-        else:
-            parts.append(str(block))
-    if data.get("structuredContent") is not None:
-        parts.append(str(data["structuredContent"]))
-    return "\n".join(parts).strip()
-
-
-def _serialize_call_result(result: Any) -> dict[str, Any]:
-    if hasattr(result, "model_dump"):
-        return result.model_dump(mode="json")
-
-    content: list[Any] = []
-    for block in result.content:
-        if hasattr(block, "model_dump"):
-            content.append(block.model_dump(mode="json"))
-        else:
-            content.append(str(block))
-    payload: dict[str, Any] = {
-        "content": content,
-        "isError": bool(result.isError),
-    }
-    if result.structuredContent is not None:
-        payload["structuredContent"] = result.structuredContent
-    return payload
-
-
-def _cache_valid(settings: Settings) -> bool:
-    global _tool_cache
-    if _tool_cache is None:
-        return False
-    ttl = settings.blender_tools_cache_ttl_s
-    return (time.monotonic() - _tool_cache.fetched_at) < ttl
-
-
-async def _async_fetch_tools(settings: Settings) -> list[dict[str, Any]]:
-    async with _build_client(settings) as client:
-        remote_tools = await client.list_tools()
-        serialized = [_serialize_tool(tool) for tool in remote_tools]
-        allowed_names = filter_tool_names([t["name"] for t in serialized], settings)
-        allowed = {name for name in allowed_names}
-        return [tool for tool in serialized if tool["name"] in allowed]
-
-
-async def _async_health_check(settings: Settings) -> dict[str, Any]:
-    url = resolve_blender_mcp_url(settings)
+def health_check(settings: Settings | None = None) -> dict[str, Any]:
+    """Ping the Lab MCP bridge and return reachability metadata."""
+    settings = settings or _load_settings()
+    endpoint = resolve_blender_endpoint(settings)
     if not settings.blender_enabled:
         return {
             "enabled": False,
             "connected": False,
-            "url": url,
+            "endpoint": endpoint,
+            "host": settings.blender_host,
+            "port": settings.blender_port,
         }
 
     try:
-        async with _build_client(settings) as client:
-            remote_tools = await client.list_tools()
-            serialized = [_serialize_tool(tool) for tool in remote_tools]
-            allowed_names = filter_tool_names([t["name"] for t in serialized], settings)
-            allowed = {name for name in allowed_names}
-            filtered = [tool for tool in serialized if tool["name"] in allowed]
-            sample = [tool["name"] for tool in filtered[:8]]
+        response = lab_execute(
+            _HEALTH_PING_CODE,
+            host=settings.blender_host,
+            port=settings.blender_port,
+            timeout_s=settings.blender_connect_timeout_s,
+            strict_json=True,
+        )
+        if response.get("status") != "ok":
+            message = response.get("message") or str(response)
             return {
                 "enabled": True,
-                "connected": True,
-                "url": url,
-                "tool_count": len(serialized),
-                "filtered_tool_count": len(filtered),
-                "sample_tools": sample,
+                "connected": False,
+                "endpoint": endpoint,
+                "host": settings.blender_host,
+                "port": settings.blender_port,
+                "error": message,
             }
-    except Exception as exc:
+        result = response.get("result") or {}
+        return {
+            "enabled": True,
+            "connected": True,
+            "endpoint": endpoint,
+            "host": settings.blender_host,
+            "port": settings.blender_port,
+            "blender_version": result.get("version"),
+            "sample_tools": [t["name"] for t in _LOCAL_TOOL_CATALOG],
+            "tool_count": len(_LOCAL_TOOL_CATALOG),
+        }
+    except LabMCPError as exc:
         logger.warning("blender health_check failed: %s", exc)
         return {
             "enabled": True,
             "connected": False,
-            "url": url,
+            "endpoint": endpoint,
+            "host": settings.blender_host,
+            "port": settings.blender_port,
             "error": str(exc),
         }
-
-
-async def _async_list_tools(settings: Settings, *, use_cache: bool) -> dict[str, Any]:
-    global _tool_cache
-
-    if not settings.blender_enabled:
-        return {"error": "Blender integration is disabled (blender.enabled=false)"}
-
-    if use_cache and _cache_valid(settings):
-        assert _tool_cache is not None
-        return {
-            "status": "ok",
-            "cached": True,
-            "count": len(_tool_cache.tools),
-            "tools": list(_tool_cache.tools),
-        }
-
-    try:
-        tools = await _async_fetch_tools(settings)
-        _tool_cache = _ToolCache(fetched_at=time.monotonic(), tools=tools)
-        return {
-            "status": "ok",
-            "cached": False,
-            "count": len(tools),
-            "tools": tools,
-        }
-    except Exception as exc:
-        logger.warning("blender list_tools failed: %s", exc)
-        return {"status": "error", "error": str(exc)}
-
-
-async def _async_call_tool(
-    name: str,
-    arguments: dict[str, Any] | None,
-    settings: Settings,
-) -> dict[str, Any]:
-    if not settings.blender_enabled:
-        return {
-            "success": False,
-            "error": "Blender integration is disabled (blender.enabled=false)",
-        }
-
-    if not _tool_allowed(name, settings):
-        return {
-            "success": False,
-            "error": f"Tool {name!r} is blocked by blender tool allowlist/denylist",
-        }
-
-    try:
-        async with _build_client(settings) as client:
-            result = await client.call_tool(name, arguments or {})
-            text = _extract_text(result)
-            payload = _serialize_call_result(result)
-            return {
-                "success": not bool(payload.get("isError")),
-                "tool": name,
-                "text": text,
-                "result": payload,
-            }
-    except Exception as exc:
-        logger.warning("blender call_tool(%s) failed: %s", name, exc)
-        return {"success": False, "tool": name, "error": str(exc)}
-
-
-def health_check(settings: Settings | None = None) -> dict[str, Any]:
-    """Ping the Blender MCP server and return reachability metadata."""
-    settings = settings or _load_settings()
-    return _run_async(_async_health_check(settings))
 
 
 def list_tools(
@@ -282,35 +147,97 @@ def list_tools(
     *,
     use_cache: bool = True,
 ) -> dict[str, Any]:
-    """List tools exposed by the Blender MCP server."""
+    """Return the fixed Hub-side Lab MCP tool catalog."""
     settings = settings or _load_settings()
-    return _run_async(_async_list_tools(settings, use_cache=use_cache))
+    if not settings.blender_enabled:
+        return {"error": "Blender integration is disabled (blender.enabled=false)"}
+
+    # use_cache is accepted for API compatibility; catalog is local and static.
+    _ = use_cache
+    return {
+        "status": "ok",
+        "cached": True,
+        "backend": "lab-mcp",
+        "count": len(_LOCAL_TOOL_CATALOG),
+        "tools": list(_LOCAL_TOOL_CATALOG),
+        "note": (
+            "Lab MCP has no remote tool catalog. Use blender_execute with bpy code "
+            "that assigns a dict to `result`."
+        ),
+    }
 
 
-def call_tool(
-    name: str,
-    arguments: dict[str, Any] | None = None,
+def execute(
+    code: str,
+    *,
+    strict_json: bool = True,
     settings: Settings | None = None,
 ) -> dict[str, Any]:
-    """Invoke a Blender MCP tool by name with optional JSON arguments."""
+    """Execute Python inside Blender via Lab MCP and return a structured payload."""
     settings = settings or _load_settings()
-    return _run_async(_async_call_tool(name, arguments, settings))
+    if not settings.blender_enabled:
+        return {
+            "success": False,
+            "error": "Blender integration is disabled (blender.enabled=false)",
+        }
+
+    code = (code or "").strip()
+    if not code:
+        return {"success": False, "error": "code must be a non-empty string"}
+
+    try:
+        response = lab_execute(
+            code,
+            host=settings.blender_host,
+            port=settings.blender_port,
+            timeout_s=settings.blender_connect_timeout_s,
+            strict_json=strict_json,
+        )
+    except LabMCPError as exc:
+        logger.warning("blender execute failed: %s", exc)
+        return {"success": False, "error": str(exc)}
+
+    status = response.get("status")
+    success = status == "ok"
+    text_parts: list[str] = []
+    if response.get("stdout"):
+        text_parts.append(str(response["stdout"]))
+    if response.get("stderr"):
+        text_parts.append(str(response["stderr"]))
+    if not success and response.get("message"):
+        text_parts.append(str(response["message"]))
+    result = response.get("result")
+    if result is not None:
+        text_parts.append(str(result))
+
+    payload: dict[str, Any] = {
+        "success": success,
+        "status": status,
+        "text": "\n".join(text_parts).strip(),
+        "result": result,
+        "response": response,
+    }
+    if not success:
+        payload["error"] = response.get("message") or "Lab MCP execute returned an error"
+    return payload
 
 
 def format_status_report(settings: Settings | None = None) -> str:
     """Human-readable status for ``/blender status`` slash commands."""
     settings = settings or _load_settings()
     health = health_check(settings)
+    endpoint = health.get("endpoint", resolve_blender_endpoint(settings))
     lines = [
         "Blender MCP Status:",
         f"  Enabled: {health.get('enabled', settings.blender_enabled)}",
-        f"  URL: {health.get('url', resolve_blender_mcp_url(settings))}",
+        f"  Backend: lab-mcp (TCP)",
+        f"  Endpoint: {endpoint}",
         f"  Connected: {health.get('connected', False)}",
     ]
-    if health.get("tool_count") is not None:
-        lines.append(f"  Tool count: {health['tool_count']}")
+    if health.get("blender_version"):
+        lines.append(f"  Blender version: {health['blender_version']}")
     if health.get("sample_tools"):
-        lines.append("  Sample tools:")
+        lines.append("  Hub tools:")
         for name in health["sample_tools"]:
             lines.append(f"    - {name}")
     if health.get("error"):
@@ -318,11 +245,13 @@ def format_status_report(settings: Settings | None = None) -> str:
 
     if not settings.blender_enabled:
         lines.append(
-            "  Hint: set blender.enabled: true in config.yaml to enable integration."
+            "  Hint: blender.enabled is false in config — set true to enable integration."
         )
     elif not health.get("connected"):
         lines.append(
-            "  Hint: start the Blender MCP add-on/server, then retry /blender status."
+            "  Hint: start Blender 5.1+ with the Lab MCP add-on "
+            f"(default {settings.blender_host}:{settings.blender_port}), "
+            "then retry /blender status."
         )
 
     return "\n".join(lines)

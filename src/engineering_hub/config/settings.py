@@ -1,5 +1,6 @@
 """Application settings using pydantic-settings."""
 
+import logging
 from pathlib import Path
 from typing import Any
 
@@ -14,6 +15,8 @@ DEFAULT_JOURNAL_CATEGORIES: dict[str, str] = {
     "Technical Review Work": "technical-reviewer",
     "Thoughts to Expand or Clarify": "research",
 }
+
+logger = logging.getLogger(__name__)
 
 
 class Settings(BaseSettings):
@@ -108,40 +111,22 @@ class Settings(BaseSettings):
         ),
     )
 
-    # Blender MCP (HTTP addon inside a running Blender session)
+    # Blender Lab MCP (TCP bridge inside a running Blender 5.1+ session)
     blender_enabled: bool = Field(
-        default=False,
-        description="Enable Blender MCP client integration for agents and MCP proxy",
+        default=True,
+        description="Enable Blender Lab MCP client for agents and MCP tools",
     )
-    blender_mcp_url: str = Field(
-        default="http://127.0.0.1:8765/mcp",
-        description="HTTP MCP endpoint exposed by the Blender addon",
+    blender_host: str = Field(
+        default="127.0.0.1",
+        description="Host for the Blender Lab MCP TCP bridge",
     )
-    blender_auth_token: str | None = Field(
-        default=None,
-        description=(
-            "Optional bearer token for Blender MCP auth. "
-            "Prefer ENGINEERING_HUB_BLENDER_AUTH_TOKEN env var."
-        ),
+    blender_port: int = Field(
+        default=9876,
+        description="Port for the Blender Lab MCP TCP bridge (Lab default 9876)",
     )
     blender_connect_timeout_s: float = Field(
         default=10.0,
-        description="Timeout in seconds for Blender MCP client connections",
-    )
-    blender_tools_cache_ttl_s: float = Field(
-        default=60.0,
-        description="Seconds to cache remote Blender tool listings",
-    )
-    blender_tool_allowlist: list[str] | None = Field(
-        default=None,
-        description=(
-            "When set, only these remote tool names may be invoked. "
-            "None means all tools except denylist entries."
-        ),
-    )
-    blender_tool_denylist: list[str] | None = Field(
-        default_factory=lambda: ["run_python_script"],
-        description="Remote Blender tool names blocked from agent invocation",
+        description="Timeout in seconds for Lab MCP TCP connections",
     )
 
     # Horn Iterator (parametric exponential-horn sweep, LVT alert system)
@@ -235,6 +220,38 @@ class Settings(BaseSettings):
     mlx_max_tokens: int = Field(
         default=4096,
         description="Default max tokens for MLX generation",
+    )
+
+    # mlx_lm.server (OpenAI-compatible HTTP) — Journaler chat + tool-use agents
+    mlx_server_enabled: bool = Field(
+        default=True,
+        description=(
+            "When True, Journaler uses mlx_lm.server over HTTP instead of "
+            "in-process mlx_lm.load (enables OpenAI-style tool calling). "
+            "Default True; set false to force in-process mlx_lm.load."
+        ),
+    )
+    mlx_server_base_url: str = Field(
+        default="http://127.0.0.1:8081/v1",
+        description=(
+            "OpenAI-compatible base URL for mlx_lm.server "
+            "(default port 8081 to avoid SearXNG on 8080)"
+        ),
+    )
+    mlx_server_api_key: str = Field(
+        default="not-needed",
+        description="API key placeholder for OpenAI SDK clients (mlx_lm.server ignores auth)",
+    )
+    mlx_server_timeout_s: float = Field(
+        default=600.0,
+        description="HTTP timeout in seconds for mlx_lm.server chat/completions",
+    )
+    mlx_server_offer_start: bool = Field(
+        default=True,
+        description=(
+            "When True and stdin is a TTY, interactive Journaler (chat/tui/start) "
+            "prompts y/N to launch mlx_lm.server if it is not reachable"
+        ),
     )
 
     # Ollama settings (local embeddings + optional chat generation)
@@ -399,7 +416,10 @@ class Settings(BaseSettings):
     )
     journaler_briefing_append_to_journal: bool = Field(
         default=True,
-        description="Upsert morning and discussion briefings into today's org journal",
+        description=(
+            "Upsert morning/discussion briefings, topic hints, and daily summary "
+            "into today's org journal"
+        ),
     )
     journaler_end_of_day_time: str = Field(
         default="15:30",
@@ -1085,22 +1105,29 @@ class Settings(BaseSettings):
             blender = config["blender"]
             if blender.get("enabled") is not None:
                 flat_config["blender_enabled"] = bool(blender["enabled"])
-            if blender.get("mcp_url"):
-                flat_config["blender_mcp_url"] = str(blender["mcp_url"])
-            if blender.get("auth_token"):
-                flat_config["blender_auth_token"] = str(blender["auth_token"])
+            if blender.get("host"):
+                flat_config["blender_host"] = str(blender["host"])
+            if blender.get("port") is not None:
+                flat_config["blender_port"] = int(blender["port"])
             if blender.get("connect_timeout_s") is not None:
                 flat_config["blender_connect_timeout_s"] = float(
                     blender["connect_timeout_s"]
                 )
-            if blender.get("tools_cache_ttl_s") is not None:
-                flat_config["blender_tools_cache_ttl_s"] = float(
-                    blender["tools_cache_ttl_s"]
+            # Legacy dcc-mcp HTTP keys — ignored in Lab MCP mode.
+            legacy_keys = (
+                "mcp_url",
+                "auth_token",
+                "tools_cache_ttl_s",
+                "tool_allowlist",
+                "tool_denylist",
+            )
+            present_legacy = [k for k in legacy_keys if blender.get(k) is not None]
+            if present_legacy:
+                logger.warning(
+                    "blender.%s ignored: Hub uses Blender Lab MCP (host/port TCP), "
+                    "not dcc-mcp HTTP",
+                    ", ".join(present_legacy),
                 )
-            if blender.get("tool_allowlist") is not None:
-                flat_config["blender_tool_allowlist"] = list(blender["tool_allowlist"])
-            if blender.get("tool_denylist") is not None:
-                flat_config["blender_tool_denylist"] = list(blender["tool_denylist"])
 
         if "horn_iterator" in config:
             horn = config["horn_iterator"]
@@ -1203,6 +1230,19 @@ class Settings(BaseSettings):
                 flat_config["mlx_repetition_penalty"] = mlx["repetition_penalty"]
             if mlx.get("max_tokens") is not None:
                 flat_config["mlx_max_tokens"] = mlx["max_tokens"]
+
+        if "mlx_server" in config:
+            mlx_server = config["mlx_server"]
+            if mlx_server.get("enabled") is not None:
+                flat_config["mlx_server_enabled"] = bool(mlx_server["enabled"])
+            if mlx_server.get("base_url"):
+                flat_config["mlx_server_base_url"] = str(mlx_server["base_url"])
+            if mlx_server.get("api_key") is not None:
+                flat_config["mlx_server_api_key"] = str(mlx_server["api_key"])
+            if mlx_server.get("timeout_s") is not None:
+                flat_config["mlx_server_timeout_s"] = float(mlx_server["timeout_s"])
+            if mlx_server.get("offer_start") is not None:
+                flat_config["mlx_server_offer_start"] = bool(mlx_server["offer_start"])
 
         if "memory" in config:
             mem = config["memory"]

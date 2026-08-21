@@ -45,6 +45,7 @@ from engineering_hub.journaler.model_profiles import (
     model_status_data,
     parse_model_slash_message,
     resolve_journaler_model_spec,
+    spec_from_journaler_config,
 )
 from engineering_hub.horn_iterator import service as horn_service
 from engineering_hub.journaler.timesheet_slash import handle_timesheet_slash_command
@@ -257,7 +258,7 @@ def _execute_journaler_export(
 
     if summarize:
         log.print("[bold]Loading model for summarized export...[/bold]")
-        backend = build_journaler_mlx_backend(spec)
+        backend = build_journaler_mlx_backend(spec, settings=settings)
         engine = ConversationEngine(
             backend=backend,
             system_prompt="You format chat transcripts into Emacs org mode.",
@@ -904,7 +905,12 @@ def _handle_output_command(
 def _interactive_output_choice(
     chat_console: Console,
 ) -> "Callable[[GenerationOutcome], Action | None]":
-    """Build a choice provider that prompts the user when output is truncated."""
+    """Build a choice provider that prompts the user when output is truncated.
+
+    Menu labels are escaped before printing: Rich markup treats lowercase tags
+    such as ``[s]`` / ``[c]`` / ``[f]`` as styles and would otherwise strip the
+    choice keys from the displayed menu.
+    """
 
     def _provider(outcome: "GenerationOutcome") -> "Action | None":
         phase_note = (
@@ -912,34 +918,52 @@ def _interactive_output_choice(
             if outcome.phase == "thinking"
             else ""
         )
-        chat_console.print(
-            f"\n[yellow]Output may be incomplete[/yellow] "
-            f"(reason: {outcome.reason}{phase_note}).\n"
+        # Numbered keys avoid Rich style-tag collisions; escape the body so any
+        # future bracketed labels still render literally.
+        menu = (
             "\n"
-            "  [s] Summarize history and retry\n"
+            "  [1] Summarize history and retry\n"
             "      Compress older exchanges to free context, then ask the model again.\n"
             "      The cut-off reply stays in context but is not summarized.\n"
             "\n"
-            "  [S] Summarize history + partial answer, then retry\n"
-            "      Same as [s], and also summarizes the incomplete reply into a brief.\n"
+            "  [2] Summarize history + partial answer, then retry\n"
+            "      Same as [1], and also summarizes the incomplete reply into a brief.\n"
             "      Use when both chat history and the partial answer are using space.\n"
             "\n"
-            "  [c] Continue (same turn)\n"
+            "  [3] Continue (same turn)\n"
             "      Resume where generation stopped and append more text to this reply.\n"
             "      May run several hidden passes; output is stitched into one message.\n"
             "\n"
-            "  [f] Continue (new follow-up turn)\n"
+            "  [4] Continue (new follow-up turn)\n"
             "      Continue via an explicit follow-up request after the partial reply.\n"
             "      Use when you want a separate continuation pass instead of a seamless seam.\n"
             "\n"
             "  [Enter] Stop and keep partial\n"
             "      Accept the incomplete answer as-is; no further generation."
         )
+        chat_console.print(
+            f"\n[yellow]Output may be incomplete[/yellow] "
+            f"(reason: {escape(str(outcome.reason))}{escape(phase_note)})."
+            f"{escape(menu)}\n"
+            "\n"
+            "[dim]Type 1–4 from the list above "
+            "(1=summarize history, 2=summarize both, "
+            "3=continue same turn, 4=continue as follow-up), "
+            "or press Enter to keep the partial answer.[/dim]"
+        )
         try:
-            choice = input("Choice [s/S/c/f, or Enter to stop]: ").strip()
+            choice = input(
+                "Your choice [1=summarize history / 2=summarize both / "
+                "3=continue same / 4=continue follow-up / Enter=stop]: "
+            ).strip()
         except (KeyboardInterrupt, EOFError):
             return "stop"
         mapping: dict[str, Action] = {
+            "1": "summarize_history",
+            "2": "summarize_both",
+            "3": "continue_same",
+            "4": "continue_followup",
+            # Legacy letter shortcuts (still accepted if typed).
             "s": "summarize_history",
             "S": "summarize_both",
             "c": "continue_same",
@@ -2464,6 +2488,11 @@ def cmd_journaler(args: argparse.Namespace) -> int:
         load_slack_tokens=settings.journaler_load_slack_tokens,
         agent_backend=settings.journaler_agent_backend,
         skills_dir=settings.journaler_skills_dir,
+        mlx_server_enabled=settings.mlx_server_enabled,
+        mlx_server_base_url=settings.mlx_server_base_url,
+        mlx_server_api_key=settings.mlx_server_api_key,
+        mlx_server_timeout_s=settings.mlx_server_timeout_s,
+        mlx_server_offer_start=settings.mlx_server_offer_start,
         watch_dirs=list(settings.journaler_watch_dirs)
         if settings.journaler_watch_dirs
         else None,
@@ -2556,7 +2585,15 @@ def cmd_journaler(args: argparse.Namespace) -> int:
 
         chat_model_ctx = JournalerChatModelContext(settings, spec)
         console.print("[bold]Loading Journaler model for interactive chat...[/bold]")
-        backend = build_journaler_mlx_backend(chat_model_ctx.spec)
+        from engineering_hub.agents.mlx_server import offer_start_mlx_server_if_needed
+
+        offer_start_mlx_server_if_needed(
+            settings,
+            chat_model_ctx.spec.model_path,
+            console=console,
+            state_dir=config.state_dir,
+        )
+        backend = build_journaler_mlx_backend(chat_model_ctx.spec, settings=settings)
         ctx = JournalContext(
             org_roam_dir=config.org_roam_dir,
             journal_dir=config.journal_dir,
@@ -2844,7 +2881,15 @@ def cmd_journaler(args: argparse.Namespace) -> int:
         )
 
         console.print("[bold]Loading Journaler for TUI mode...[/bold]")
-        backend = build_journaler_mlx_backend(spec)
+        from engineering_hub.agents.mlx_server import offer_start_mlx_server_if_needed
+
+        offer_start_mlx_server_if_needed(
+            settings,
+            spec.model_path,
+            console=console,
+            state_dir=config.state_dir,
+        )
+        backend = build_journaler_mlx_backend(spec, settings=settings)
         ctx = JournalContext(
             org_roam_dir=config.org_roam_dir,
             journal_dir=config.journal_dir,
@@ -2965,10 +3010,6 @@ def cmd_journaler(args: argparse.Namespace) -> int:
             try:
                 # Build minimal context + engine via generate_briefing_now's bootstrap path
                 from engineering_hub.journaler.context import JournalContext
-                from engineering_hub.journaler.engine import (
-                    ConversationalMLXBackend,
-                    ConversationEngine,
-                )
 
                 ptf = config.pending_tasks_file
                 if ptf is None:
@@ -2988,14 +3029,9 @@ def cmd_journaler(args: argparse.Namespace) -> int:
                     conversation_summary_excerpt_chars=config.conversation_summary_excerpt_chars,
                 )
                 ctx.scan()
-                backend = ConversationalMLXBackend(
-                    model_path=config.model_path,
-                    temp=config.temp,
-                    top_p=config.top_p,
-                    min_p=config.min_p,
-                    repetition_penalty=config.repetition_penalty,
-                    backend=config.mlx_backend,
-                    enable_thinking=config.enable_thinking,
+                backend = build_journaler_mlx_backend(
+                    spec_from_journaler_config(config),
+                    settings=config,
                 )
                 from engineering_hub.journaler.delegator import build_delegator
 
@@ -3120,7 +3156,7 @@ def cmd_journaler(args: argparse.Namespace) -> int:
 
         if strategy == ClearStrategy.SUMMARIZE:
             console.print("[bold]Loading model to compress history before clearing...[/bold]")
-            backend = build_journaler_mlx_backend(spec)
+            backend = build_journaler_mlx_backend(spec, settings=settings)
         else:
             backend = None  # type: ignore[assignment]
 
@@ -3252,7 +3288,7 @@ def cmd_journaler(args: argparse.Namespace) -> int:
 
         try:
 
-            mlx_backend = build_journaler_mlx_backend(spec)
+            mlx_backend = build_journaler_mlx_backend(spec, settings=settings)
             delegator = build_delegator(
                 mlx_backend,
                 anthropic_api_key=api_key,

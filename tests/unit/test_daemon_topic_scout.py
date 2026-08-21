@@ -6,15 +6,21 @@ from unittest.mock import MagicMock, patch
 
 from engineering_hub.journaler.context import JournalContext
 from engineering_hub.journaler.daemon import (
+    TOPIC_HINTS_JOURNAL_HEADING,
     JournalerConfig,
     _coordination_scan,
     _tick,
     _topic_scout_tick,
 )
 from engineering_hub.journaler.models import ContextSnapshot
+from engineering_hub.journaler.org_writer import read_section_body
 
 
-def _minimal_config(tmp_path: Path) -> JournalerConfig:
+def _minimal_config(
+    tmp_path: Path,
+    *,
+    append_to_journal: bool = True,
+) -> JournalerConfig:
     journal_dir = tmp_path / "journals"
     journal_dir.mkdir()
     workspace = tmp_path / "workspace"
@@ -29,6 +35,7 @@ def _minimal_config(tmp_path: Path) -> JournalerConfig:
         state_dir=state,
         proactive_topic_scout_enabled=True,
         proactive_topic_scout_max_tokens=256,
+        briefing_append_to_journal=append_to_journal,
     )
 
 
@@ -78,6 +85,68 @@ def test_topic_scout_writes_hint_file(tmp_path: Path) -> None:
     hint_path = config.state_dir / "topic_hints" / f"{date.today().isoformat()}.md"
     assert hint_path.is_file()
     assert "Conversation starters" in hint_path.read_text(encoding="utf-8")
+
+    today_path = config.journal_dir / f"{date.today().isoformat()}.org"
+    body = read_section_body(today_path, TOPIC_HINTS_JOURNAL_HEADING)
+    assert "Follow up on client call" in body
+    assert "Conversation starters" in body
+    assert "_Generated " in body
+    assert "journal 2026-06-05.org: +1 entry (Client call)" in body
+
+
+def test_topic_scout_skips_journal_when_flag_disabled(tmp_path: Path) -> None:
+    config = _minimal_config(tmp_path, append_to_journal=False)
+    context = JournalContext(
+        org_roam_dir=config.org_roam_dir,
+        journal_dir=config.journal_dir,
+        workspace_dir=config.workspace_dir,
+        memory_service=None,
+        state_dir=config.state_dir,
+    )
+    engine = MagicMock()
+    engine._raw_complete.return_value = "### Conversation starters\n- Hint one\n"
+    snapshot = ContextSnapshot(
+        has_significant_changes=True,
+        change_summary="journal today.org: +1 entry (Note)",
+    )
+
+    result = _topic_scout_tick(config, context, engine, snapshot)
+
+    assert result is not None
+    hint_path = config.state_dir / "topic_hints" / f"{date.today().isoformat()}.md"
+    assert hint_path.is_file()
+    today_path = config.journal_dir / f"{date.today().isoformat()}.org"
+    assert not today_path.exists()
+
+
+def test_topic_scout_appends_to_existing_journal_section(tmp_path: Path) -> None:
+    config = _minimal_config(tmp_path)
+    context = JournalContext(
+        org_roam_dir=config.org_roam_dir,
+        journal_dir=config.journal_dir,
+        workspace_dir=config.workspace_dir,
+        memory_service=None,
+        state_dir=config.state_dir,
+    )
+    engine = MagicMock()
+    snapshot = ContextSnapshot(
+        has_significant_changes=True,
+        change_summary="journal today.org: +1 entry (Note)",
+    )
+
+    engine._raw_complete.return_value = "### Conversation starters\n- First hint\n"
+    _topic_scout_tick(config, context, engine, snapshot)
+    engine._raw_complete.return_value = "### Conversation starters\n- Second hint\n"
+    _topic_scout_tick(config, context, engine, snapshot)
+
+    today_path = config.journal_dir / f"{date.today().isoformat()}.org"
+    raw = today_path.read_text(encoding="utf-8")
+    assert raw.count(f"* {TOPIC_HINTS_JOURNAL_HEADING}") == 1
+    body = read_section_body(today_path, TOPIC_HINTS_JOURNAL_HEADING)
+    assert "First hint" in body
+    assert "Second hint" in body
+    assert body.index("First hint") < body.index("Second hint")
+    assert body.count("_Generated ") == 2
 
 
 def test_tick_skips_scout_when_not_significant(tmp_path: Path) -> None:

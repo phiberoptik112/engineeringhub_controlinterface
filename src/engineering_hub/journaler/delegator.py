@@ -48,7 +48,6 @@ from engineering_hub.journaler.thinking import strip_think_blocks
 
 if TYPE_CHECKING:
     from engineering_hub.code.pi_executor import PiExecutor
-    from engineering_hub.journaler.engine import ConversationalMLXBackend
 
 logger = logging.getLogger(__name__)
 
@@ -69,7 +68,7 @@ def _anthropic_key_str(anthropic_api_key: SecretStr | str) -> str:
 
 
 def build_delegator(
-    mlx_backend: ConversationalMLXBackend,
+    mlx_backend: Any,
     *,
     anthropic_api_key: SecretStr | str = "",
     skills_dir: Path | None = None,
@@ -215,18 +214,17 @@ _AGENT_ALIASES: dict[str, str] = {
 
 
 class JournalerMLXBackendAdapter:
-    """Adapts ConversationalMLXBackend to the LLMBackend protocol.
+    """Adapts ConversationalMLXBackend / OpenAIMLXServerBackend to LLMBackend.
 
-    The Journaler keeps a 32B model loaded in memory for conversational use.
-    This adapter lets the same resident model serve single-turn agent tasks
-    without loading a second copy.
+    The Journaler keeps a model available for conversational use (in-process or
+    via mlx_lm.server). This adapter lets the same backend serve agent tasks.
     """
 
-    def __init__(self, journaler_backend: ConversationalMLXBackend) -> None:
+    def __init__(self, journaler_backend: Any) -> None:
         self._backend = journaler_backend
 
-    def set_backend(self, journaler_backend: ConversationalMLXBackend) -> None:
-        """Point at a new resident MLX backend (e.g. after Journaler ``/model``)."""
+    def set_backend(self, journaler_backend: Any) -> None:
+        """Point at a new Journaler backend (e.g. after ``/model``)."""
         self._backend = journaler_backend
 
     def complete(self, system: str, user_message: str, max_tokens: int) -> str:
@@ -245,11 +243,24 @@ class JournalerMLXBackendAdapter:
         messages: list[dict],
         tools: list[dict],
         max_tokens: int,
-    ) -> None:
-        raise NotImplementedError(
-            "MLX backend does not support tool calling; "
-            "use Claude API for tool-use agents."
+    ) -> Any:
+        complete_with_tools = getattr(self._backend, "complete_with_tools", None)
+        if complete_with_tools is None:
+            raise NotImplementedError(
+                "MLX backend does not support tool calling; "
+                "enable mlx_server.enabled and run mlx_lm.server, "
+                "or use --backend claude for tool-use agents."
+            )
+        return complete_with_tools(
+            system=system,
+            messages=messages,
+            tools=tools,
+            max_tokens=max_tokens,
         )
+
+    @property
+    def tool_protocol(self) -> str:
+        return str(getattr(self._backend, "tool_protocol", "anthropic"))
 
     def test_connection(self) -> bool:
         return self._backend.is_loaded()
@@ -322,7 +333,7 @@ class AgentDelegator:
 
     def __init__(
         self,
-        mlx_backend: ConversationalMLXBackend,
+        mlx_backend: Any,
         anthropic_worker: AgentWorker | None = None,
         skills_dir: Path | None = None,
         default_backend: str = "mlx",
@@ -356,7 +367,7 @@ class AgentDelegator:
         resolved_skills = skills_dir or _default_skills_dir()
         self._skills = _load_skills(resolved_skills)
 
-    def set_mlx_backend(self, backend: ConversationalMLXBackend) -> None:
+    def set_mlx_backend(self, backend: Any) -> None:
         """Sync the MLX delegator adapter with a newly loaded Journaler backend."""
         self._mlx_adapter.set_backend(backend)
 
@@ -413,16 +424,22 @@ class AgentDelegator:
                 "Configure 'anthropic.api_key' for Claude or ensure the MLX model is loaded."
             )
 
-        # Auto-promote TOOL_USE agents from MLX to Claude when available, since
-        # MLX does not support structured tool calling.
+        # Auto-promote TOOL_USE agents from MLX to Claude only when the MLX
+        # path cannot call tools (in-process MLX). mlx_lm.server backends keep mlx.
         try:
             agent_model_class = self._registry.get_model_class(AgentType(resolved_type))
         except ValueError:
             agent_model_class = ModelClass.REASONING
 
+        mlx_has_tools = hasattr(self._mlx_adapter, "complete_with_tools") and (
+            getattr(self._mlx_adapter._backend, "complete_with_tools", None) is not None
+            or getattr(self._mlx_adapter._backend, "tool_protocol", None) == "openai"
+        )
+
         if (
             worker is self._mlx_worker
             and agent_model_class == ModelClass.TOOL_USE
+            and not mlx_has_tools
             and self._default_backend != "mlx"
         ):
             if self._anthropic_worker:
@@ -434,15 +451,22 @@ class AgentDelegator:
             else:
                 logger.warning(
                     "Agent '%s' requires tool calling but MLX does not support it. "
-                    "Results may be incomplete. Configure anthropic.api_key for full capability.",
+                    "Enable mlx_server.enabled + mlx_lm.server, or configure anthropic.api_key.",
                     resolved_type,
                 )
         elif worker is self._mlx_worker and agent_model_class == ModelClass.TOOL_USE:
-            logger.info(
-                "TOOL_USE agent '%s' running on MLX (agent_backend=mlx); "
-                "tool calls will fall back to single-shot if unsupported.",
-                resolved_type,
-            )
+            if mlx_has_tools:
+                logger.info(
+                    "TOOL_USE agent '%s' running on mlx_lm.server tool path",
+                    resolved_type,
+                )
+            else:
+                logger.warning(
+                    "TOOL_USE agent '%s' on in-process MLX without tool calling; "
+                    "enable mlx_server.enabled + mlx_lm.server, or use --backend claude. "
+                    "Delegation will fail rather than invent scene state.",
+                    resolved_type,
+                )
 
         task = ParsedTask(
             agent=resolved_type,

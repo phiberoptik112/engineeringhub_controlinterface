@@ -98,8 +98,6 @@ def _agent_command(agent: str, description: str, project_id: Any) -> str:
     cmd = f"/agent {agent} {description}"
     if project_id is not None:
         cmd += f" --project {project_id}"
-    if agent == "blender":
-        cmd += " --backend claude"
     return cmd
 
 

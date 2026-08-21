@@ -1,140 +1,112 @@
-"""Unit tests for Blender MCP service (mocked — no Blender required)."""
+"""Unit tests for Blender Lab MCP service (mocked — no Blender required)."""
 
 from __future__ import annotations
 
-from unittest.mock import AsyncMock, MagicMock, patch
-
-import pytest
+from unittest.mock import patch
 
 from engineering_hub.blender import service as blender_service
+from engineering_hub.blender.lab_client import LabMCPError
 from engineering_hub.config.settings import Settings
-
-
-@pytest.fixture(autouse=True)
-def _clear_tool_cache() -> None:
-    blender_service._tool_cache = None
 
 
 def _settings(**overrides: object) -> Settings:
     base = {
         "blender_enabled": True,
-        "blender_mcp_url": "http://127.0.0.1:8765/mcp",
-        "blender_tool_denylist": ["run_python_script"],
+        "blender_host": "127.0.0.1",
+        "blender_port": 9876,
     }
     base.update(overrides)
     return Settings(**base)
 
 
-def test_resolve_blender_mcp_url_from_settings() -> None:
-    settings = _settings(blender_mcp_url="http://localhost:8400/mcp")
-    assert blender_service.resolve_blender_mcp_url(settings) == "http://localhost:8400/mcp"
+def test_resolve_blender_endpoint_from_settings() -> None:
+    settings = _settings(blender_host="localhost", blender_port=9999)
+    assert blender_service.resolve_blender_endpoint(settings) == "localhost:9999"
 
 
-def test_filter_tool_names_respects_denylist() -> None:
-    settings = _settings()
-    names = blender_service.filter_tool_names(
-        ["get_scene_info", "run_python_script", "list_objects"],
-        settings,
-    )
-    assert names == ["get_scene_info", "list_objects"]
-
-
-def test_filter_tool_names_respects_allowlist() -> None:
-    settings = _settings(blender_tool_allowlist=["get_scene_info"])
-    names = blender_service.filter_tool_names(
-        ["get_scene_info", "list_objects"],
-        settings,
-    )
-    assert names == ["get_scene_info"]
-
-
-@patch("engineering_hub.blender.service._build_client")
-def test_health_check_connected(mock_build_client: MagicMock) -> None:
-    tool_a = MagicMock()
-    tool_a.name = "get_scene_info"
-    tool_b = MagicMock()
-    tool_b.name = "run_python_script"
-    client = AsyncMock()
-    client.list_tools.return_value = [tool_a, tool_b]
-    client.__aenter__.return_value = client
-    client.__aexit__.return_value = None
-    mock_build_client.return_value = client
+@patch("engineering_hub.blender.service.lab_execute")
+def test_health_check_connected(mock_lab_execute: object) -> None:
+    mock_lab_execute.return_value = {
+        "status": "ok",
+        "result": {"ok": True, "version": "5.1.0"},
+    }
 
     result = blender_service.health_check(settings=_settings())
     assert result["connected"] is True
-    assert result["tool_count"] == 2
-    assert result["filtered_tool_count"] == 1
-    assert "get_scene_info" in result["sample_tools"]
+    assert result["endpoint"] == "127.0.0.1:9876"
+    assert result["blender_version"] == "5.1.0"
+    assert "blender_execute" in result["sample_tools"]
+    mock_lab_execute.assert_called_once()
 
 
-@patch("engineering_hub.blender.service._build_client")
-def test_health_check_offline(mock_build_client: MagicMock) -> None:
-    client = AsyncMock()
-    client.list_tools.side_effect = ConnectionError("refused")
-    client.__aenter__.return_value = client
-    client.__aexit__.return_value = None
-    mock_build_client.return_value = client
+@patch("engineering_hub.blender.service.lab_execute")
+def test_health_check_offline(mock_lab_execute: object) -> None:
+    mock_lab_execute.side_effect = LabMCPError(
+        "Lab MCP connection failed (127.0.0.1:9876): refused"
+    )
 
     result = blender_service.health_check(settings=_settings())
     assert result["connected"] is False
     assert "refused" in result["error"]
 
 
-@patch("engineering_hub.blender.service._build_client")
-def test_list_tools_filters_and_caches(mock_build_client: MagicMock) -> None:
-    tool = MagicMock()
-    tool.name = "list_objects"
-    tool.description = "List scene objects"
-    tool.inputSchema = {"type": "object", "properties": {}}
-    client = AsyncMock()
-    client.list_tools.return_value = [tool]
-    client.__aenter__.return_value = client
-    client.__aexit__.return_value = None
-    mock_build_client.return_value = client
-
-    settings = _settings()
-    first = blender_service.list_tools(settings=settings)
-    second = blender_service.list_tools(settings=settings)
-
-    assert first["cached"] is False
-    assert second["cached"] is True
-    assert first["tools"][0]["name"] == "list_objects"
-    assert client.list_tools.await_count == 1
+def test_list_tools_returns_local_catalog() -> None:
+    payload = blender_service.list_tools(settings=_settings())
+    assert payload["status"] == "ok"
+    assert payload["backend"] == "lab-mcp"
+    names = [t["name"] for t in payload["tools"]]
+    assert names == ["blender_health", "blender_list_tools", "blender_execute"]
 
 
-@patch("engineering_hub.blender.service._build_client")
-def test_call_tool_success(mock_build_client: MagicMock) -> None:
-    result_obj = MagicMock()
-    result_obj.model_dump.return_value = {
-        "isError": False,
-        "content": [{"type": "text", "text": "Scene has 3 objects"}],
+@patch("engineering_hub.blender.service.lab_execute")
+def test_execute_success(mock_lab_execute: object) -> None:
+    mock_lab_execute.return_value = {
+        "status": "ok",
+        "result": {"objects": ["Cube", "Camera"]},
     }
-    client = AsyncMock()
-    client.call_tool.return_value = result_obj
-    client.__aenter__.return_value = client
-    client.__aexit__.return_value = None
-    mock_build_client.return_value = client
 
-    payload = blender_service.call_tool(
-        "get_scene_info",
-        {"detail": True},
+    payload = blender_service.execute(
+        "import bpy\nresult = {'objects': [o.name for o in bpy.data.objects]}",
         settings=_settings(),
     )
     assert payload["success"] is True
-    assert "3 objects" in payload["text"]
+    assert payload["result"]["objects"] == ["Cube", "Camera"]
+    mock_lab_execute.assert_called_once()
+    call_kwargs = mock_lab_execute.call_args
+    assert call_kwargs.kwargs["strict_json"] is True
+    assert call_kwargs.kwargs["port"] == 9876
 
 
-def test_call_tool_blocked_by_denylist() -> None:
-    payload = blender_service.call_tool(
-        "run_python_script",
-        {"code": "print(1)"},
-        settings=_settings(),
-    )
+@patch("engineering_hub.blender.service.lab_execute")
+def test_execute_lab_error_status(mock_lab_execute: object) -> None:
+    mock_lab_execute.return_value = {
+        "status": "error",
+        "message": "Traceback: NameError",
+    }
+
+    payload = blender_service.execute("bad()", settings=_settings())
     assert payload["success"] is False
-    assert "blocked" in payload["error"]
+    assert "NameError" in payload["error"]
+
+
+def test_execute_empty_code() -> None:
+    payload = blender_service.execute("  ", settings=_settings())
+    assert payload["success"] is False
+    assert "non-empty" in payload["error"]
 
 
 def test_health_check_disabled() -> None:
     result = blender_service.health_check(settings=_settings(blender_enabled=False))
     assert result["enabled"] is False
     assert result["connected"] is False
+
+
+def test_format_status_offline_hint() -> None:
+    with patch(
+        "engineering_hub.blender.service.lab_execute",
+        side_effect=LabMCPError("connection refused"),
+    ):
+        report = blender_service.format_status_report(settings=_settings())
+    assert "lab-mcp" in report
+    assert "9876" in report
+    assert "Lab MCP" in report

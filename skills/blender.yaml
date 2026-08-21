@@ -1,5 +1,5 @@
 name: blender
-display_name: Blender MCP
+display_name: Blender Lab MCP
 agent_type: blender
 
 domain: acoustic-engineering
@@ -15,25 +15,27 @@ domain_triggers:
   - bpy
 
 description: |
-  Controls a running Blender session through MCP: inspect scene hierarchy,
-  apply acoustic visualization conventions (SPL colormaps, receiver markers),
-  and invoke remote Blender tools safely with inspect-before-mutate discipline.
+  Controls a running Blender 5.1+ session through the Lab MCP TCP bridge:
+  inspect scene hierarchy with bpy execute, apply acoustic visualization
+  conventions (SPL colormaps, receiver markers), and mutate safely with
+  inspect-before-mutate discipline.
 
 when_to_use:
   - User asks to inspect or summarize the current Blender scene
   - User wants SPL or acoustic simulation results visualized in 3D
-  - User asks to list objects, materials, or collections via Blender MCP
+  - User asks to list objects, materials, or collections via Lab MCP
   - User needs receiver/source markers placed in a room model
 
 invocation_examples:
-  - "/agent blender --backend claude summarize the current scene and list acoustic receiver empties"
-  - "/agent 3d --backend claude apply a viridis SPL colormap to the wall mesh collection"
-  - "/agent blender --backend claude check MCP connectivity and list available tools"
+  - "/agent blender --backend mlx summarize the current scene and list acoustic receiver empties"
+  - "/agent 3d --backend mlx apply a viridis SPL colormap to the wall mesh collection"
+  - "/agent blender --backend mlx check Lab MCP connectivity then list mesh objects"
+  - "/agent blender --backend mlx report orientation and AABB volume of TestSolid"
   - "/agent blender-mcp inspect materials on the room shell before any edits"
 
 parameters:
   description:
-    description: The Blender/MCP task — inspection, visualization, or safe scene edit
+    description: The Blender/Lab MCP task — inspection, visualization, or safe scene edit
     required: true
 
 output:

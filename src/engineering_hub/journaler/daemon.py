@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import logging
 import signal
+import sys
 import time
 from dataclasses import dataclass
 from datetime import date, datetime
@@ -27,7 +28,6 @@ from engineering_hub.journaler.briefing_tasks import (
 from engineering_hub.journaler.context import JournalContext
 from engineering_hub.journaler.context_manager import PressureConfig
 from engineering_hub.journaler.engine import (
-    ConversationalMLXBackend,
     ConversationEngine,
     LoadFileBudgetConfig,
 )
@@ -37,7 +37,10 @@ from engineering_hub.journaler.model_profiles import (
 )
 from engineering_hub.journaler.models import ContextSnapshot
 from engineering_hub.journaler.output_limit import OutputLimitConfig
-from engineering_hub.journaler.org_writer import upsert_section_in_today_journal
+from engineering_hub.journaler.org_writer import (
+    append_to_today_journal,
+    upsert_section_in_today_journal,
+)
 from engineering_hub.journaler.prompts import (
     build_skills_block,
     build_workspace_layout,
@@ -194,6 +197,13 @@ class JournalerConfig:
     #   Defaults to the skills/ directory at the repo root.
     skills_dir: Path | None = None
 
+    # mlx_lm.server HTTP backend (when enabled, Journaler skips in-process mlx_lm.load)
+    mlx_server_enabled: bool = True
+    mlx_server_base_url: str = "http://127.0.0.1:8081/v1"
+    mlx_server_api_key: str = "not-needed"
+    mlx_server_timeout_s: float = 600.0
+    mlx_server_offer_start: bool = True
+
     # Daily summary context loop settings.
     # conversation_lookback_days: how many daily_summaries/*.md files to include in
     #   the proactive snapshot (independent of journal_lookback_days).
@@ -260,6 +270,19 @@ class JournalerConfig:
     def get_output_limit(self) -> OutputLimitConfig:
         """Return the OutputLimitConfig, defaulting if not set."""
         return self.output_limit or OutputLimitConfig()
+
+
+def _build_backend_from_config(config: JournalerConfig):
+    """Build the Journaler LM backend (HTTP mlx_lm.server or in-process)."""
+    from engineering_hub.journaler.model_profiles import (
+        build_journaler_mlx_backend,
+        spec_from_journaler_config,
+    )
+
+    return build_journaler_mlx_backend(
+        spec_from_journaler_config(config),
+        settings=config,
+    )
 
 
 def pressure_config_from_settings(
@@ -332,17 +355,29 @@ def run_daemon(config: JournalerConfig, settings: Settings | None = None) -> Non
         prose_completion_detection=config.prose_completion_detection,
     )
 
-    # Init MLX backend (model loads here — takes ~10-30s for 32B)
+    # Init MLX backend (in-process load or mlx_lm.server HTTP client)
     logger.info("Initializing Journaler model...")
-    backend = ConversationalMLXBackend(
-        model_path=config.model_path,
-        temp=config.temp,
-        top_p=config.top_p,
-        min_p=config.min_p,
-        repetition_penalty=config.repetition_penalty,
-        backend=config.mlx_backend,
-        enable_thinking=config.enable_thinking,
-    )
+    if sys.stdin.isatty():
+        from engineering_hub.agents.mlx_server import offer_start_mlx_server_if_needed
+
+        offer_start_mlx_server_if_needed(
+            config,
+            config.model_path,
+            state_dir=config.state_dir,
+        )
+    backend = _build_backend_from_config(config)
+    if type(backend).__name__ == "OpenAIMLXServerBackend":
+        logger.info(
+            "Journaler using mlx_lm.server at %s (model=%s)",
+            config.mlx_server_base_url,
+            config.model_path,
+        )
+    elif getattr(config, "mlx_server_enabled", True):
+        logger.warning(
+            "mlx_server.enabled but server unreachable at %s — using in-process MLX "
+            "(tool calling unavailable until mlx_lm.server is started)",
+            getattr(config, "mlx_server_base_url", "http://127.0.0.1:8081/v1"),
+        )
 
     # Init conversation engine with context management
     pressure_cfg = config.get_pressure_config()
@@ -612,22 +647,40 @@ def run_daemon(config: JournalerConfig, settings: Settings | None = None) -> Non
 
 MORNING_BRIEFING_JOURNAL_HEADING = "Morning Briefing"
 DISCUSSION_BRIEFING_JOURNAL_HEADING = "Discussion Briefing"
+TOPIC_HINTS_JOURNAL_HEADING = "Topic Hints"
+DAILY_SUMMARY_JOURNAL_HEADING = "Daily Summary"
 
 
-def _write_briefing_to_journal(
+def _write_section_to_journal(
     config: JournalerConfig,
     *,
     heading: str,
     text: str,
 ) -> None:
-    """Upsert briefing content into today's org journal (non-fatal on failure)."""
+    """Upsert content under a heading in today's org journal (non-fatal on failure)."""
     if not config.briefing_append_to_journal:
         return
     ok, msg = upsert_section_in_today_journal(config.journal_dir, heading, text)
     if ok:
-        logger.info("Briefing appended to org journal: %s", msg)
+        logger.info("Section upserted to org journal: %s", msg)
     else:
-        logger.warning("Could not append briefing to org journal: %s", msg)
+        logger.warning("Could not upsert section to org journal: %s", msg)
+
+
+def _append_section_to_journal(
+    config: JournalerConfig,
+    *,
+    heading: str,
+    text: str,
+) -> None:
+    """Append content under a heading in today's org journal (non-fatal on failure)."""
+    if not config.briefing_append_to_journal:
+        return
+    ok, msg = append_to_today_journal(config.journal_dir, heading, text)
+    if ok:
+        logger.info("Section appended to org journal: %s", msg)
+    else:
+        logger.warning("Could not append section to org journal: %s", msg)
 
 
 def _persist_morning_briefing(
@@ -644,7 +697,7 @@ def _persist_morning_briefing(
         encoding="utf-8",
     )
     logger.info("Morning briefing written to %s", output_path)
-    _write_briefing_to_journal(
+    _write_section_to_journal(
         config,
         heading=MORNING_BRIEFING_JOURNAL_HEADING,
         text=briefing,
@@ -663,7 +716,7 @@ def _persist_discussion_briefing(
     output_path = output_dir / f"discussion-{today_str}.md"
     output_path.write_text(discussion, encoding="utf-8")
     logger.info("Discussion briefing written to %s", output_path)
-    _write_briefing_to_journal(
+    _write_section_to_journal(
         config,
         heading=DISCUSSION_BRIEFING_JOURNAL_HEADING,
         text=discussion,
@@ -711,15 +764,7 @@ def generate_briefing_now(
     prompt = format_briefing_prompt(briefing_template, today_str, briefing_context)
 
     if engine is None:
-        backend = ConversationalMLXBackend(
-            model_path=config.model_path,
-            temp=config.temp,
-            top_p=config.top_p,
-            min_p=config.min_p,
-            repetition_penalty=config.repetition_penalty,
-            backend=config.mlx_backend,
-            enable_thinking=config.enable_thinking,
-        )
+        backend = _build_backend_from_config(config)
         engine = ConversationEngine(
             backend=backend,
             system_prompt="You are the Journaler.",
@@ -782,15 +827,7 @@ def generate_discussion_now(
         context.scan()
 
     if engine is None:
-        backend = ConversationalMLXBackend(
-            model_path=config.model_path,
-            temp=config.temp,
-            top_p=config.top_p,
-            min_p=config.min_p,
-            repetition_penalty=config.repetition_penalty,
-            backend=config.mlx_backend,
-            enable_thinking=config.enable_thinking,
-        )
+        backend = _build_backend_from_config(config)
         engine = ConversationEngine(
             backend=backend,
             system_prompt="You are the Journaler.",
@@ -882,15 +919,7 @@ def generate_summary_now(config: JournalerConfig) -> Path:
                     )
                 )
 
-    backend = ConversationalMLXBackend(
-        model_path=config.model_path,
-        temp=config.temp,
-        top_p=config.top_p,
-        min_p=config.min_p,
-        repetition_penalty=config.repetition_penalty,
-        backend=config.mlx_backend,
-        enable_thinking=config.enable_thinking,
-    )
+    backend = _build_backend_from_config(config)
     engine = ConversationEngine(
         backend=backend,
         system_prompt="You are the Journaler.",
@@ -962,14 +991,22 @@ def _topic_scout_tick(
     hints_dir = config.state_dir / "topic_hints"
     hints_dir.mkdir(parents=True, exist_ok=True)
     path = _topic_hints_path(config.state_dir)
+    generated_at = datetime.now().isoformat(timespec="seconds")
+    generated_line = (
+        f"_Generated {generated_at} after: {snapshot.change_summary}_"
+    )
     stamped = (
         f"# Topic hints — {date.today().isoformat()}\n\n"
-        f"_Generated {datetime.now().isoformat(timespec='seconds')} "
-        f"after: {snapshot.change_summary}_\n\n"
+        f"{generated_line}\n\n"
         f"{hint}\n"
     )
     path.write_text(stamped, encoding="utf-8")
     logger.info("Topic scout written: %s", path)
+    _append_section_to_journal(
+        config,
+        heading=TOPIC_HINTS_JOURNAL_HEADING,
+        text=f"{generated_line}\n\n{hint}",
+    )
     return hint
 
 
@@ -1346,9 +1383,10 @@ def _end_of_day_clear(
 ) -> None:
     """End-of-day housekeeping: compress today's conversation, archive, and reset.
 
-    Writes a daily summary to ``<state_dir>/daily_summaries/YYYY-MM-DD.md``
-    and optionally captures it to memory if ``capture_daily_to_memory`` is
-    enabled in the PressureConfig.
+    Writes a daily summary to ``<state_dir>/daily_summaries/YYYY-MM-DD.md``,
+    upserts it under ``* Daily Summary`` in today's org journal when
+    ``briefing_append_to_journal`` is enabled, and optionally captures it to
+    memory if ``capture_daily_to_memory`` is enabled in the PressureConfig.
     """
     history = engine.history
 
@@ -1428,6 +1466,11 @@ def _end_of_day_clear(
         encoding="utf-8",
     )
     logger.info(f"Daily summary written to {summary_path}")
+    _write_section_to_journal(
+        config,
+        heading=DAILY_SUMMARY_JOURNAL_HEADING,
+        text=summary,
+    )
 
     # Optionally capture to memory
     pressure_cfg = config.get_pressure_config()

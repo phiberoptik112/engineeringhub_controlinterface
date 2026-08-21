@@ -303,7 +303,7 @@ The Journaler is a persistent daemon that runs a local ~32B model on Apple Silic
 - **Loads agent personas** from `skills/*.yaml`: a concise **skills block** (display name, description, when-to-use, example `/agent` lines) is appended to the system prompt for **both** `journaler start` and **`journaler chat`**. On the daemon, each scheduled org-roam scan refreshes the rolling context snapshot **and re-attaches** that skills block so personas are not dropped mid-run
 - **Uses** `journaler.agent_backend`, optional `journaler.skills_dir`, and optional `journaler.anthropic_api_key` (else `anthropic.api_key` / `ENGINEERING_HUB_ANTHROPIC_API_KEY`) for delegation — same resolution for daemon and interactive chat
 - **Generates** a morning briefing at a configurable time (default 9:00 AM), with concise 2-3 sentence items that emphasize trends across the journal window and an extra **pending-tasks.org** summary when recent queue timestamps appear in that file. Pending/stale/completed tasks are rebuilt from the full journal lookback window (plus recent org-roam project notes) on every scan, with source file/date provenance in briefing context; prose lines like “finished X” can mark tasks complete when `prose_completion_detection` is enabled (default). When `journaler.briefing_append_to_journal` is enabled (default), the report is also upserted under `* Morning Briefing` in today's org journal (`journal.org_journal_dir`, default `~/org-roam/journal/YYYY-MM-DD.org`).
-- **Runs a proactive topic scout** on significant scan ticks (journal / pending-tasks / output changes): one light MLX call writes `topic_hints/YYYY-MM-DD.md` and injects **Topic hints (auto)** into the live system prompt for HTTP chat
+- **Runs a proactive topic scout** on significant scan ticks (journal / pending-tasks / output changes): one light MLX call writes `topic_hints/YYYY-MM-DD.md`, injects **Topic hints (auto)** into the live system prompt for HTTP chat, and when `journaler.briefing_append_to_journal` is enabled (default) appends each hint body under `* Topic Hints` in today's org journal (prior entries for the day are kept)
 - **Delegates** scheduled coordination scans through the same `AgentDelegator` as `/agent` (local MLX by default, with corpus/memory when configured)
 - **Responds** to ad-hoc questions via an HTTP chat endpoint on `localhost:18790`
 - **Writes** to daily journals and org-roam nodes via slash commands where intended; **overnight queue** tasks go only to **`pending-tasks.org`** (see **`/tasks`** / **`/queue`**)
@@ -321,7 +321,7 @@ journaler:
   scan_interval_min: 10
   briefing_enabled: true
   briefing_time: "09:00"
-  briefing_append_to_journal: true   # upsert morning/discussion reports into today's org journal
+  briefing_append_to_journal: true   # upsert morning/discussion/topic hints/daily summary into today's org journal
   # scan_org_roam_tree: true        # false = only journal.org_journal_dir + watch_dirs (faster; significance is content-based either way)
   # journal_lookback_days: 30
   # journal_max_files: 30
@@ -447,7 +447,7 @@ journaler:
 
 **Policies**
 
-- `prompt` (default) — when output is incomplete, interactive chat shows a menu: summarize history (`s`), summarize history + partial answer (`S`), continue same turn (`c`), continue as a follow-up turn (`f`), or stop (Enter).
+- `prompt` (default) — when output is incomplete, interactive chat shows a numbered menu: summarize history (`1`), summarize history + partial answer (`2`), continue same turn (`3`), continue as a follow-up turn (`4`), or stop (Enter). Letter shortcuts `s`/`S`/`c`/`f` still work if typed.
 - `auto_continue` — automatically continues across additional passes until complete or `max_continuation_passes` is hit.
 - `auto_summarize` — compresses context (per `summarize_scope_default`) and retries.
 - `stop` — keeps the partial output with a one-line notice.
@@ -563,12 +563,12 @@ The Journaler runs all day, and a 32B model's context window fills up over hours
 | **Compression** | Window ≥ 70% full | Asks the model to summarize earlier turns into a ~200-word paragraph; replaces them with a single preserved system message |
 | **Emergency trim** | Window ≥ 90% after compression | Force-drops to the last 3 turns |
 | **Topic-aware clear** | Topic shift detected (3 consecutive on-topic messages) | Archives the old topic, starts fresh with the new one |
-| **End-of-day reset** | Scheduled (`end_of_day_time`, default 15:30) or `/summarize` on demand | Compresses the full day, saves to `daily_summaries/YYYY-MM-DD.md`, resets history |
+| **End-of-day reset** | Scheduled (`end_of_day_time`, default 15:30) or `/summarize` on demand | Compresses the full day, saves to `daily_summaries/YYYY-MM-DD.md`, upserts under `* Daily Summary` in today's org journal when `briefing_append_to_journal` is enabled, resets history |
 | **Manual clear** | `/clear` command | User-controlled: soft, compress-then-clear, or full reset |
 
 ### Daily Summary Context Loop
 
-Daily summaries are generated automatically at `end_of_day_time` (default **15:30**, configurable) and feed back into every future session through two complementary paths. You can also trigger a summary at any time:
+Daily summaries are generated automatically at `end_of_day_time` (default **15:30**, configurable) and feed back into every future session through two complementary paths. When `briefing_append_to_journal` is enabled (default), the summary is also upserted under `* Daily Summary` in today's org journal. You can also trigger a summary at any time:
 
 - **Inside `journaler chat`:** type `/summarize` — generates the summary immediately from the current session's history and archives it.
 - **From the terminal:** `engineering-hub journaler summarize` — reads today's turns from `conversation.jsonl`, generates the summary, and writes it without needing an active chat session.
@@ -696,7 +696,7 @@ While in `engineering-hub journaler chat`, any input starting with `/` is handle
 | `/clear` | Soft clear: archive conversation history, keep context snapshot |
 | `/clear --summarize` | Compress history into a summary, then clear |
 | `/clear --hard` | Full reset: clear conversation and wipe scan state |
-| `/summarize` | Generate today's daily summary now, write it to `daily_summaries/YYYY-MM-DD.md`, and archive history |
+| `/summarize` | Generate today's daily summary now, write it to `daily_summaries/YYYY-MM-DD.md` (and upsert under `* Daily Summary` in today's org journal when `briefing_append_to_journal` is enabled), and archive history |
 | `/status` | Show context pressure, utilization %, turn count, and current topic |
 | `/budget` | Show full token budget breakdown (system prompt, snapshot, history, available) |
 | `/topic` | Show the currently detected conversation topic |
@@ -1037,14 +1037,14 @@ See [Bay Area Rental Scout](#bay-area-rental-scout) for setup, configuration, MC
 
 ---
 
-**`blender`** — Inspect and visualize acoustic scenes in a live Blender session via MCP (room geometry, SPL colormaps, receiver markers). Aliases: `3d`, `blender-mcp`. **Tool-use agent** — requires structured tool calling; use `--backend claude` when Journaler default is MLX (see [Blender MCP](#blender-mcp)).
+**`blender`** — Inspect and visualize acoustic scenes in a live Blender 5.1+ session via Lab MCP (room geometry, SPL colormaps, receiver markers). Aliases: `3d`, `blender-mcp`. **Tool-use agent** — requires structured tool calling; prefer `--backend mlx` with `mlx_server.enabled` (or `--backend claude`). See [Blender MCP](#blender-mcp).
 
 Check connectivity without delegating: `/blender status`.
 
 ```text
 /blender status
-/agent blender --backend claude summarize the current scene and list receiver empties
-/agent 3d --backend claude apply a viridis SPL colormap to the wall mesh collection
+/agent blender --backend mlx summarize the current scene and list receiver empties
+/agent 3d --backend mlx apply a viridis SPL colormap to the wall mesh collection
 /agent blender-mcp check MCP tools before editing materials on the room shell
 ```
 
@@ -1851,53 +1851,87 @@ Org tasks written by `rental_add_journal_task` use the format:
 
 ## Blender MCP
 
-Engineering Hub connects to a **running Blender session** with an MCP addon (for example [dcc-mcp-blender](https://github.com/dcc-mcp/dcc-mcp-blender) at `http://127.0.0.1:8765/mcp`). Hub does not start Blender — it calls the addon's HTTP MCP endpoint from Journaler agents and optionally proxies those tools through `engineering-hub mcp-server`.
+Engineering Hub connects to a **running Blender 5.1+ session** with the [Blender Lab MCP](https://www.blender.org/lab/mcp-server/) add-on (TCP bridge at `127.0.0.1:9876` by default). Hub does not start Blender — it sends null-byte-delimited JSON execute requests from Journaler agents and exposes the same tools through `engineering-hub mcp-server`.
 
 ```text
 ┌─────────────────────┐     ┌──────────────────────────────┐     ┌─────────────────────┐
-│ journaler chat      │────▶│ engineering_hub.blender      │────▶│ Blender + MCP addon │
-│ /agent blender      │     │ .service (health, list, call)│     │ (HTTP /mcp)         │
+│ journaler chat      │────▶│ engineering_hub.blender      │────▶│ Blender + Lab MCP   │
+│ /agent blender      │     │ .service (health, execute)   │     │ (TCP :9876)         │
 │ /blender status     │     └──────────────────────────────┘     └─────────────────────┘
 └─────────────────────┘
 ```
 
 ### Prerequisites
 
-1. Install and enable an MCP addon inside Blender (dcc-mcp-blender, blender-mcp, etc.).
-2. Start the MCP server from the addon (note the URL — default for dcc-mcp-blender is `http://127.0.0.1:8765/mcp`).
-3. Enable integration in `config.yaml`:
+1. Install and enable the Lab MCP add-on in Blender 5.1+ (Extensions → Blender Lab / MCP).
+2. Start the MCP server from the add-on preferences (or leave Auto Start on). Default: `127.0.0.1:9876`.
+3. Enable integration in `config.yaml` (defaults are already Lab MCP):
 
 ```yaml
 blender:
   enabled: true
-  mcp_url: "http://127.0.0.1:8765/mcp"
-  # Optional auth: ENGINEERING_HUB_BLENDER_AUTH_TOKEN env var
-  tool_denylist: ["run_python_script"]
+  host: "127.0.0.1"
+  port: 9876
+  connect_timeout_s: 10
 ```
 
-**Security:** Blender MCP can execute generated Python in your open `.blend` file. Use tool denylists, work on backed-up files, and confirm destructive operations.
+**Security:** Lab MCP executes generated Python in your open `.blend` file. Work on backed-up files and confirm destructive operations. Legacy dcc-mcp keys (`mcp_url`, `tool_denylist`, …) are ignored if present.
 
 ### Agent tools (via `/agent blender`)
 
 | Tool | Purpose |
 | --- | --- |
-| `blender_health` | Connection check and filtered tool count |
-| `blender_list_tools` | Discover remote MCP tool names/schemas |
-| `blender_call_tool` | Invoke any allowed remote tool by name |
+| `blender_health` | TCP connection check and Blender version |
+| `blender_list_tools` | Fixed Hub catalog (Lab has no remote tool list) |
+| `blender_execute` | Run `bpy` Python that assigns a dict to `result` |
 
-**Backend note:** `@blender` is a tool-use agent. With Journaler default `agent_backend: "mlx"`, delegation falls back to single-shot text without real tool calls. Prefer:
+**Backend note:** `@blender` is a tool-use agent and needs structured tool calling.
+
+**Local (recommended on Apple Silicon):** `mlx_server.enabled` defaults to true. Interactive Journaler prompts to start `mlx_lm.server` when it is down; you can also run it yourself so chat and `/agent` share an OpenAI-compatible endpoint with real `tool_calls`:
+
+```yaml
+mlx_server:
+  enabled: true
+  base_url: "http://127.0.0.1:8081/v1"   # not 8080 (SearXNG default)
+```
+
+```bash
+mlx_lm.server --model mlx-community/Qwen3-30B-A3B-Instruct-2507-4bit \
+  --host 127.0.0.1 --port 8081 --max-tokens 4096
+```
 
 ```text
 /blender status
-/agent blender --backend claude summarize the current scene and list mesh objects
-/agent blender --backend auto create a 6x4x2.7m room box named ConferenceRoom_A
+/agent blender --backend mlx summarize the current scene and list mesh objects
+/agent blender --backend mlx create a 6x4x2.7m room box named ConferenceRoom_A
 ```
 
-Natural-language routing to `@blender` (when not in propose mode) also appends `--backend claude` automatically.
+Use a **tool-capable** instruct checkpoint; in-process MLX (`mlx_server.enabled: false`) cannot drive Blender tools. Claude remains available via `--backend claude` / `auto`.
 
-### MCP proxy (optional)
+### Manual validation prompts
 
-When `blender.enabled: true`, `engineering-hub mcp-server` mounts a live proxy under the `blender_` namespace so Cursor can use memory + rental + Blender tools from one config. If Blender is offline, proxy mounting may add latency to other hub MCP operations — you can also connect Cursor directly to the Blender addon URL instead.
+Fixture: open a `.blend` with a closed mesh named `TestSolid` (e.g. 2×1×0.5 m box, scale applied).
+
+```text
+/blender status
+/agent blender --backend mlx check Lab MCP connectivity then list mesh objects
+/agent blender --backend mlx summarize the current scene; list mesh objects
+/agent blender --backend mlx report world location, rotation (Euler degrees), and scale of TestSolid
+/agent blender --backend mlx rotate TestSolid by 90 degrees around Z, then re-read orientation
+/agent blender --backend mlx estimate AABB volume of TestSolid in m³; show bbox dimensions
+/agent blender --backend mlx compute exact closed-mesh volume of TestSolid via bpy
+/agent blender --backend mlx list modifiers and poly count on TestSolid
+/agent blender --backend mlx add Subdivision Surface levels=2 to TestSolid; do not apply; list modifiers
+/agent blender --backend mlx add Bevel (segments=3, width=0.02m); report modifier stack
+```
+
+**Volume note:** Use `blender_execute` with `bpy` (e.g. object `bound_box` for AABB, or mesh volume helpers when available). There is no separate remote volume tool.
+
+### MCP tools (optional)
+
+When `blender.enabled: true`, `engineering-hub mcp-server` mounts Lab MCP wrappers under the `blender_` namespace (`blender_health`, `blender_list_tools`, `blender_execute`) so Cursor can use memory + rental + Blender tools from one config. Blender must be running with Lab MCP listening for execute calls to succeed.
+
+## Bay Area Rental Scout (continued)
 
 ### Run the pipeline directly (without Hub)
 
@@ -2013,7 +2047,7 @@ Two toolsets are served from one process:
 
 - **engineering-brain memory tools** — `search_brain`, `browse_recent`, `capture_note`, `get_stats`
 - **Rental Scout tools** (mounted under the `rental_` namespace) — `rental_get_criteria`, `rental_update_criteria`, `rental_run_scan`, `rental_get_top_matches`, `rental_get_listing_stats`, `rental_clear_seen_listings`, `rental_add_journal_task`, `rental_format_digest_for_org`
-- **Blender MCP proxy** (when `blender.enabled: true`, mounted under the `blender_` namespace) — remote addon tools; requires Blender running. See [Blender MCP](#blender-mcp).
+- **Blender Lab MCP tools** (when `blender.enabled: true`, mounted under the `blender_` namespace) — `blender_health`, `blender_list_tools`, `blender_execute`; requires Blender 5.1+ with Lab MCP listening. See [Blender MCP](#blender-mcp).
 
 The rental tools operate on the workspace configured by `rental_scout.workspace_dir` (criteria.yaml, seen_listings.db, latest_digest.json). `rental_run_scan` shells out to the rental-scout pipeline's `main.py` using the workspace `.venv` Python when available. See [Bay Area Rental Scout](#bay-area-rental-scout) for full setup and sample commands.
 
@@ -2114,18 +2148,15 @@ See [config/config.example.yaml](config/config.example.yaml) for all available o
 - `memory.*` - Vector memory settings (enabled, search_k, threshold)
 - `rental_scout.workspace_dir` - Rental Scout workspace holding the pipeline and its artifacts (default: `~/dev/rental_scout`; used by `/agent rental-scout` and the `rental_` MCP tools)
 - `rental_scout.python_path` - Python interpreter for `rental_run_scan` subprocesses (default: auto-detect `{workspace_dir}/.venv/bin/python`, else current interpreter)
-- `blender.enabled` - Enable Blender MCP client for `/agent blender`, `/blender status`, and optional MCP proxy (default: false)
-- `blender.mcp_url` - HTTP MCP endpoint for the Blender addon (default: `http://127.0.0.1:8765/mcp`)
-- `blender.auth_token` / `ENGINEERING_HUB_BLENDER_AUTH_TOKEN` - Optional bearer token for authenticated Blender MCP endpoints
-- `blender.tool_denylist` - Remote tool names blocked from agent invocation (default includes `run_python_script`)
-- `blender.tool_allowlist` - When set, only listed remote tools may be invoked
-- `blender.enabled` - Enable Blender MCP client integration and optional MCP proxy (default: false)
-- `blender.mcp_url` - HTTP MCP endpoint for the Blender addon (default: `http://127.0.0.1:8765/mcp`)
-- `blender.auth_token` - Optional bearer token for Blender MCP (`ENGINEERING_HUB_BLENDER_AUTH_TOKEN` env var)
-- `blender.connect_timeout_s` - Connection timeout in seconds (default: 10)
-- `blender.tools_cache_ttl_s` - Seconds to cache remote tool listings (default: 60)
-- `blender.tool_allowlist` - When set, only these remote tool names may be invoked
-- `blender.tool_denylist` - Remote tool names blocked from agent invocation (default includes `run_python_script`)
+- `blender.enabled` - Enable Blender Lab MCP client for `/agent blender`, `/blender status`, and MCP tools (default: true)
+- `blender.host` - Lab MCP TCP host (default: `127.0.0.1`)
+- `blender.port` - Lab MCP TCP port (default: `9876`)
+- `blender.connect_timeout_s` - TCP connect/read timeout seconds (default: 10)
+- `mlx_server.enabled` - Prefer `mlx_lm.server` over HTTP for Journaler chat and `/agent --backend mlx` (default: true). If unreachable, interactive chat/tui/start prompt y/N to launch it; otherwise fall back to in-process `mlx_lm.load`. Set false to always load in-process.
+- `mlx_server.offer_start` - When true (default), interactive Journaler prompts to start `mlx_lm.server` if it is not reachable
+- `mlx_server.base_url` - OpenAI-compatible base URL (default: `http://127.0.0.1:8081/v1`)
+- `mlx_server.api_key` - Placeholder for OpenAI clients (default: `not-needed`)
+- `mlx_server.timeout_s` - HTTP timeout seconds (default: 600)
 - `horn_iterator.enabled` - Enable the horn iterator agent, CLI, and `/horn` slash command (default: true)
 - `horn_iterator.output_dir` - Directory for sweep exports (CSV/org); defaults to `{workspace_dir}/horn_iterator`
 - `horn_iterator.flare_rate_per_m` - Override the exponential flare rate m (/m); blueprint default 17.8 (fc ≈ 486 Hz)

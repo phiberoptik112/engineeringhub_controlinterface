@@ -283,6 +283,8 @@ class OllamaBackend:
     network access to a running Ollama instance.
     """
 
+    tool_protocol = "openai"
+
     def __init__(
         self,
         host: str = "http://localhost:11434",

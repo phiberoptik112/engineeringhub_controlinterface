@@ -1,5 +1,6 @@
 """Agent worker for executing tasks via a pluggable LLM backend."""
 
+import json
 import logging
 import re
 from datetime import datetime
@@ -203,6 +204,29 @@ class AgentWorker:
                 error_message=f"LLM backend error: {e}",
             )
         except NotImplementedError as e:
+            # TOOL_USE agents must not silently fall back to single-shot — that
+            # produces hallucinated "offline" / no-tool reports (e.g. @blender).
+            requires_tools = (
+                config is not None
+                and config.model_class == ModelClass.TOOL_USE
+                and bool(config.tools)
+            )
+            if requires_tools:
+                logger.error(
+                    "TOOL_USE agent '%s' cannot run without tool calling: %s",
+                    agent_type.value,
+                    e,
+                )
+                return TaskResult(
+                    task=task,
+                    success=False,
+                    error_message=(
+                        f"{e} "
+                        "This agent requires live tool calls (e.g. blender_execute). "
+                        "Enable mlx_server.enabled in config.yaml, run mlx_lm.server "
+                        "on the configured base_url, or retry with --backend claude."
+                    ),
+                )
             logger.warning(
                 "Backend does not support tool calling, falling back to single-shot: %s", e
             )
@@ -269,6 +293,7 @@ class AgentWorker:
 
         messages: list[dict[str, Any]] = [{"role": "user", "content": user_message}]
         response = None
+        tool_protocol = str(getattr(self._backend, "tool_protocol", "anthropic"))
 
         complete_with_tools = getattr(self._backend, "complete_with_tools")
         for _iteration in range(MAX_TOOL_ITERATIONS):
@@ -282,7 +307,50 @@ class AgentWorker:
             if response.stop_reason != "tool_use" or not response.tool_calls:
                 return response.text or ""
 
-            # Build the assistant content block from the raw response
+            if tool_protocol == "openai":
+                assistant_msg: dict[str, Any] = {
+                    "role": "assistant",
+                    "content": response.text or "",
+                }
+                oai_calls = []
+                for call in response.tool_calls:
+                    oai_calls.append(
+                        {
+                            "id": call.id,
+                            "type": "function",
+                            "function": {
+                                "name": call.name,
+                                "arguments": json.dumps(call.arguments),
+                            },
+                        }
+                    )
+                assistant_msg["tool_calls"] = oai_calls
+                messages.append(assistant_msg)
+
+                for call in response.tool_calls:
+                    handler = handler_map.get(call.name)
+                    if handler is None:
+                        result_text = f"Unknown tool '{call.name}' — not available."
+                        logger.warning("Tool call to unregistered tool: %s", call.name)
+                    else:
+                        try:
+                            result_text = handler(call.arguments, tool_ctx)
+                            logger.debug(
+                                "Tool %s → %d chars", call.name, len(result_text)
+                            )
+                        except Exception as exc:
+                            result_text = f"Tool '{call.name}' raised an error: {exc}"
+                            logger.error("Tool %s failed: %s", call.name, exc)
+                    messages.append(
+                        {
+                            "role": "tool",
+                            "tool_call_id": call.id,
+                            "content": result_text,
+                        }
+                    )
+                continue
+
+            # Anthropic-style tool loop (default)
             assistant_content = response.raw.get("content", [])
             messages.append({"role": "assistant", "content": assistant_content})
 

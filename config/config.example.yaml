@@ -109,18 +109,17 @@ staging:
 #   # when that venv exists, otherwise the engineering-hub interpreter.
 #   # python_path: "~/dev/rental_scout/.venv/bin/python"
 
-# ── Blender MCP (3D scene control via HTTP addon in Blender) ──────
-# Requires a running Blender session with an MCP addon enabled (e.g. dcc-mcp-blender
-# at http://127.0.0.1:8765/mcp). Exposed to journaler via /agent blender and optionally
-# proxied under the blender_ namespace in `engineering-hub mcp-server`.
+# ── Blender Lab MCP (3D scene control via TCP bridge in Blender 5.1+) ──
+# Requires a running Blender session with the Lab MCP add-on enabled
+# (default TCP 127.0.0.1:9876). Exposed to journaler via /agent blender and as
+# FastMCP tools under the blender_ namespace in `engineering-hub mcp-server`.
 # blender:
-#   enabled: false
-#   mcp_url: "http://127.0.0.1:8765/mcp"
-#   # auth_token: set via ENGINEERING_HUB_BLENDER_AUTH_TOKEN instead of YAML
+#   enabled: true   # default; set false to skip Lab MCP /agent blender tools
+#   host: "127.0.0.1"
+#   port: 9876
 #   connect_timeout_s: 10
-#   tools_cache_ttl_s: 60
-#   # tool_allowlist: ["get_scene_info", "list_objects"]
-#   tool_denylist: ["run_python_script"]
+#   # Legacy dcc-mcp keys (mcp_url, auth_token, tool_allowlist, tool_denylist)
+#   # are ignored if present.
 
 # ── Horn Iterator (parametric exponential-horn sweep, LVT alert system) ──
 # Local compute (no API). Exposed via the `engineering-hub horn` CLI, the
@@ -257,6 +256,21 @@ chunking:
 #   # Ollama URL as seen from inside containers (Docker Compose service name)
 #   ollama_host: "http://ollama:11434"
 
+# ── mlx_lm.server (OpenAI-compatible HTTP for Journaler chat + tool-use) ──
+# Enabled by default. When the server is reachable, Journaler uses it (tool
+# calling). If unreachable, interactive chat/tui/start prompts y/N to launch
+# mlx_lm.server; declining (or non-TTY) falls back to in-process mlx_lm.load.
+# Start separately (port 8081 avoids SearXNG's default 8080):
+#   mlx_lm.server --model mlx-community/Qwen3-30B-A3B-Instruct-2507-4bit \
+#     --host 127.0.0.1 --port 8081 --max-tokens 4096
+# Set enabled: false to always use in-process load.
+mlx_server:
+  enabled: true
+  base_url: "http://127.0.0.1:8081/v1"
+  offer_start: true   # prompt y/N when interactive and server is down
+  # api_key: "not-needed"
+  # timeout_s: 600
+
 # ── Pi coding agent (code-engineer) ──────────────────────────────
 # The code-engineer agent delegates software changes to the external Pi
 # coding agent (https://pi.dev) running in an isolated git worktree of a
@@ -382,7 +396,7 @@ chunking:
 #   # Morning briefing schedule
 #   briefing_enabled: true
 #   briefing_time: "09:00"       # local time (HH:MM); default 9:00
-#   briefing_append_to_journal: true  # upsert reports under * Morning Briefing / * Discussion Briefing in today's org journal
+#   briefing_append_to_journal: true  # upsert under * Morning Briefing / * Discussion Briefing / * Topic Hints / * Daily Summary in today's org journal
 #
 #   # Topics Discussion Briefing — multi-persona roundtable (disabled by default)
 #   # discussion_briefing_enabled: false

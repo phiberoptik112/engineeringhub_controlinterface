@@ -4,15 +4,18 @@ from __future__ import annotations
 
 from datetime import date
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
+from engineering_hub.journaler.context_manager import ConversationHistory, ConversationTurn
 from engineering_hub.journaler.daemon import (
+    DAILY_SUMMARY_JOURNAL_HEADING,
     DISCUSSION_BRIEFING_JOURNAL_HEADING,
     MORNING_BRIEFING_JOURNAL_HEADING,
     JournalerConfig,
+    _end_of_day_clear,
     _persist_discussion_briefing,
     _persist_morning_briefing,
-    _write_briefing_to_journal,
+    _write_section_to_journal,
 )
 from engineering_hub.journaler.org_writer import (
     read_section_body,
@@ -99,13 +102,13 @@ def test_morning_and_discussion_sections_coexist(tmp_path: Path) -> None:
     assert "Persona notes." in discussion_body
 
 
-def test_write_briefing_to_journal_respects_disabled_flag(tmp_path: Path) -> None:
+def test_write_section_to_journal_respects_disabled_flag(tmp_path: Path) -> None:
     config = _minimal_config(tmp_path, append_to_journal=False)
 
     with patch(
         "engineering_hub.journaler.daemon.upsert_section_in_today_journal"
     ) as mock_upsert:
-        _write_briefing_to_journal(
+        _write_section_to_journal(
             config,
             heading=MORNING_BRIEFING_JOURNAL_HEADING,
             text="Should not write",
@@ -141,7 +144,7 @@ def test_persist_discussion_briefing_writes_state_and_journal(tmp_path: Path) ->
     assert "Insight." in body
 
 
-def test_write_briefing_to_journal_logs_warning_on_failure(tmp_path: Path) -> None:
+def test_write_section_to_journal_logs_warning_on_failure(tmp_path: Path) -> None:
     config = _minimal_config(tmp_path)
 
     with patch(
@@ -149,10 +152,85 @@ def test_write_briefing_to_journal_logs_warning_on_failure(tmp_path: Path) -> No
         return_value=(False, "disk full"),
     ):
         with patch("engineering_hub.journaler.daemon.logger") as mock_logger:
-            _write_briefing_to_journal(
+            _write_section_to_journal(
                 config,
                 heading=MORNING_BRIEFING_JOURNAL_HEADING,
                 text="Briefing body",
             )
             mock_logger.warning.assert_called_once()
             assert "disk full" in mock_logger.warning.call_args[0][1]
+
+
+def _engine_with_turns(*contents: str) -> MagicMock:
+    history = ConversationHistory()
+    for i, content in enumerate(contents):
+        role = "user" if i % 2 == 0 else "assistant"
+        history.turns.append(
+            ConversationTurn(
+                role=role,
+                content=content,
+                timestamp="2026-07-28T12:00:00+00:00",
+                tokens=10,
+            )
+        )
+    engine = MagicMock()
+    engine.history = history
+    engine.budget = MagicMock()
+    engine.budget.history_tokens = 0
+    engine._raw_complete.return_value = (
+        "## Planned vs. Done\nShipped report.\n\n## Tomorrow's Seed\nFollow up."
+    )
+    return engine
+
+
+def test_end_of_day_clear_upserts_daily_summary_to_journal(tmp_path: Path) -> None:
+    config = _minimal_config(tmp_path)
+    engine = _engine_with_turns("What should I prioritize?", "Review the ASTM draft.")
+
+    _end_of_day_clear(engine, config)
+
+    today_str = date.today().isoformat()
+    summary_path = config.state_dir / "daily_summaries" / f"{today_str}.md"
+    assert summary_path.is_file()
+    assert "Shipped report." in summary_path.read_text(encoding="utf-8")
+
+    today_path = config.journal_dir / f"{today_str}.org"
+    body = read_section_body(today_path, DAILY_SUMMARY_JOURNAL_HEADING)
+    assert "Shipped report." in body
+    assert "Tomorrow's Seed" in body
+    assert len(engine.history.turns) == 0
+
+
+def test_end_of_day_clear_skips_journal_when_flag_disabled(tmp_path: Path) -> None:
+    config = _minimal_config(tmp_path, append_to_journal=False)
+    engine = _engine_with_turns("Hello", "Hi there.")
+
+    _end_of_day_clear(engine, config)
+
+    today_str = date.today().isoformat()
+    summary_path = config.state_dir / "daily_summaries" / f"{today_str}.md"
+    assert summary_path.is_file()
+    today_path = config.journal_dir / f"{today_str}.org"
+    assert not today_path.exists()
+
+
+def test_end_of_day_clear_replaces_existing_daily_summary_section(
+    tmp_path: Path,
+) -> None:
+    config = _minimal_config(tmp_path)
+    today_str = date.today().isoformat()
+    upsert_section_in_today_journal(
+        config.journal_dir,
+        DAILY_SUMMARY_JOURNAL_HEADING,
+        "Old summary body",
+    )
+    engine = _engine_with_turns("Update me", "Done.")
+
+    _end_of_day_clear(engine, config)
+
+    today_path = config.journal_dir / f"{today_str}.org"
+    raw = today_path.read_text(encoding="utf-8")
+    assert raw.count(f"* {DAILY_SUMMARY_JOURNAL_HEADING}") == 1
+    body = read_section_body(today_path, DAILY_SUMMARY_JOURNAL_HEADING)
+    assert "Shipped report." in body
+    assert "Old summary body" not in body

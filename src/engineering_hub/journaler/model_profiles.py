@@ -291,9 +291,63 @@ def apply_spec_to_journaler_config_attrs(spec: JournalerModelSpec) -> dict[str, 
     }
 
 
-def build_journaler_mlx_backend(spec: JournalerModelSpec):
-    """Factory for :class:`ConversationalMLXBackend` from a spec."""
+def build_journaler_mlx_backend(spec: JournalerModelSpec, settings: Any | None = None):
+    """Factory for Journaler LM backends from a model spec.
+
+    When ``settings.mlx_server_enabled`` is True and the profile is not forced
+    to ``mlx-vlm``, returns an :class:`OpenAIMLXServerBackend` that talks to
+    ``mlx_lm.server`` **if the server is reachable**. Otherwise loads weights
+    in-process via :class:`ConversationalMLXBackend` (with a warning when the
+    HTTP server was preferred but offline).
+    """
     from engineering_hub.journaler.engine import ConversationalMLXBackend
+
+    use_server = False
+    if settings is not None and bool(getattr(settings, "mlx_server_enabled", True)):
+        backend_kind = (spec.mlx_backend or "auto").lower()
+        if backend_kind == "mlx-vlm":
+            logger.info(
+                "mlx_server.enabled but profile mlx_backend=mlx-vlm — "
+                "using in-process VLM load"
+            )
+        else:
+            use_server = True
+
+    if use_server:
+        from engineering_hub.agents.mlx_server import (
+            MLXServerSamplingConfig,
+            OpenAIMLXServerBackend,
+            probe_mlx_server,
+        )
+
+        assert settings is not None
+        base_url = str(
+            getattr(settings, "mlx_server_base_url", "http://127.0.0.1:8081/v1")
+        )
+        api_key = str(getattr(settings, "mlx_server_api_key", "not-needed"))
+        if not probe_mlx_server(base_url, api_key=api_key):
+            logger.warning(
+                "mlx_server.enabled but %s is unreachable — falling back to "
+                "in-process MLX (tool calling unavailable). Start: "
+                "mlx_lm.server --model %s --host 127.0.0.1 --port 8081 "
+                "--max-tokens 4096",
+                base_url,
+                spec.model_path,
+            )
+        else:
+            return OpenAIMLXServerBackend(
+                base_url=base_url,
+                model=spec.model_path,
+                api_key=api_key,
+                timeout_s=float(getattr(settings, "mlx_server_timeout_s", 600.0)),
+                sampling=MLXServerSamplingConfig(
+                    temp=spec.temp,
+                    top_p=spec.top_p,
+                    min_p=spec.min_p,
+                    repetition_penalty=spec.repetition_penalty,
+                ),
+                enable_thinking=spec.enable_thinking,
+            )
 
     return ConversationalMLXBackend(
         model_path=spec.model_path,
@@ -501,6 +555,7 @@ def journaler_slash_model_command(
             engine,
             delegator,
             thinking_floor=thinking_floor,
+            settings=settings,
         )
     except Exception as exc:
         logger.exception("Journaler model reload failed")
@@ -537,6 +592,7 @@ def load_model_from_catalog_entry(
             thinking_floor=int(
                 getattr(settings, "journaler_thinking_max_tokens", DEFAULT_THINKING_MAX_TOKENS)
             ),
+            settings=settings,
         )
     except Exception as exc:
         logger.exception("Journaler model reload failed")
@@ -556,9 +612,43 @@ def reload_journaler_model_into_engine(
     delegator: Any | None = None,
     *,
     thinking_floor: int = DEFAULT_THINKING_MAX_TOKENS,
+    settings: Any | None = None,
 ) -> None:
-    """Load *spec* as a new backend, swap *engine*'s backend, sync *delegator* if set."""
-    backend = build_journaler_mlx_backend(spec)
+    """Load *spec* as a new backend, swap *engine*'s backend, sync *delegator* if set.
+
+    When *settings* is omitted, reuse ``engine``-adjacent settings from an optional
+    ``model_ctx`` is the caller's responsibility — pass settings explicitly for
+    ``mlx_server.enabled`` routing.
+    """
+    backend = build_journaler_mlx_backend(spec, settings=settings)
+    # For HTTP server backends, path/profile switches only change the request model id.
+    if settings is not None and bool(getattr(settings, "mlx_server_enabled", False)):
+        existing = getattr(engine, "_backend", None)
+        if existing is not None and hasattr(existing, "set_model") and hasattr(
+            existing, "tool_protocol"
+        ):
+            # Prefer updating the live client (avoids dropping connection settings).
+            if type(existing).__name__ == "OpenAIMLXServerBackend" and type(
+                backend
+            ).__name__ == "OpenAIMLXServerBackend":
+                existing.set_model(spec.model_path)
+                existing.set_enable_thinking(spec.enable_thinking)
+                existing.set_sampling_params(
+                    temp=spec.temp,
+                    top_p=spec.top_p,
+                    min_p=spec.min_p,
+                    repetition_penalty=spec.repetition_penalty,
+                )
+                engine.replace_backend(
+                    existing,
+                    model_context_window=spec.model_context_window,
+                    max_tokens=spec.max_tokens,
+                    max_thinking_tokens=spec.max_thinking_tokens,
+                )
+                if delegator is not None:
+                    delegator.set_mlx_backend(existing)
+                return
+
     engine.replace_backend(
         backend,
         model_context_window=spec.model_context_window,

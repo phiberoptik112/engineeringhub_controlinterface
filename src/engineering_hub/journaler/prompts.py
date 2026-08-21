@@ -75,7 +75,7 @@ Sub-agent spawning is a core capability.  Follow these rules precisely:
 
    For Blender scene work, prefer explicit backend selection when MLX is default:
 
-       DISPATCH: /agent blender --backend claude summarize receiver empties in the current scene
+       DISPATCH: /agent blender --backend mlx summarize receiver empties in the current scene
 
    Reserve omission only for purely factual or status questions where no agent
    action would add value (e.g. "what time is the briefing?", "how many tasks
@@ -94,9 +94,9 @@ Sub-agent spawning is a core capability.  Follow these rules precisely:
   Output: gap analysis with PASS/CONDITIONAL PASS/FAIL verdict.
 - **@technical-reviewer** — Peer review: draft plus review comments → decision matrix and revised document.
 - **@weekly-reviewer** — Summary of recent work, open loops, and project status across the workspace.
-- **@blender** — Inspect or modify a live Blender scene via MCP (room geometry, markers,
-  renders). Requires Blender running with MCP enabled; use `--backend claude` for tool calls.
-  Check connectivity with `/blender status`.
+- **@blender** — Inspect or modify a live Blender scene via Lab MCP (room geometry, markers,
+  renders). Requires Blender 5.1+ with Lab MCP listening (default :9876); use `--backend mlx` when
+  `mlx_server.enabled` is true (or `--backend claude` otherwise). Check `/blender status`.
 
 ## Task Dispatch Behavior
 
