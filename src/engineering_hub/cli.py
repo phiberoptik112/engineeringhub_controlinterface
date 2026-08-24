@@ -4,6 +4,7 @@ import argparse
 import logging
 import shlex
 import sys
+from collections.abc import Callable
 from datetime import date
 from pathlib import Path
 from urllib.parse import urlparse
@@ -19,6 +20,7 @@ from rich.text import Text
 from engineering_hub.actions.file_ingest import read_path_content_for_load
 from engineering_hub.config.loader import find_config_file
 from engineering_hub.config.settings import Settings
+from engineering_hub.horn_iterator import service as horn_service
 from engineering_hub.journaler.constants import (
     DEFAULT_JOURNALER_MLX_MODEL_ID,
     JOURNALER_CONVERSATION_EXPORT_DIRNAME,
@@ -29,16 +31,10 @@ from engineering_hub.journaler.engine import (
     _is_model_cached,
 )
 from engineering_hub.journaler.file_browser import browse_org_roam
-from engineering_hub.journaler.output_limit import (
-    Action,
-    GenerationOutcome,
-    OutputLimitConfig,
-)
 from engineering_hub.journaler.model_profiles import (
     JournalerChatModelContext,
     JournalerModelSpec,
     build_journaler_mlx_backend,
-    effective_generation_max_tokens,
     ensure_spec_model_path,
     journaler_model_display_label,
     journaler_slash_model_command,
@@ -46,7 +42,13 @@ from engineering_hub.journaler.model_profiles import (
     parse_model_slash_message,
     resolve_journaler_model_spec,
 )
-from engineering_hub.horn_iterator import service as horn_service
+from engineering_hub.journaler.monitor_tui import render_status_snapshot, run_monitor
+from engineering_hub.journaler.output_limit import (
+    Action,
+    GenerationOutcome,
+    OutputLimitConfig,
+)
+from engineering_hub.journaler.status_snapshot import collect_status_snapshot
 from engineering_hub.journaler.timesheet_slash import handle_timesheet_slash_command
 from engineering_hub.memory.service import MemoryService
 from engineering_hub.orchestration.orchestrator import Orchestrator
@@ -2350,7 +2352,7 @@ def cmd_journaler(args: argparse.Namespace) -> int:
     if sub is None:
         console.print(
             "[yellow]Usage: engineering-hub journaler"
-            " {start|chat|tui|briefing|summarize|export|status|scan|clear|download|pipeline}[/yellow]"
+            " {start|chat|tui|briefing|summarize|export|status|monitor|scan|clear|download|pipeline}[/yellow]"
         )
         return 1
 
@@ -2451,6 +2453,13 @@ def cmd_journaler(args: argparse.Namespace) -> int:
         mlx_backend=spec.mlx_backend,
         memory_service=memory_service,
         corpus_service=corpus_service,
+        activity_log_enabled=settings.journaler_activity_log_enabled,
+        activity_log_mode=settings.journaler_activity_log_mode,
+        activity_log_path=settings.journaler_activity_log_path,
+        activity_log_heading=settings.journaler_activity_log_heading,
+        activity_log_include_suggestions=(
+            settings.journaler_activity_log_include_suggestions
+        ),
         web_search_provider=web_search_provider,
         web_search_enabled=settings.agent_web_search_enabled,
         web_search_max_results=settings.agent_web_search_max_results,
@@ -2526,6 +2535,13 @@ def cmd_journaler(args: argparse.Namespace) -> int:
             )
         if config.chat_enabled:
             console.print(f"  Chat: http://{config.chat_host}:{config.chat_port}")
+        if config.activity_log_enabled:
+            target = (
+                str(config.activity_log_path)
+                if config.activity_log_path is not None
+                else config.activity_log_mode
+            )
+            console.print(f"  Activity log: {target}")
         try:
             run_daemon(config, settings)
         except KeyboardInterrupt:
@@ -2536,6 +2552,7 @@ def cmd_journaler(args: argparse.Namespace) -> int:
         return 0
 
     elif sub == "chat":
+        from engineering_hub.code.pi_executor import build_pi_executor
         from engineering_hub.journaler.chat_repl import (
             _PALETTE_SENTINEL,
             COMMAND_CATALOG,
@@ -2543,7 +2560,6 @@ def cmd_journaler(args: argparse.Namespace) -> int:
             prompt_line,
             set_pending_insertion,
         )
-        from engineering_hub.code.pi_executor import build_pi_executor
         from engineering_hub.journaler.delegator import build_delegator
         from engineering_hub.journaler.engine import ConversationEngine
         from engineering_hub.journaler.file_browser import browse_commands
@@ -3062,24 +3078,38 @@ def cmd_journaler(args: argparse.Namespace) -> int:
         return 0
 
     elif sub == "status":
-        state_file = config.state_dir / "state.json"
-        if state_file.exists():
-            import json
-
-            data = json.loads(state_file.read_text(encoding="utf-8"))
-            table = Table(title="Journaler Status")
-            table.add_column("Setting", style="cyan")
-            table.add_column("Value", style="green")
-            table.add_row("Model", config.model_path)
-            table.add_row("State Dir", str(config.state_dir))
-            table.add_row("Last Scan", data.get("last_scan", "never"))
-            table.add_row("Tracked Files", str(len(data.get("file_mtimes", {}))))
-            table.add_row("Chat Endpoint", f"http://{config.chat_host}:{config.chat_port}")
-            console.print(table)
-        else:
-            console.print("[dim]Journaler has not run yet. No state file found.[/dim]")
-            console.print(f"  Expected at: {state_file}")
+        snapshot = collect_status_snapshot(
+            config.state_dir,
+            chat_host=config.chat_host,
+            chat_port=config.chat_port,
+            model_path=config.model_path,
+            chat_enabled=config.chat_enabled,
+            heartbeat_stale_after_sec=settings.journaler_status_heartbeat_stale_sec,
+        )
+        console.print(render_status_snapshot(snapshot))
+        if not snapshot.get("scan_state_present") and not snapshot.get("http_online"):
+            console.print(
+                "[dim]Journaler has not run yet, or no state/HTTP status is available.[/dim]"
+            )
+            console.print(f"  Expected state under: {config.state_dir}")
         return 0
+
+    elif sub == "monitor":
+        return run_monitor(
+            state_dir=config.state_dir,
+            chat_host=config.chat_host,
+            chat_port=config.chat_port,
+            model_path=config.model_path,
+            chat_enabled=config.chat_enabled,
+            refresh_seconds=(
+                getattr(args, "refresh", None)
+                or settings.journaler_monitor_refresh_sec
+            ),
+            heartbeat_stale_after_sec=settings.journaler_status_heartbeat_stale_sec,
+            once=getattr(args, "once", False),
+            use_http=not getattr(args, "no_http", False),
+            console=console,
+        )
 
     elif sub == "scan":
         console.print("[bold]Running scan...[/bold]")
@@ -4368,6 +4398,27 @@ def main() -> int:
         "summarize", help="Generate today's daily summary and archive conversation history"
     )
     journaler_sub.add_parser("status", help="Show Journaler status")
+    monitor_p = journaler_sub.add_parser(
+        "monitor",
+        help="Live TUI status dashboard for the Journaler daemon",
+    )
+    monitor_p.add_argument(
+        "--refresh",
+        type=float,
+        default=None,
+        metavar="SECONDS",
+        help="Refresh interval for the live monitor (default: journaler.monitor_refresh_sec)",
+    )
+    monitor_p.add_argument(
+        "--once",
+        action="store_true",
+        help="Render one status snapshot and exit",
+    )
+    monitor_p.add_argument(
+        "--no-http",
+        action="store_true",
+        help="Read only file-backed status and skip the HTTP /status probe",
+    )
     journaler_sub.add_parser("scan", help="Run a single org-roam scan")
     journaler_sub.add_parser(
         "download", help="Pre-download the Journaler model to local HF cache"

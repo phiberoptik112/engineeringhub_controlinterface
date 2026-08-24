@@ -283,4 +283,3 @@ def test_briefing_includes_task_provenance(tmp_path: Path) -> None:
     assert "Draft ASTM section" in briefing
     assert day in briefing
     assert "Client Work" in briefing or f"{day}.org" in briefing
-

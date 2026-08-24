@@ -20,7 +20,7 @@ They coexist cleanly: the Orchestrator processes explicit tasks while the Journa
 - **Local MLX Models**: Run agents on Apple Silicon via `mlx-lm` with HuggingFace model IDs
 - **Ollama Backend**: Use Ollama for agent generation — works on any platform and inside Docker containers
 - **Docker Containers**: Isolate agent task execution in ephemeral containers with resource limits and network controls
-- **Journaler Daemon**: Always-on ambient listener with morning briefings, HTTP chat, and Slack integration — optional **model profiles**, Qwen3 **thinking mode**, CLI `--profile` / `--model`, and **`/model`** to switch checkpoints without losing chat history
+- **Journaler Daemon**: Always-on ambient listener with morning briefings, HTTP chat, live **`journaler monitor`** status dashboard, optional Doom Emacs-readable org activity log, and Slack integration — optional **model profiles**, Qwen3 **thinking mode**, CLI `--profile` / `--model`, and **`/model`** to switch checkpoints without losing chat history
 - **Agent Delegation**: **`journaler chat`** and the daemon’s HTTP `/chat` both use the same setup: an **AgentDelegator**, YAML **skills** summaries injected into the system prompt (personas, when-to-use hints, examples), and **`/agent`** / **`/skills`** slash commands — execution is local MLX or Claude API, selectable per-command via `journaler.agent_backend` and `--backend`
 - **Task planner & overnight queue**: **`/queue`** and **`/tasks`** manage proposals and commits to **`pending-tasks.org`**; **`journaler.default_task_mode`** chooses **immediate** (inline / classifier-driven delegation) vs **propose** (`DISPATCH:` + confirmation). Morning briefings include a short summary of recent queue activity when present
 - **Skills System**: Extensible `skills/` directory of YAML files defines each agent personality's capabilities; drop a new `.yaml` to add a delegation skill without code changes
@@ -129,6 +129,10 @@ engineering-hub journaler summarize
 
 # Check daemon status
 engineering-hub journaler status
+
+# Live daemon monitor (Rich TUI; Ctrl-C to exit)
+engineering-hub journaler monitor
+engineering-hub journaler monitor --once
 
 # Run a single org-roam scan
 engineering-hub journaler scan
@@ -331,6 +335,14 @@ journaler:
   chat_enabled: true
   chat_host: "127.0.0.1"
   chat_port: 18790
+  monitor_refresh_sec: 2.0
+  status_heartbeat_stale_sec: 30
+  activity_log:
+    enabled: false
+    mode: "daily_journal"      # daily_journal | dedicated_file
+    path: null                 # optional .org path for dedicated_file
+    heading: "Journaler Activity"
+    include_suggestions: true
   slack_enabled: false
   slack_webhook_url: ""  # or set JOURNALER_SLACK_WEBHOOK env var
   max_conversation_history: 20
@@ -391,6 +403,15 @@ journaler:
 ```
 
 `model_path` is optional: if omitted, the Journaler falls back to `mlx.model_path` (the orchestrator MLX path), then to a built-in default (`mlx-community/gemma-4-31b-it-8bit`). Use `journaler download` after changing paths.
+
+`engineering-hub journaler monitor` renders a live Rich dashboard from the HTTP
+`/status` endpoint plus `.journaler/daemon_status.json`, `state.json`, and
+`context_cache.json`.  The daemon refreshes `daemon_status.json` every few
+seconds so `journaler monitor --no-http` still works when HTTP chat is disabled.
+When `journaler.activity_log.enabled` is true, daemon events are appended as
+org-mode entries either under today's journal (`daily_journal`) or in a
+dedicated file (`dedicated_file`, defaulting to `<org-roam>/journaler-activity.org`).
+This file can be kept open in Doom Emacs with `auto-revert-mode`.
 
 #### Model profiles and thinking mode
 
@@ -1532,6 +1553,7 @@ The Journaler writes to `<workspace_dir>/.journaler/`:
 .journaler/
 ├── state.json           # Canonical path keys, mtimes, and SHA-256 content hashes for incremental scanning
 ├── context_cache.json   # Compressed rolling context snapshot
+├── daemon_status.json   # Live daemon heartbeat/status for `journaler monitor`
 ├── conversation.jsonl   # Full chat history log (all turns, including archived/compressed)
 ├── briefings/           # Generated morning briefings (YYYY-MM-DD.md)
 ├── topic_hints/         # Auto-generated conversation starters after significant scans

@@ -8,6 +8,7 @@ optionally runs an HTTP chat server for ad-hoc questions.
 from __future__ import annotations
 
 import logging
+import os
 import signal
 import time
 from dataclasses import dataclass
@@ -18,6 +19,7 @@ from typing import TYPE_CHECKING, Any
 import schedule
 
 from engineering_hub.config.settings import Settings
+from engineering_hub.journaler.activity_log import ActivityLogConfig, JournalerActivityLog
 from engineering_hub.journaler.briefing_tasks import (
     BackgroundWorkQueue,
     BriefingTaskExtractor,
@@ -36,8 +38,8 @@ from engineering_hub.journaler.model_profiles import (
     spec_from_journaler_config,
 )
 from engineering_hub.journaler.models import ContextSnapshot
-from engineering_hub.journaler.output_limit import OutputLimitConfig
 from engineering_hub.journaler.org_writer import upsert_section_in_today_journal
+from engineering_hub.journaler.output_limit import OutputLimitConfig
 from engineering_hub.journaler.prompts import (
     build_skills_block,
     build_workspace_layout,
@@ -46,6 +48,10 @@ from engineering_hub.journaler.prompts import (
     format_system_prompt,
     load_briefing_prompt,
     load_system_prompt,
+)
+from engineering_hub.journaler.status_snapshot import (
+    build_status_suggestions,
+    write_status_file,
 )
 from engineering_hub.journaler.task_integrator import (
     TaskIntegrator,
@@ -169,6 +175,13 @@ class JournalerConfig:
     # Optional PDF reference corpus (libraryfiles-corpus); used for per-turn RAG in chat.
     corpus_service: Any | None = None
 
+    # Org-mode daemon activity stream (for Doom Emacs auto-revert workflows).
+    activity_log_enabled: bool = False
+    activity_log_mode: str = "daily_journal"
+    activity_log_path: Path | None = None
+    activity_log_heading: str = "Journaler Activity"
+    activity_log_include_suggestions: bool = True
+
     # Local-first web search for delegated /agent tasks.
     web_search_provider: SearchProvider | None = None
     web_search_enabled: bool = False
@@ -277,6 +290,83 @@ def pressure_config_from_settings(
     return PressureConfig(**{k: v for k, v in raw.items() if k in allowed})
 
 
+def _build_daemon_status_payload(
+    config: JournalerConfig,
+    context: JournalContext,
+    engine: ConversationEngine,
+    start_time: datetime,
+    *,
+    status: str = "running",
+    last_event: str = "",
+) -> dict[str, Any]:
+    """Build the lightweight status sidecar written for monitor clients."""
+    now = datetime.now()
+    snapshot = context._snapshot
+    uptime_seconds = int((now - start_time).total_seconds())
+    engine_status = engine.get_status()
+    return {
+        "pid": os.getpid(),
+        "status": status,
+        "started_at": start_time.isoformat(timespec="seconds"),
+        "last_heartbeat": now.isoformat(timespec="seconds"),
+        "uptime": _format_uptime(uptime_seconds),
+        "last_event": last_event,
+        "model_path": config.model_path,
+        "model_loaded": engine._backend.is_loaded(),
+        "chat_enabled": config.chat_enabled,
+        "chat_url": f"http://{config.chat_host}:{config.chat_port}",
+        "scan_interval_min": config.scan_interval_min,
+        "deep_scan_interval_min": config.deep_scan_interval_min,
+        "briefing_enabled": config.briefing_enabled,
+        "briefing_time": config.briefing_time,
+        "last_scan": snapshot.last_scan,
+        "pending_tasks": len(snapshot.pending_tasks),
+        "completed_tasks": len(snapshot.completed_tasks),
+        "stale_tasks": len(snapshot.stale_tasks),
+        "tracked_files": len(context._state.file_mtimes),
+        "history": engine.get_history_summary(),
+        "engine": engine_status,
+    }
+
+
+def _write_daemon_status(
+    config: JournalerConfig,
+    context: JournalContext,
+    engine: ConversationEngine,
+    start_time: datetime,
+    *,
+    status: str = "running",
+    last_event: str = "",
+) -> dict[str, Any]:
+    payload = _build_daemon_status_payload(
+        config,
+        context,
+        engine,
+        start_time,
+        status=status,
+        last_event=last_event,
+    )
+    try:
+        write_status_file(config.state_dir, payload)
+    except OSError as exc:
+        logger.warning("Failed to write Journaler daemon status: %s", exc)
+    return payload
+
+
+def _status_suggestions(payload: dict[str, Any]) -> list[str]:
+    snapshot = dict(payload)
+    snapshot["daemon_online"] = payload.get("status") == "running"
+    snapshot["http_online"] = bool(payload.get("chat_enabled"))
+    snapshot["heartbeat_fresh"] = True
+    return build_status_suggestions(snapshot)
+
+
+def _format_uptime(seconds: int) -> str:
+    hours, remainder = divmod(max(0, seconds), 3600)
+    minutes, seconds = divmod(remainder, 60)
+    return f"{hours}h {minutes}m {seconds}s"
+
+
 def output_limit_config_from_settings(settings: Settings) -> OutputLimitConfig:
     """Build the Journaler output-length config from YAML-backed settings."""
     return OutputLimitConfig.from_raw(dict(settings.journaler_output_limit or {}))
@@ -305,6 +395,18 @@ def run_daemon(config: JournalerConfig, settings: Settings | None = None) -> Non
     config.state_dir.mkdir(parents=True, exist_ok=True)
     if config.briefing_output_dir:
         config.briefing_output_dir.mkdir(parents=True, exist_ok=True)
+
+    activity_log = JournalerActivityLog(
+        ActivityLogConfig(
+            enabled=config.activity_log_enabled,
+            mode=config.activity_log_mode,
+            path=config.activity_log_path,
+            heading=config.activity_log_heading,
+            include_suggestions=config.activity_log_include_suggestions,
+        ),
+        org_roam_dir=config.org_roam_dir,
+        journal_dir=config.journal_dir,
+    )
 
     # Load prompts (allow user overrides in state dir)
     system_template = load_system_prompt(config.state_dir)
@@ -476,18 +578,21 @@ def run_daemon(config: JournalerConfig, settings: Settings | None = None) -> Non
             delegator=delegator,
             model_context=runtime_model,
             pending_tasks_file=pending_pf,
+            activity_log=activity_log,
             task_integrator=task_integrator,
         )
 
     # Schedule recurring tasks
     schedule.every(config.scan_interval_min).minutes.do(
         _tick,
-        config=config,
         context=context,
         engine=engine,
         system_template=system_template,
         workspace_map=workspace_map,
         skills_suffix=skills_suffix,
+        config=config,
+        start_time=start_time,
+        activity_log=activity_log,
     )
 
     if config.deep_scan_interval_min > 0:
@@ -498,6 +603,9 @@ def run_daemon(config: JournalerConfig, settings: Settings | None = None) -> Non
             system_template=system_template,
             workspace_map=workspace_map,
             skills_suffix=skills_suffix,
+            config=config,
+            start_time=start_time,
+            activity_log=activity_log,
         )
         logger.info(
             f"Deep scan (full journal window) scheduled every "
@@ -512,6 +620,8 @@ def run_daemon(config: JournalerConfig, settings: Settings | None = None) -> Non
             engine=engine,
             briefing_template=briefing_template,
             slack=slack,
+            activity_log=activity_log,
+            start_time=start_time,
             task_extractor=task_extractor,
             work_queue=work_queue,
         )
@@ -572,6 +682,8 @@ def run_daemon(config: JournalerConfig, settings: Settings | None = None) -> Non
         _end_of_day_clear,
         engine=engine,
         config=config,
+        activity_log=activity_log,
+        start_time=start_time,
     )
     logger.info(f"End-of-day context clear scheduled at {eod_time}")
 
@@ -596,17 +708,63 @@ def run_daemon(config: JournalerConfig, settings: Settings | None = None) -> Non
         f"Journaler daemon running. Model: {config.model_path}, "
         f"scan every {config.scan_interval_min}min"
     )
+    status_payload = _write_daemon_status(
+        config,
+        context,
+        engine,
+        start_time,
+        last_event="daemon_start",
+    )
+    activity_log.append_event(
+        "daemon_start",
+        "Journaler daemon started",
+        details={
+            "Model": config.model_path,
+            "Scan interval": f"{config.scan_interval_min} min",
+            "Chat": f"http://{config.chat_host}:{config.chat_port}"
+            if config.chat_enabled
+            else "disabled",
+        },
+        suggestions=_status_suggestions(status_payload),
+        properties={"pid": os.getpid()},
+    )
 
     # Main loop
+    last_heartbeat = 0.0
     try:
         while not shutdown:
             schedule.run_pending()
+            now = time.monotonic()
+            if now - last_heartbeat >= 5:
+                _write_daemon_status(
+                    config,
+                    context,
+                    engine,
+                    start_time,
+                    last_event="heartbeat",
+                )
+                last_heartbeat = now
             time.sleep(1)
     except KeyboardInterrupt:
         pass
     finally:
         if chat_server:
             chat_server.stop()
+        status_payload = _write_daemon_status(
+            config,
+            context,
+            engine,
+            start_time,
+            status="stopped",
+            last_event="daemon_stop",
+        )
+        activity_log.append_event(
+            "daemon_stop",
+            "Journaler daemon stopped",
+            details={"Uptime": status_payload.get("uptime", "")},
+            properties={"pid": os.getpid()},
+            level="warning",
+        )
         logger.info("Journaler daemon stopped.")
 
 
@@ -850,7 +1008,6 @@ def generate_summary_now(config: JournalerConfig) -> Path:
     import json
 
     from engineering_hub.journaler.context_manager import ConversationTurn
-
     from engineering_hub.journaler.conversations_config import (
         build_store_from_config,
         resolve_transcript_path,
@@ -980,6 +1137,8 @@ def _tick(
     system_template: str,
     workspace_map: str = "",
     skills_suffix: str = "",
+    start_time: datetime | None = None,
+    activity_log: JournalerActivityLog | None = None,
 ) -> None:
     """10-minute scan cycle."""
     snapshot = context.scan()
@@ -1005,6 +1164,28 @@ def _tick(
                 prompt = prompt.rstrip() + "\n\n" + skills_suffix
             engine._system_prompt = prompt
 
+    if config is not None and start_time is not None:
+        payload = _write_daemon_status(
+            config,
+            context,
+            engine,
+            start_time,
+            last_event="scan_complete",
+        )
+        if activity_log is not None:
+            activity_log.append_event(
+                "scan_complete",
+                "Journaler scan complete",
+                details={
+                    "Last scan": snapshot.last_scan,
+                    "Pending tasks": len(snapshot.pending_tasks),
+                    "Completed tasks": len(snapshot.completed_tasks),
+                    "Stale tasks": len(snapshot.stale_tasks),
+                    "Changes": snapshot.change_summary or "none",
+                },
+                suggestions=_status_suggestions(payload),
+            )
+
 
 def _deep_scan_tick(
     context: JournalContext,
@@ -1012,6 +1193,9 @@ def _deep_scan_tick(
     system_template: str,
     workspace_map: str = "",
     skills_suffix: str = "",
+    config: JournalerConfig | None = None,
+    start_time: datetime | None = None,
+    activity_log: JournalerActivityLog | None = None,
 ) -> None:
     """Hourly deep-scan cycle.
 
@@ -1035,6 +1219,25 @@ def _deep_scan_tick(
         f"{len(snapshot.active_roam_nodes)} active roam nodes, "
         f"{len(snapshot.stale_tasks)} stale tasks"
     )
+    if config is not None and start_time is not None:
+        payload = _write_daemon_status(
+            config,
+            context,
+            engine,
+            start_time,
+            last_event="deep_scan_complete",
+        )
+        if activity_log is not None:
+            activity_log.append_event(
+                "deep_scan_complete",
+                "Journaler deep scan refreshed context",
+                details={
+                    "Recurring topics": len(snapshot.recurring_topics),
+                    "Active roam nodes": len(snapshot.active_roam_nodes),
+                    "Stale tasks": len(snapshot.stale_tasks),
+                },
+                suggestions=_status_suggestions(payload),
+            )
 
 
 def _task_integrator_tick(integrator: TaskIntegrator) -> None:
@@ -1087,6 +1290,8 @@ def _morning_briefing(
     engine: ConversationEngine,
     briefing_template: str,
     slack: SlackPoster | None,
+    activity_log: JournalerActivityLog | None = None,
+    start_time: datetime | None = None,
     task_extractor: BriefingTaskExtractor | None = None,
     work_queue: BackgroundWorkQueue | None = None,
 ) -> None:
@@ -1102,7 +1307,22 @@ def _morning_briefing(
         )
     )
 
-    _persist_morning_briefing(config, today_str, briefing)
+    briefing_path = _persist_morning_briefing(config, today_str, briefing)
+    if start_time is not None:
+        payload = _write_daemon_status(
+            config,
+            context,
+            engine,
+            start_time,
+            last_event="briefing_generated",
+        )
+        if activity_log is not None:
+            activity_log.append_event(
+                "briefing_generated",
+                "Morning briefing generated",
+                details={"Path": briefing_path},
+                suggestions=_status_suggestions(payload),
+            )
 
     if slack:
         slack.post_briefing(briefing)
@@ -1343,6 +1563,8 @@ def _read_todays_work_status(config: JournalerConfig) -> str:
 def _end_of_day_clear(
     engine: ConversationEngine,
     config: JournalerConfig,
+    activity_log: JournalerActivityLog | None = None,
+    start_time: datetime | None = None,
 ) -> None:
     """End-of-day housekeeping: compress today's conversation, archive, and reset.
 
@@ -1452,3 +1674,12 @@ def _end_of_day_clear(
         f"End-of-day clear: {len(archived)} turns archived, "
         f"summary saved to {summary_path.name}"
     )
+    if activity_log is not None:
+        activity_log.append_event(
+            "end_of_day_clear",
+            "End-of-day conversation clear complete",
+            details={
+                "Archived turns": len(archived),
+                "Summary": summary_path,
+            },
+        )
