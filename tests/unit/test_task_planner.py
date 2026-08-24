@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 
 from engineering_hub.core.constants import TaskStatus
@@ -128,3 +128,27 @@ def test_org_task_writer_moves_completed_pending_block(tmp_path: Path) -> None:
     assert "* Completed Agent Tasks" in final
     # Original pending checkbox line should be moved, not duplicated as [ ]
     assert final.count("- [ ] @research: Block body") == 0
+
+
+def test_org_task_parser_strips_mcp_wikilinks(tmp_path: Path) -> None:
+    journal_dir = tmp_path / "journal"
+    journal_dir.mkdir()
+    today = date.today().isoformat()
+    journal_file = journal_dir / f"{today}.org"
+    journal_file.write_text(
+        f"#+title: {today}\n\n"
+        "* Overnight Agent Tasks\n"
+        "- [ ] @rental-scout: run rental scan [[mcp://rental-scout/run_scan]]\n",
+        encoding="utf-8",
+    )
+    parser = OrgTaskParser(
+        journal_dir=journal_dir,
+        task_sections=["Overnight Agent Tasks"],
+        lookback_days=1,
+    )
+    tasks = parser.parse_tasks()
+    assert len(tasks) == 1
+    task = tasks[0]
+    assert task.agent == "rental-scout"
+    assert task.description == "run rental scan"
+    assert task.input_paths == []

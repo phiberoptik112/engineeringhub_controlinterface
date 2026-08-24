@@ -7,6 +7,9 @@ without raising.
 Supported operations
 --------------------
 - ``append_to_heading``     — add body text under a named heading
+- ``append_to_today_journal`` — append under a heading in today's daily journal
+- ``upsert_section_in_today_journal`` — replace or create a heading section in today's journal
+- ``read_section_body``     — read the body under a named heading
 - ``assert_org_path_under_roam`` — verify a path is a writable ``.org`` under roam root
 - ``add_todo_to_journal``   — insert a ``- [ ]`` item in today's daily journal
 - ``mark_done_in_journal``  — flip a matching ``- [ ]`` to ``- [X]``
@@ -91,6 +94,188 @@ def _create_journal_file(path: Path) -> bool:
         f"\n"
         f"* Overnight Agent Tasks\n\n"
         f"* Notes\n\n"
+    )
+    path.write_text(content, encoding="utf-8")
+    return True
+
+
+def _single_line(text: str) -> str:
+    """Collapse whitespace so generated org headings and entries stay valid."""
+    return " ".join(text.split()).strip()
+
+
+def _org_tag(text: str) -> str:
+    """Return an org-safe tag derived from arbitrary text."""
+    tag = re.sub(r"\W+", "_", text.lower()).strip("_")
+    return tag[:60] or "unknown"
+
+
+def _append_under_top_heading(raw: str, heading: str, entry: str) -> str:
+    """Return org text with *entry* appended under ``* <heading>``."""
+    heading_pattern = re.compile(
+        r"^(\*+)\s+" + re.escape(heading) + r"\s*$", re.MULTILINE
+    )
+    match = heading_pattern.search(raw)
+    if not match:
+        return raw.rstrip("\n") + f"\n\n* {heading}\n{entry}\n"
+
+    star_count = len(match.group(1))
+    rest_start = match.end()
+    next_heading = re.compile(r"^\*{1," + str(star_count) + r"}\s+", re.MULTILINE)
+    next_match = next_heading.search(raw, rest_start)
+    insert_end = next_match.start() if next_match else len(raw)
+    return raw[:insert_end].rstrip("\n") + f"\n{entry}\n" + raw[insert_end:]
+
+
+def _monthly_timesheet_slug(project_id: str | None, project_heading: str) -> str:
+    """Return a stable filename slug for a monthly timesheet note."""
+    if project_id:
+        return f"project-{project_id}"
+    return _org_tag(project_heading)
+
+
+def _monthly_timesheet_path(
+    journal_dir: Path,
+    now: datetime,
+    project_id: str | None,
+    project_heading: str,
+) -> Path:
+    """Return the per-project monthly working note under ``timesheets/``."""
+    return monthly_timesheet_path_for_month(
+        journal_dir,
+        now.strftime("%Y-%m"),
+        project_id,
+        project_heading,
+    )
+
+
+def monthly_timesheet_path_for_month(
+    journal_dir: Path,
+    month: str,
+    project_id: str | None,
+    project_heading: str,
+) -> Path:
+    """Return ``timesheets/YYYY-MM-<slug>.org`` for a project/month."""
+    slug = _monthly_timesheet_slug(project_id, project_heading)
+    timesheets_dir = journal_dir.expanduser().resolve().parent / "timesheets"
+    return timesheets_dir / f"{month}-{slug}.org"
+
+
+def _create_monthly_timesheet_file(
+    path: Path,
+    month: str,
+    project_heading: str,
+    project_id: str | None = None,
+    now: datetime | None = None,
+) -> bool:
+    """Create a monthly timesheet working note if missing."""
+    path = path.expanduser().resolve()
+    if path.exists():
+        return False
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tags = ["timesheet", "monthly"]
+    if project_id:
+        tags.append(f"project_{project_id}")
+    else:
+        tags.append(f"project_{_org_tag(project_heading)}")
+    tags_str = f":{':'.join(tags)}:"
+
+    props = [
+        ":PROPERTIES:",
+        f":ID:       {uuid.uuid4()}",
+        ":PURPOSE:  monthly-timesheet-working",
+        f":MONTH:    {month}",
+    ]
+    if project_id:
+        props.append(f":PROJECT_ID: {project_id}")
+    props.extend([":END:"])
+
+    content = (
+        "\n".join(props)
+        + f"\n#+title: {month} Timesheet — {project_heading}\n"
+        + f"#+filetags: {tags_str}\n"
+        + f"#+created: {_org_timestamp(now)}\n"
+        + "\n"
+        + "* Hours\n\n"
+        + "* Notes\n\n"
+        + "* Review\n\n"
+    )
+    path.write_text(content, encoding="utf-8")
+    return True
+
+
+def _append_to_timesheet_project(
+    raw: str,
+    project_heading: str,
+    entry: str,
+    heading_tags: list[str] | None = None,
+) -> str:
+    """Return journal text with *entry* appended under the project subheading."""
+    timesheet_match = re.search(r"^(\*+)\s+Timesheet\s*$", raw, re.MULTILINE)
+    tags = [tag for tag in (heading_tags or []) if tag]
+    tags_suffix = f" :{':'.join(tags)}:" if tags else ""
+
+    if not timesheet_match:
+        return (
+            raw.rstrip("\n")
+            + f"\n\n* Timesheet\n** {project_heading}{tags_suffix}\n{entry}\n"
+        )
+
+    timesheet_level = len(timesheet_match.group(1))
+    timesheet_body_start = timesheet_match.end()
+    next_top = re.compile(r"^\*{1," + str(timesheet_level) + r"}\s+", re.MULTILINE)
+    next_top_match = next_top.search(raw, timesheet_body_start)
+    timesheet_end = next_top_match.start() if next_top_match else len(raw)
+
+    section = raw[timesheet_body_start:timesheet_end]
+    project_pattern = re.compile(
+        r"^(\*{" + str(timesheet_level + 1) + r"})\s+"
+        + re.escape(project_heading)
+        + r"(?:\s+:[\w:]+:)?\s*$",
+        re.MULTILINE,
+    )
+    project_match = project_pattern.search(section)
+
+    if not project_match:
+        insertion = f"\n** {project_heading}{tags_suffix}\n{entry}\n"
+        return raw[:timesheet_end].rstrip("\n") + insertion + raw[timesheet_end:]
+
+    project_level = len(project_match.group(1))
+    project_body_start = timesheet_body_start + project_match.end()
+    next_project = re.compile(r"^\*{1," + str(project_level) + r"}\s+", re.MULTILINE)
+    next_project_match = next_project.search(raw, project_body_start)
+    project_end = (
+        min(next_project_match.start(), timesheet_end)
+        if next_project_match
+        else timesheet_end
+    )
+
+    return raw[:project_end].rstrip("\n") + f"\n{entry}\n" + raw[project_end:]
+
+
+def _timesheet_reference_path(journal_dir: Path) -> Path:
+    """Return the org-roam note used as the agent-searchable timesheet ledger."""
+    return journal_dir.expanduser().resolve().parent / "timesheets" / "timesheet-reference.org"
+
+
+def _create_timesheet_reference_file(path: Path, now: datetime | None = None) -> bool:
+    """Create the shared org-roam timesheet reference note if missing."""
+    path = path.expanduser().resolve()
+    if path.exists():
+        return False
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    content = (
+        f":PROPERTIES:\n"
+        f":ID:       {uuid.uuid4()}\n"
+        f":PURPOSE:  agent-searchable-timesheet-reference\n"
+        f":END:\n"
+        f"#+title: Timesheet Reference\n"
+        f"#+filetags: :timesheet:agent-context:worklog:\n"
+        f"#+created: {_org_timestamp(now)}\n"
+        f"\n"
+        f"* Timesheet\n\n"
     )
     path.write_text(content, encoding="utf-8")
     return True
@@ -227,6 +412,225 @@ def add_todo_to_journal(
     if ok:
         return True, f"Added task to {today_path.name} under '* {section_heading}'"
     return ok, msg
+
+
+def upsert_section_in_heading(
+    path: Path,
+    heading: str,
+    text: str,
+) -> tuple[bool, str]:
+    """Replace the body under ``* <heading>`` or create the section if absent.
+
+    Unlike :func:`append_to_heading`, an existing section body is fully replaced
+    rather than appended to.  Used for idempotent writes such as daily briefings.
+
+    Returns:
+        ``(ok, message)``
+    """
+    path = path.expanduser().resolve()
+    if not path.exists():
+        return False, f"File not found: {path}"
+    if not path.is_file():
+        return False, f"Not a file: {path}"
+
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        return False, f"Could not read {path.name}: {exc}"
+
+    heading_pattern = re.compile(
+        r"^(\*+)\s+" + re.escape(heading) + r"\s*$", re.MULTILINE
+    )
+    match = heading_pattern.search(raw)
+    text_block = "\n" + text.strip() + "\n"
+
+    if match:
+        star_count = len(match.group(1))
+        rest_start = match.end()
+        next_heading = re.compile(
+            r"^\*{1," + str(star_count) + r"}\s+", re.MULTILINE
+        )
+        next_match = next_heading.search(raw, rest_start)
+        insert_end = next_match.start() if next_match else len(raw)
+        new_raw = raw[:rest_start] + text_block + raw[insert_end:]
+        message = f"Updated '* {heading}' in {path.name}"
+    else:
+        new_raw = raw.rstrip("\n") + f"\n\n* {heading}\n{text_block}"
+        message = f"Created '* {heading}' in {path.name}"
+
+    try:
+        path.write_text(new_raw, encoding="utf-8")
+    except OSError as exc:
+        return False, f"Could not write {path.name}: {exc}"
+
+    return True, message
+
+
+def upsert_section_in_today_journal(
+    journal_dir: Path,
+    heading: str,
+    text: str,
+) -> tuple[bool, str]:
+    """Replace or create ``heading`` in today's daily journal.
+
+    Resolves today's ``YYYY-MM-DD.org`` file under *journal_dir*, creating it
+    with minimal frontmatter if missing, then delegates to
+    :func:`upsert_section_in_heading`.
+
+    Returns:
+        ``(ok, message)``
+    """
+    journal_dir = journal_dir.expanduser().resolve()
+    today_path = _today_journal_path(journal_dir)
+    _create_journal_file(today_path)
+    return upsert_section_in_heading(today_path, heading, text)
+
+
+def append_to_today_journal(
+    journal_dir: Path,
+    heading: str,
+    text: str,
+    *,
+    create_heading_if_missing: bool = True,
+) -> tuple[bool, str]:
+    """Append ``text`` under ``heading`` in today's daily journal.
+
+    Resolves today's ``YYYY-MM-DD.org`` file under *journal_dir*, creating it
+    with minimal frontmatter if missing, then delegates to
+    :func:`append_to_heading`.  Used by the Task-Integrator to write inline
+    ``* Agent Conversation`` blocks and queued ``@agent:`` lines.
+
+    Returns:
+        ``(ok, message)``
+    """
+    journal_dir = journal_dir.expanduser().resolve()
+    today_path = _today_journal_path(journal_dir)
+    _create_journal_file(today_path)
+    return append_to_heading(
+        today_path,
+        heading,
+        text,
+        create_heading_if_missing=create_heading_if_missing,
+    )
+
+
+def read_section_body(path: Path, heading: str) -> str:
+    """Return the body text under the first ``* <heading>`` in an org file.
+
+    The body spans from just after the heading line to the next heading of the
+    same or higher level (or end of file).  Returns an empty string if the file
+    or heading is not found.
+    """
+    path = path.expanduser().resolve()
+    if not path.is_file():
+        return ""
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except OSError:
+        return ""
+
+    heading_pattern = re.compile(
+        r"^(\*+)\s+" + re.escape(heading) + r"\s*$", re.MULTILINE
+    )
+    match = heading_pattern.search(raw)
+    if not match:
+        return ""
+    star_count = len(match.group(1))
+    rest_start = match.end()
+    next_heading = re.compile(r"^\*{1," + str(star_count) + r"}\s+", re.MULTILINE)
+    next_match = next_heading.search(raw, rest_start)
+    end = next_match.start() if next_match else len(raw)
+    return raw[rest_start:end].strip("\n")
+
+
+def append_timesheet_entry(
+    journal_dir: Path,
+    project: str,
+    hours: float,
+    description: str,
+    project_id: str | None = None,
+    now: datetime | None = None,
+) -> tuple[bool, str]:
+    """Append a structured timesheet entry to today's daily journal.
+
+    Entries are grouped as ``* Timesheet`` → ``** <project>`` so daily hours
+    stay readable while preserving project-specific sections.
+    """
+    journal_dir = journal_dir.expanduser().resolve()
+    today_path = _today_journal_path(journal_dir)
+    _create_journal_file(today_path)
+
+    project_heading = _single_line(project)
+    desc = _single_line(description)
+    if not project_heading:
+        return False, "Project is required"
+    if not desc:
+        return False, "Description is required"
+    if hours <= 0:
+        return False, "Hours must be greater than 0"
+
+    project_label = project_heading
+    if project_id:
+        project_label = f"[[django://project/{project_id}][{project_heading}]]"
+
+    entry = f"- {_org_timestamp(now)} {hours:.2f}h :: {desc}"
+    journal_link = f"[[file:{today_path}][{today_path.name}]]"
+    reference_entry = entry + f"\n  - Daily journal: {journal_link}"
+    if project_id:
+        reference_entry += f"\n  - Project link: {project_label}"
+
+    try:
+        raw = today_path.read_text(encoding="utf-8")
+    except OSError as exc:
+        return False, f"Could not read {today_path.name}: {exc}"
+
+    new_raw = _append_to_timesheet_project(raw, project_label, entry)
+
+    try:
+        today_path.write_text(new_raw, encoding="utf-8")
+    except OSError as exc:
+        return False, f"Could not write {today_path.name}: {exc}"
+
+    reference_path = _timesheet_reference_path(journal_dir)
+    try:
+        _create_timesheet_reference_file(reference_path, now=now)
+        reference_raw = reference_path.read_text(encoding="utf-8")
+        project_tag = f"project_{project_id}" if project_id else f"project_{_org_tag(project_heading)}"
+        reference_raw = _append_to_timesheet_project(
+            reference_raw,
+            project_label,
+            reference_entry,
+            heading_tags=["project", project_tag],
+        )
+        reference_path.write_text(reference_raw, encoding="utf-8")
+    except OSError as exc:
+        return False, f"Could not update timesheet reference: {exc}"
+
+    monthly_path = _monthly_timesheet_path(
+        journal_dir, now or datetime.now(), project_id, project_heading
+    )
+    try:
+        month = (now or datetime.now()).strftime("%Y-%m")
+        _create_monthly_timesheet_file(
+            monthly_path,
+            month=month,
+            project_heading=project_heading,
+            project_id=project_id,
+            now=now,
+        )
+        monthly_raw = monthly_path.read_text(encoding="utf-8")
+        monthly_entry = entry + f"\n  - Daily journal: {journal_link}"
+        monthly_raw = _append_under_top_heading(monthly_raw, "Hours", monthly_entry)
+        monthly_path.write_text(monthly_raw, encoding="utf-8")
+    except OSError as exc:
+        return False, f"Could not update monthly timesheet: {exc}"
+
+    return (
+        True,
+        f"Logged {hours:.2f}h to {project_heading} in {today_path}\n"
+        f"Updated timesheet reference: {reference_path}\n"
+        f"Updated monthly timesheet: {monthly_path}",
+    )
 
 
 def mark_done_in_journal(

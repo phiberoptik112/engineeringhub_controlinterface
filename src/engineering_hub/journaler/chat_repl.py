@@ -23,11 +23,26 @@ _PALETTE_SENTINEL = "///cmdpalette"
 
 COMMAND_CATALOG: list[CommandEntry] = [
     # Context Management
-    CommandEntry("/model", "[profile|path]", "Show or switch model profile", "Context Management"),
+    CommandEntry("/model", "", "Show active model and all adjustable settings", "Context Management"),
+    CommandEntry("/model", "<profile>", "Switch to a named profile (full reload)", "Context Management"),
+    CommandEntry("/model", "path <hf-id-or-path>", "Load model by path (full reload)", "Context Management"),
+    CommandEntry("/model", "set thinking on|off|auto", "Toggle thinking mode (live, no reload)", "Context Management"),
+    CommandEntry("/model", "set streaming on|off", "Toggle per-token streaming output (live)", "Context Management"),
+    CommandEntry("/model", "set temp <float>", "Adjust temperature live (no reload)", "Context Management"),
+    CommandEntry("/model", "set top_p <float>", "Adjust top-p sampling live", "Context Management"),
+    CommandEntry("/model", "set min_p <float>", "Adjust min-p sampling live", "Context Management"),
+    CommandEntry("/model", "set max_tokens <int>", "Adjust max generation tokens live", "Context Management"),
+    CommandEntry("/model_browse", "", "Browse mlx-community models and profiles", "Context Management"),
     CommandEntry("/status", "", "Show context pressure and turn count", "Context Management"),
     CommandEntry("/budget", "", "Token budget breakdown", "Context Management"),
+    CommandEntry("/output", "", "Show output-limit policy (summarize/continue/stop)", "Context Management"),
+    CommandEntry("/output", "set <key> <value>", "Change output policy/max_tokens/passes/continue_mode live", "Context Management"),
     CommandEntry("/topic", "", "Show the currently detected conversation topic", "Context Management"),
+    CommandEntry("/convo", "", "Browse and switch named conversations (interactive picker)", "Context Management"),
+    CommandEntry("/convo", "new [--project N] [--topic L] <title>", "Create and switch to a new conversation", "Context Management"),
+    CommandEntry("/convo", "list|status|rename|restore-files|archive|delete", "Manage conversation sessions", "Context Management"),
     CommandEntry("/clear", "[--hard|--summarize]", "Clear conversation history", "Context Management"),
+    CommandEntry("/summarize", "", "Generate today's daily summary now and archive history", "Context Management"),
     CommandEntry("/files", "[clear]", "List or clear loaded files", "Context Management"),
     CommandEntry(
         "/focus",
@@ -37,7 +52,8 @@ COMMAND_CATALOG: list[CommandEntry] = [
     ),
     # File Ops
     CommandEntry("/load", "<path> [-r]", "Load a file or directory into context", "File Ops"),
-    CommandEntry("/load_browse", "", "Interactive browser for org-roam files", "File Ops"),
+    CommandEntry("/load_recent", "[N] [--days D] [--list]", "Load most recently created files across the workspace", "File Ops"),
+    CommandEntry("/load_browse", "", "Browse/load files with metadata and home search", "File Ops"),
     CommandEntry("/edit_browse", "", "Interactive browser to set /edit target", "File Ops"),
     CommandEntry("/find", "<title fragment>", "Search org-roam files by title", "File Ops"),
     # Agent Delegation
@@ -50,9 +66,36 @@ COMMAND_CATALOG: list[CommandEntry] = [
     ),
     CommandEntry("/tasks", "[confirm|commit|rollback|…]", "Overnight task queue (pending-tasks.org)", "Agent Delegation"),
     CommandEntry("/queue", "<description>", "Propose a task for the overnight queue", "Agent Delegation"),
+    CommandEntry(
+        "/history",
+        "[--agent <type>] <query>",
+        "Retrieve prior chat excerpts or dispatch an agent review",
+        "Agent Delegation",
+    ),
     CommandEntry("/skills", "", "List available agent personas", "Agent Delegation"),
+    CommandEntry("/blender", "status", "Check Blender MCP connectivity and tools", "Agent Delegation"),
+    CommandEntry("/horn", "[sweep|defaults]", "Run parametric horn sweep / show LVT defaults", "Agent Delegation"),
+    CommandEntry(
+        "/integrate",
+        "[status]",
+        "Run the Task-Integrator: interview inline in today's journal, propose agent tasks",
+        "Agent Delegation",
+    ),
     CommandEntry("/agent_browse", "", "Interactive skill picker for agent delegation", "Agent Delegation"),
+    CommandEntry(
+        "/persona",
+        "[<name>|reset|list]",
+        "Show, swap, reset, or list active Journaler persona",
+        "Agent Delegation",
+    ),
     CommandEntry("/validate-latex", "<path>", "Compile a .tex file and report errors", "Agent Delegation"),
+    # Zettelkasten
+    CommandEntry(
+        "/zettel",
+        "{propose|apply|status}",
+        "Manage atomic note proposals",
+        "Zettelkasten",
+    ),
     # Capture Templates
     CommandEntry("/capture", "<name> [field=value ...]", "Apply a capture template", "Capture Templates"),
     CommandEntry("/capture_list", "", "List available capture templates", "Capture Templates"),
@@ -62,6 +105,12 @@ COMMAND_CATALOG: list[CommandEntry] = [
     CommandEntry("/edit", "<heading> :: <text>", "Append text under a heading in the open target", "Org-Roam Write"),
     CommandEntry("/task", "<description>", "Add a TODO to today's journal", "Org-Roam Write"),
     CommandEntry("/done", "<fragment>", "Mark a matching TODO as done", "Org-Roam Write"),
+    CommandEntry(
+        "/timesheet",
+        '<hours> project "<project>" :: <description>',
+        "Log hours to today's journal by project",
+        "Org-Roam Write",
+    ),
     CommandEntry("/note", "<heading> :: <text>", "Append text under a heading in today's journal", "Org-Roam Write"),
     # Export
     CommandEntry(
@@ -69,6 +118,13 @@ COMMAND_CATALOG: list[CommandEntry] = [
         "[--format raw|--summarize] [-o <path>] …",
         "Export transcript to org-roam (default: conversation_exports/)",
         "Export",
+    ),
+    # Quick Context
+    CommandEntry(
+        "/context",
+        "[number]",
+        "Show suggested files to load (top 10 by frequency/recency)",
+        "Quick Context",
     ),
     # Session
     CommandEntry("/help", "", "Show available slash commands", "Session"),

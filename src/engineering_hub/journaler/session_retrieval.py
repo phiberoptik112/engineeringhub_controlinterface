@@ -69,23 +69,34 @@ def retrieve_past_sessions(
     max_results: int = 5,
     excerpt_chars: int = 1200,
     max_transcript_turns: int = 2000,
+    store: object | None = None,
 ) -> list[SessionRetrievalHit]:
-    """Search daily summaries and the raw transcript for prior conversation hits."""
+    """Search daily summaries and transcript JSONL for prior conversation hits."""
     terms = _keywords(query)
     if not terms and not _DATE_RE.search(query):
         return []
 
     hits: list[SessionRetrievalHit] = []
     hits.extend(_search_daily_summaries(query, terms, state_dir, excerpt_chars))
-    hits.extend(
-        _search_conversation_jsonl(
-            query,
-            terms,
-            state_dir / "conversation.jsonl",
-            excerpt_chars,
-            max_transcript_turns,
+
+    jsonl_paths: list[Path] = []
+    if store is not None and hasattr(store, "all_jsonl_paths"):
+        jsonl_paths = store.all_jsonl_paths()  # type: ignore[union-attr]
+    else:
+        legacy = state_dir / "conversation.jsonl"
+        if legacy.exists():
+            jsonl_paths = [legacy]
+
+    for path in jsonl_paths:
+        hits.extend(
+            _search_conversation_jsonl(
+                query,
+                terms,
+                path,
+                excerpt_chars,
+                max_transcript_turns,
+            )
         )
-    )
     hits.sort(key=lambda h: (h.score, h.date), reverse=True)
     return hits[:max_results]
 

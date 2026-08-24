@@ -1,0 +1,65 @@
+# Copy Markdown outputs → Claude Code folder
+#
+# Install (pick one):
+#   cp config/copy-md-to-claude.example.yaml ~/org-roam/engineering-hub/copy-md-to-claude.yaml
+#   cp config/copy-md-to-claude.example.yaml ~/.config/engineering-hub/copy-md-to-claude.yaml
+#
+# Or point at a file:
+#   ./scripts/copy-md-to-claude.sh --config /path/to/copy-md-to-claude.yaml LVT
+#   EH_COPY_CONFIG=~/my-copy.yaml ./scripts/copy-md-to-claude.sh LVT
+#
+# Chat examples after configuring:
+#   ./scripts/copy-md-to-claude.sh LVT
+#   ./scripts/copy-md-to-claude.sh -q "most recent LVT to shared"
+#   ./scripts/copy-md-to-claude.sh --project LVT --dest shared
+#   ./scripts/copy-md-to-claude.sh --list-projects
+#   ./scripts/copy-md-to-claude.sh --list-destinations
+
+# Default source tree (Engineering Hub agent outputs)
+source_dir: ~/org-roam/engineering-hub/outputs
+
+# Default Claude destination when no project/dest override applies
+dest_dir: ~/Claude/engineering-hub-outputs
+
+# Default number of newest files when filtering by project/phrase
+recent: 5
+
+# Named destination folders you can reference in chat or with --dest
+destinations:
+  claude: ~/Claude/engineering-hub-outputs
+  shared: ~/Claude/engineering-hub-outputs
+  scheduled: ~/Claude/Scheduled
+  # lvt: ~/Claude/LVT
+
+# Named projects — retain match tokens and optional path scopes
+projects:
+  LVT:
+    # Optional chat aliases (matched case-insensitively)
+    aliases:
+      - lvt
+      - "alert system"
+      - LVT_alert
+    # Filename must contain at least one of these (OR). Defaults to the project key.
+    match:
+      - LVT
+      - LVT_alert_system
+    # Optional: only search these subdirs under source_dir
+    paths:
+      - docs
+      - research
+      - outputs
+    # Optional per-project destination (name from destinations: or a path)
+    dest: shared
+    # Optional per-project recent default
+    recent: 5
+
+  Hale:
+    aliases: [hale]
+    match: [Hale]
+    paths: [docs, research]
+    dest: claude
+
+  N4:
+    aliases: [n4]
+    match: [N4]
+    dest: claude
